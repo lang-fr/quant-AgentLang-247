@@ -1,1 +1,14 @@
-
+google-genai
+python-dotenv
+yfinance
+fredapi
+ccxt
+cot_reports
+pandas
+numpy
+arch
+backtesting
+feedparser
+requests
+flask
+metaapi-cloud-sdk
