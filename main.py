@@ -10,6 +10,10 @@ import yfinance as yf
 import ccxt
 import feedparser
 import requests
+import socket
+import urllib3.util.connection as urllib3_cn
+
+urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 import cot_reports as cot
 from arch import arch_model
 from backtesting import Backtest, Strategy
@@ -611,14 +615,23 @@ def kirim_telegram(pesan: str, log_id: int = None):
         payload = {"chat_id": str(TELEGRAM_CHAT_ID).strip(), "text": chunk}
         if reply_markup and idx == len(chunks) - 1:
             payload["reply_markup"] = json.dumps(reply_markup)
-        try:
-            r = requests.post(url, json=payload, timeout=15).json()
-            if not r.get("ok"):
+        for percobaan in range(3):
+            try:
+                r = requests.post(url, json=payload, timeout=30).json()
+                if r.get("ok"):
+                    print("sendMessage terkirim ke Telegram!", flush=True)
+                    break
+                err_code = r.get("error_code")
+                if err_code == 429:
+                    jeda = int(r.get("parameters", {}).get("retry_after", 10)) + 1
+                    print(f"sendMessage kena 429 -> tunggu {jeda}s lalu kirim ulang...", flush=True)
+                    time.sleep(jeda)
+                    continue
                 print(f"sendMessage gagal: {r}", flush=True)
-            else:
-                print("sendMessage terkirim ke Telegram!", flush=True)
-        except Exception as e:
-            print(f"Error kirim_telegram: {e}", flush=True)
+                break
+            except Exception as e:
+                print(f"Error kirim_telegram (percobaan {percobaan + 1}): {e}", flush=True)
+                time.sleep(3)
 
 
 def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
