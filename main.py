@@ -718,7 +718,7 @@ Kembalikan HANYA format JSON valid dengan kunci:
     try:
         response = analisa_dengan_retry(
             client,
-            "gemini-2.5-flash",
+            "gemini-3.8-flash",
             prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
