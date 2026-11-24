@@ -732,8 +732,14 @@ Kembalikan HANYA format JSON valid dengan kunci:
 {{
   "xau_score": integer (0-100),
   "xau_bias": "BULLISH" | "BEARISH" | "WAIT_NO_TRADE",
+  "xau_entry": "estimasi zona entry spesifik berbasis harga terakhir",
+  "xau_sl": "level Stop Loss spesifik",
+  "xau_tp": "level Take Profit 1 & 2 spesifik",
   "btc_score": integer (0-100),
   "btc_bias": "BULLISH" | "BEARISH" | "WAIT_NO_TRADE",
+  "btc_entry": "estimasi zona entry spesifik berbasis harga terakhir",
+  "btc_sl": "level Stop Loss spesifik",
+  "btc_tp": "level Take Profit 1 & 2 spesifik",
   "macro_view": "ringkasan 1 kalimat",
   "bull_case": "ringkasan 1 kalimat",
   "bear_skeptic_veto": "ringkasan 1 kalimat",
@@ -756,9 +762,11 @@ Kembalikan HANYA format JSON valid dengan kunci:
         lolos_final = risk_status.get("approved") and (top_score >= 75)
         hasil_teks = (
             f"QUANT AGENT v2.3 — SIDANG 4 AGEN ({pemicu})\n"
-            f"Sesi: {deteksi_sesi_trading()} | Spread XAU: {spread_aktif} pips\n"
-            f"• XAUUSD: {verdict.get('xau_bias')} (Skor: {xau_score}/100) | Regime: {mtf_gold.get('market_regime')}\n"
-            f"• BTCUSDT: {verdict.get('btc_bias')} (Skor: {btc_score}/100) | Regime: {mtf_btc.get('market_regime')}\n\n"
+            f"Sesi: {deteksi_sesi_trading()} | Spread XAU: {spread_aktif} pips\n\n"
+            f"• XAUUSD: {verdict.get('xau_bias')} (Skor: {xau_score}/100) | {mtf_gold.get('market_regime')}\n"
+            f"  Entry: {verdict.get('xau_entry')} | SL: {verdict.get('xau_sl')} | TP: {verdict.get('xau_tp')}\n\n"
+            f"• BTCUSDT: {verdict.get('btc_bias')} (Skor: {btc_score}/100) | {mtf_btc.get('market_regime')}\n"
+            f"  Entry: {verdict.get('btc_entry')} | SL: {verdict.get('btc_sl')} | TP: {verdict.get('btc_tp')}\n\n"
             f"1. Macro Analyst: {verdict.get('macro_view')}\n"
             f"2. Bull Case: {verdict.get('bull_case')}\n"
             f"3. Bear/Skeptic Veto: {verdict.get('bear_skeptic_veto')}\n"
