@@ -667,25 +667,26 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
         log_id = simpan_log("XAUUSD/BTC", "WAIT", 0, spread_aktif, macro_snap, "NO_API_KEY", laporan[:400])
         kirim_telegram(laporan, log_id=log_id)
         return laporan
-    try:
-        def analisa_dengan_retry(client, model_name: str, prompt: str, config=None, max_retries: int = 3):
-            for percobaan in range(max_retries):
-                try:
-                    return client.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                        config=config,
-                    )
-                except Exception as e:
-                    pesan_error = str(e)
-                    if "429" in pesan_error or "RESOURCE_EXHAUSTED" in pesan_error:
-                        waktu_tunggu = 35 * (percobaan + 1)
-                        print(f"Kuota API penuh, nunggu {waktu_tunggu} detik...")
-                        time.sleep(waktu_tunggu)
-                    else:
-                        raise e
-            raise RuntimeError("Gagal analisa setelah 3x percobaan karena limit API 429.")
-        client = genai.Client(api_key=GEMINI_API_KEY)
+
+    def analisa_dengan_retry(client, model_name: str, prompt: str, config=None, max_retries: int = 3):
+        for percobaan in range(max_retries):
+            try:
+                return client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=config,
+                )
+            except Exception as e:
+                pesan_error = str(e)
+                if "429" in pesan_error or "RESOURCE_EXHAUSTED" in pesan_error:
+                    waktu_tunggu = 35 * (percobaan + 1)
+                    print(f"Kuota API penuh, nunggu {waktu_tunggu} detik...")
+                    time.sleep(waktu_tunggu)
+                else:
+                    raise e
+        raise RuntimeError("Gagal analisa setelah 3x percobaan karena limit API 429.")
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
     prompt = f"""
 Kamu adalah Dewan Juri 4-Agen Kuantitatif Institusional. Analisa data riil berikut dalam Bahasa Indonesia:
 
