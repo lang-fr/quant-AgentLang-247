@@ -678,13 +678,13 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
                 )
             except Exception as e:
                 pesan_error = str(e)
-                if "429" in pesan_error or "RESOURCE_EXHAUSTED" in pesan_error:
-                    waktu_tunggu = 35 * (percobaan + 1)
-                    print(f"Kuota API penuh, nunggu {waktu_tunggu} detik...")
+                if any(kode in pesan_error for kode in ["429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE"]):
+                    waktu_tunggu = 15 * (percobaan + 1)
+                    print(f"Server/kuota API sibuk, nunggu {waktu_tunggu} detik...")
                     time.sleep(waktu_tunggu)
                 else:
                     raise e
-        raise RuntimeError("Gagal analisa setelah 3x percobaan karena limit API 429.")
+        raise RuntimeError("Gagal analisa setelah 3x percobaan karena API sibuk/limit.")
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     prompt = f"""
