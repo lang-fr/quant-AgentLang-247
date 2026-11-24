@@ -735,12 +735,23 @@ def loop_scheduler_otomatis():
 
 def loop_listener_telegram():
     if not TELEGRAM_BOT_TOKEN:
+        print("Listener berhenti: TELEGRAM_BOT_TOKEN kosong.")
         return
     offset = 0
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    print("Listener Telegram aktif polling...")
     while True:
         try:
-            resp = requests.get(f"{base_url}/getUpdates", params={"offset": offset, "timeout": 30}, timeout=35).json()
+            resp = requests.get(
+                f"{base_url}/getUpdates",
+                params={"offset": offset, "timeout": 30},
+                timeout=35,
+            ).json()
+            if not resp.get("ok"):
+                print("getUpdates gagal:", resp)
+                time.sleep(5)
+                continue
+
             for item in resp.get("result", []):
                 offset = item["update_id"] + 1
 
@@ -749,7 +760,8 @@ def loop_listener_telegram():
                     cb_id = cb["id"]
                     data_cb = cb.get("data", "")
                     from_id = str(cb.get("from", {}).get("id", ""))
-                    if from_id == TELEGRAM_CHAT_ID and "_" in data_cb:
+                    print(f"Callback dari {from_id}: {data_cb}")
+                    if from_id == str(TELEGRAM_CHAT_ID) and "_" in data_cb:
                         aksi, id_str = data_cb.split("_", 1)
                         log_id = int(id_str)
                         if aksi == "approve":
@@ -757,6 +769,7 @@ def loop_listener_telegram():
                             requests.post(
                                 f"{base_url}/answerCallbackQuery",
                                 json={"callback_query_id": cb_id, "text": "Disetujui & dicatat ke jurnal!"},
+                                timeout=10,
                             )
                             kirim_telegram(
                                 f"✅ Sinyal #{log_id} DISETUJUI untuk simulasi. Kuota sesi {deteksi_sesi_trading()} diperbarui."
@@ -766,6 +779,7 @@ def loop_listener_telegram():
                             requests.post(
                                 f"{base_url}/answerCallbackQuery",
                                 json={"callback_query_id": cb_id, "text": "Ditolak & dicatat."},
+                                timeout=10,
                             )
                             kirim_telegram(f"❌ Sinyal #{log_id} DITOLAK. Disiplin terjaga.")
                     continue
@@ -773,8 +787,10 @@ def loop_listener_telegram():
                 msg = item.get("message", {})
                 text = msg.get("text", "").strip().lower()
                 chat_id = str(msg.get("chat", {}).get("id", ""))
+                if text:
+                    print(f"Pesan masuk dari chat_id={chat_id} (target={TELEGRAM_CHAT_ID}): {text}")
 
-                if chat_id == TELEGRAM_CHAT_ID:
+                if chat_id == str(TELEGRAM_CHAT_ID):
                     if text in ["/start", "/help"]:
                         kirim_telegram(
                             "Quant Agent v2.3 (Institutional Multi-Asset 24/7) Aktif.\n"
@@ -794,9 +810,9 @@ def loop_listener_telegram():
                         kirim_telegram(f"{bt_gold}\n\n{bt_btc}")
                     elif text in ["/jurnal", "/evaluasi"]:
                         kirim_telegram(ambil_ringkasan_jurnal_dan_evaluasi_mingguan())
-        except Exception:
+        except Exception as e:
+            print("Listener error:", e)
             time.sleep(5)
-
 
 # ==============================================================================
 # 9. ENDPOINT WEB (HEALTH CHECK 24/7 & WEBHOOK TRADINGVIEW)
