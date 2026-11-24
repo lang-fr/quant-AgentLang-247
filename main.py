@@ -748,11 +748,11 @@ def loop_listener_telegram():
                 timeout=35,
             ).json()
             if not resp.get("ok"):
-    err_code = resp.get("error_code")
-    retry_after = int(resp.get("parameters", {}).get("retry_after", 10)) + 1
-    print(f"getUpdates gagal ({err_code}): {resp.get('description')} -> tidur {retry_after}s", flush=True)
-    time.sleep(retry_after if err_code == 429 else 5)
-    continue
+                err_code = resp.get("error_code")
+                retry_after = int(resp.get("parameters", {}).get("retry_after", 10)) + 1
+                print(f"getUpdates gagal ({err_code}): {resp.get('description')} -> tidur {retry_after}s", flush=True)
+                time.sleep(retry_after if err_code == 429 else 5)
+                continue
 
             for item in resp.get("result", []):
                 offset = item["update_id"] + 1
