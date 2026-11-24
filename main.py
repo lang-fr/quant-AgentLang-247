@@ -735,11 +735,11 @@ def loop_scheduler_otomatis():
 
 def loop_listener_telegram():
     if not TELEGRAM_BOT_TOKEN:
-        print("Listener berhenti: TELEGRAM_BOT_TOKEN kosong.")
+        print("Listener berhenti: TELEGRAM_BOT_TOKEN kosong.", flush=True)
         return
     offset = 0
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-    print("Listener Telegram aktif polling...")
+    print("Listener Telegram aktif polling...", flush=True)
     while True:
         try:
             resp = requests.get(
@@ -748,9 +748,11 @@ def loop_listener_telegram():
                 timeout=35,
             ).json()
             if not resp.get("ok"):
-                print("getUpdates gagal:", resp)
-                time.sleep(5)
-                continue
+    err_code = resp.get("error_code")
+    retry_after = int(resp.get("parameters", {}).get("retry_after", 10)) + 1
+    print(f"getUpdates gagal ({err_code}): {resp.get('description')} -> tidur {retry_after}s", flush=True)
+    time.sleep(retry_after if err_code == 429 else 5)
+    continue
 
             for item in resp.get("result", []):
                 offset = item["update_id"] + 1
