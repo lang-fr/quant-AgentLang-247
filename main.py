@@ -657,7 +657,7 @@ def analisa_dengan_retry(client, model_daftar: list, prompt: str, config=None) -
 
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
     if groq_key:
-        print("Semua Gemini penuh, pindah ke cadangan Groq Llama-3.3-70B...", flush=True)
+        print("Semua Gemini penuh, pindah ke cadangan Groq openai/gpt-oss-120b...", flush=True)
         resp_groq = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
@@ -665,10 +665,11 @@ def analisa_dengan_retry(client, model_daftar: list, prompt: str, config=None) -
                 "Content-Type": "application/json",
             },
             json={
-                "model": "llama-3.3-70b-versatile",
+                "model": "openai/gpt-oss-120b",
                 "messages": [{"role": "user", "content": prompt}],
                 "response_format": {"type": "json_object"} if config is not None else {"type": "text"},
                 "temperature": 0.2,
+                "max_tokens": 4096,
             },
             timeout=30,
         )
