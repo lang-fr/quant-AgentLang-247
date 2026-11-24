@@ -894,16 +894,24 @@ def loop_listener_telegram():
                             try:
                                 snap_db = ambil_ringkasan_jurnal_dan_evaluasi_mingguan()
                                 prompt_chat = (
-                                    f"Kamu adalah asisten quant & trading pribadi di Telegram. "
-                                    f"Jawab singkat, tajam, dan teknis dalam Bahasa Indonesia.\n"
-                                    f"Konteks jurnal & kuota sesi terakhir:\n{snap_db}\n\n"
-                                    f"Pertanyaan user: {pesan_asli}"
-                                )
+    f"Kamu adalah AgentLang, partner diskusi quant, makro, dan eksekusi trading di Telegram. "
+    f"Bicara seperti manusia yang lugas, tenang, dan analitis—hindari gaya bahasa robotik, klise, atau template kaku, "
+    f"dan JANGAN pakai tanda bintang (* atau **) karena Telegram menampilkan teks polos. "
+    f"Saat menjawab, utamakan critical thinking: uji asumsi user, soroti potensi jebakan atau blind spot (seperti bias konfirmasi, "
+    f"likuiditas palsu, risiko makro/berita, atau rasio risiko yang kurang masuk akal), dan beri perbandingan skenario jika relevan. "
+    f"Jika ada data yang tidak ada di konteks, katakan terus terang tanpa mengarang. "
+    f"Jika ditanya nama atau menyapa, perkenalkan diri secara wajar sebagai AgentLang.\n"
+    f"Konteks jurnal & kuota sesi terakhir:\n{snap_db}\n\n"
+    f"Pesan user: {pesan_asli}"
+)
                                 client_chat = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
                                 balasan = analisa_dengan_retry(
                                     client_chat,
-                                    ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-4-hydrogen"],
+                                    ["gemini-4-hydrogen", "gemini-3.6-flash", "gemini-3.5-flash-lite"],
                                     prompt_chat,
+                                    config=genai.types.GenerateContentConfig(
+                                        thinking_config=genai.types.ThinkingConfig(thinking_level="XHIGH")
+                                    ),
                                 )
                                 kirim_telegram(balasan)
                             except Exception as e:
