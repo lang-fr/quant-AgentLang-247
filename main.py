@@ -885,6 +885,26 @@ def loop_listener_telegram():
                         kirim_telegram(f"{bt_gold}\n\n{bt_btc}")
                     elif text in ["/jurnal", "/evaluasi"]:
                         kirim_telegram(ambil_ringkasan_jurnal_dan_evaluasi_mingguan())
+                        else:
+                        pesan_asli = msg.get("text", "").strip()
+                        if pesan_asli:
+                            kirim_telegram("Sedang meracik jawaban...")
+                            try:
+                                snap_db = ambil_ringkasan_jurnal_dan_evaluasi_mingguan()
+                                prompt_chat = (
+                                    f"Kamu adalah asisten quant & trading pribadi di Telegram. "
+                                    f"Jawab singkat, tajam, dan teknis dalam Bahasa Indonesia.\n"
+                                    f"Konteks jurnal & kuota sesi terakhir:\n{snap_db}\n\n"
+                                    f"Pertanyaan user: {pesan_asli}"
+                                )
+                                balasan = analisa_dengan_retry(
+                                    client,
+                                    ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-4-hydrogen"],
+                                    prompt_chat,
+                                )
+                                kirim_telegram(balasan)
+                            except Exception as e:
+                                kirim_telegram(f"Gagal balas chat: {str(e)[:150]}")
         except Exception as e:
             print("Listener error:", e)
             time.sleep(5)
