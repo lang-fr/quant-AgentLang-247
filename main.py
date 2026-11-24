@@ -668,24 +668,47 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
         kirim_telegram(laporan, log_id=log_id)
         return laporan
 
-    def analisa_dengan_retry(client, model_daftar: list, prompt: str, config=None):
+    def analisa_dengan_retry(client, model_daftar: list, prompt: str, config=None) -> str:
         error_terakhir = ""
         for model_name in model_daftar:
             for percobaan in range(2):
                 try:
                     print(f"Mencoba analisa pakai {model_name}...", flush=True)
-                    return client.models.generate_content(
+                    res = client.models.generate_content(
                         model=model_name,
                         contents=prompt,
                         config=config,
                     )
+                    return res.text
                 except Exception as e:
                     error_terakhir = str(e)
                     print(f"Gagal {model_name}: {error_terakhir[:150]}", flush=True)
                     if any(k in error_terakhir for k in ["429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE"]):
-                        time.sleep(8)
+                        time.sleep(5)
                     else:
                         break
+
+        groq_key = os.getenv("GROQ_API_KEY", "").strip()
+        if groq_key:
+            print("Semua Gemini penuh, pindah ke cadangan Groq Llama-3.3-70B...", flush=True)
+            resp_groq = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {groq_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0.2,
+                },
+                timeout=30,
+            )
+            if resp_groq.status_code == 200:
+                return resp_groq.json()["choices"][0]["message"]["content"]
+            error_terakhir = f"Groq HTTP {resp_groq.status_code}: {resp_groq.text[:100]}"
+
         raise RuntimeError(f"Semua model gagal ({error_terakhir[:120]})")
 
     client = genai.Client(api_key=GEMINI_API_KEY)
@@ -724,7 +747,7 @@ Kembalikan HANYA format JSON valid dengan kunci:
             prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
-        verdict = json.loads(response.text)
+        verdict = json.loads(response)
         xau_score = int(verdict.get("xau_score", 0))
         btc_score = int(verdict.get("btc_score", 0))
         top_score = max(xau_score, btc_score)
