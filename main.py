@@ -885,7 +885,7 @@ def loop_listener_telegram():
                         kirim_telegram(f"{bt_gold}\n\n{bt_btc}")
                     elif text in ["/jurnal", "/evaluasi"]:
                         kirim_telegram(ambil_ringkasan_jurnal_dan_evaluasi_mingguan())
-                        else:
+                    else:
                         pesan_asli = msg.get("text", "").strip()
                         if pesan_asli:
                             kirim_telegram("Sedang meracik jawaban...")
@@ -897,8 +897,9 @@ def loop_listener_telegram():
                                     f"Konteks jurnal & kuota sesi terakhir:\n{snap_db}\n\n"
                                     f"Pertanyaan user: {pesan_asli}"
                                 )
+                                client_chat = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
                                 balasan = analisa_dengan_retry(
-                                    client,
+                                    client_chat,
                                     ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-4-hydrogen"],
                                     prompt_chat,
                                 )
