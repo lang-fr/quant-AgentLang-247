@@ -608,10 +608,17 @@ def kirim_telegram(pesan: str, log_id: int = None):
 
     chunks = [pesan[i : i + 3900] for i in range(0, len(pesan), 3900)]
     for idx, chunk in enumerate(chunks):
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk}
+        payload = {"chat_id": str(TELEGRAM_CHAT_ID).strip(), "text": chunk}
         if reply_markup and idx == len(chunks) - 1:
             payload["reply_markup"] = json.dumps(reply_markup)
-        requests.post(url, json=payload, timeout=15)
+        try:
+            r = requests.post(url, json=payload, timeout=15).json()
+            if not r.get("ok"):
+                print(f"sendMessage gagal: {r}", flush=True)
+            else:
+                print("sendMessage terkirim ke Telegram!", flush=True)
+        except Exception as e:
+            print(f"Error kirim_telegram: {e}", flush=True)
 
 
 def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
@@ -740,6 +747,7 @@ def loop_listener_telegram():
     offset = 0
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     print("Listener Telegram aktif polling...", flush=True)
+    kirim_telegram("Bot Quant Agent aktif & terhubung!")
     while True:
         try:
             resp = requests.get(
