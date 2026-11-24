@@ -668,23 +668,25 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
         kirim_telegram(laporan, log_id=log_id)
         return laporan
 
-    def analisa_dengan_retry(client, model_name: str, prompt: str, config=None, max_retries: int = 3):
-        for percobaan in range(max_retries):
-            try:
-                return client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=config,
-                )
-            except Exception as e:
-                pesan_error = str(e)
-                if any(kode in pesan_error for kode in ["429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE"]):
-                    waktu_tunggu = 15 * (percobaan + 1)
-                    print(f"Server/kuota API sibuk, nunggu {waktu_tunggu} detik...")
-                    time.sleep(waktu_tunggu)
-                else:
-                    raise e
-        raise RuntimeError("Gagal analisa setelah 3x percobaan karena API sibuk/limit.")
+    def analisa_dengan_retry(client, model_daftar: list, prompt: str, config=None):
+        error_terakhir = ""
+        for model_name in model_daftar:
+            for percobaan in range(2):
+                try:
+                    print(f"Mencoba analisa pakai {model_name}...", flush=True)
+                    return client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=config,
+                    )
+                except Exception as e:
+                    error_terakhir = str(e)
+                    print(f"Gagal {model_name}: {error_terakhir[:150]}", flush=True)
+                    if any(k in error_terakhir for k in ["429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE"]):
+                        time.sleep(8)
+                    else:
+                        break
+        raise RuntimeError(f"Semua model gagal ({error_terakhir[:120]})")
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     prompt = f"""
@@ -718,7 +720,7 @@ Kembalikan HANYA format JSON valid dengan kunci:
     try:
         response = analisa_dengan_retry(
             client,
-            "gemini-3.8-flash",
+            ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-4-hydrogen"],
             prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
@@ -763,7 +765,7 @@ Kembalikan HANYA format JSON valid dengan kunci:
 # 8. BACKGROUND WORKER: SCHEDULER 24/7, EVALUASI MINGGUAN & LISTENER TELEGRAM
 # ==============================================================================
 def loop_scheduler_otomatis():
-    time.sleep(15)
+    time.sleep(AUTO_SCAN_INTERVAL_SEC)
     while True:
         try:
             jalankan_analisa_lengkap(pemicu="Auto-Scan Cloud 24/7")
