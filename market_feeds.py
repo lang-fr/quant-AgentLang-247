@@ -1,23 +1,61 @@
 import os
+import time
 from datetime import datetime, timezone
 import ccxt
 import requests
 from fredapi import Fred
 
+_CACHE = {}
+
+HEADERS_BROWSER = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
+}
+
+
+def _get_cache(key: str):
+    item = _CACHE.get(key)
+    if item and time.time() < item["expires_at"]:
+        return item["value"]
+    return None
+
+
+def _set_cache(key: str, value, ttl_seconds: int):
+    _CACHE[key] = {"value": value, "expires_at": time.time() + ttl_seconds}
+
 
 def ambil_kalender_ff(mata_uang: tuple = ("USD",)) -> dict:
     """Ambil jadwal berita High-Impact minggu ini dari ForexFactory (FairEconomy JSON)."""
+    cache_key = f"ff_{','.join(mata_uang)}"
+    cached = _get_cache(cache_key)
+    if cached is not None:
+        return cached
+
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
+        resp = requests.get(url, headers=HEADERS_BROWSER, timeout=12)
+        if resp.status_code != 200:
+            return {
+                "status": "error",
+                "blokir_entry_news": False,
+                "detail": f"HTTP {resp.status_code}",
+            }
+
         events = resp.json()
+        if not isinstance(events, list):
+            return {
+                "status": "error",
+                "blokir_entry_news": False,
+                "detail": "Format respons kalender bukan list",
+            }
 
         now_utc = datetime.now(timezone.utc)
         high_impact = []
         zona_bahaya = False
 
         for ev in events:
+            if not isinstance(ev, dict):
+                continue
             if ev.get("impact") != "High":
                 continue
             if mata_uang and ev.get("country") not in mata_uang:
@@ -33,7 +71,6 @@ def ambil_kalender_ff(mata_uang: tuple = ("USD",)) -> dict:
             if selisih_menit is not None and -45 <= selisih_menit <= 45:
                 zona_bahaya = True
 
-            # Tampilkan berita hari ini atau yang akan datang dalam 48 jam
             if selisih_menit is None or -180 <= selisih_menit <= 2880:
                 high_impact.append({
                     "waktu_utc": date_str,
@@ -44,12 +81,14 @@ def ambil_kalender_ff(mata_uang: tuple = ("USD",)) -> dict:
                     "menit_lagi": round(selisih_menit) if selisih_menit is not None else None,
                 })
 
-        return {
+        hasil = {
             "status": "ok",
             "blokir_entry_news": zona_bahaya,
             "jumlah_event": len(high_impact),
             "events": high_impact[:8],
         }
+        _set_cache(cache_key, hasil, ttl_seconds=1800)
+        return hasil
     except Exception as e:
         return {"status": "error", "blokir_entry_news": False, "detail": str(e)}
 
@@ -60,56 +99,71 @@ def ambil_makro_fred() -> dict:
     if not api_key:
         return {"status": "skip", "detail": "FRED_API_KEY belum terbaca di environment"}
 
+    cached = _get_cache("fred_makro_detail")
+    if cached is not None:
+        return cached
+
     try:
         fred = Fred(api_key=api_key)
 
-        us02y = float(fred.get_series("DGS2").dropna().iloc[-1])
-        us10y = float(fred.get_series("DGS10").dropna().iloc[-1])
-        fed_rate = float(fred.get_series("FEDFUNDS").dropna().iloc[-1])
+        s_dgs2 = fred.get_series("DGS2").dropna()
+        s_dgs10 = fred.get_series("DGS10").dropna()
+        s_fed = fred.get_series("FEDFUNDS").dropna()
+        s_cpi = fred.get_series("CPIAUCSL").dropna()
+        s_nfp = fred.get_series("PAYEMS").dropna()
 
-        cpi_series = fred.get_series("CPIAUCSL").dropna()
-        cpi_yoy = ((float(cpi_series.iloc[-1]) / float(cpi_series.iloc[-13])) - 1) * 100
+        us02y = float(s_dgs2.iloc[-1])
+        us10y = float(s_dgs10.iloc[-1])
+        fed_rate = float(s_fed.iloc[-1])
 
-        nfp_series = fred.get_series("PAYEMS").dropna()
-        nfp_change_k = float(nfp_series.iloc[-1]) - float(nfp_series.iloc[-2])
+        cpi_yoy = (
+            ((float(s_cpi.iloc[-1]) / float(s_cpi.iloc[-13])) - 1) * 100
+            if len(s_cpi) >= 13
+            else None
+        )
+        nfp_change_k = (
+            float(s_nfp.iloc[-1]) - float(s_nfp.iloc[-2])
+            if len(s_nfp) >= 2
+            else None
+        )
 
-        spread_10y_2y = round(us10y - us02y, 3)
-
-        return {
+        hasil = {
             "status": "ok",
             "US02Y_pct": round(us02y, 3),
             "US10Y_pct": round(us10y, 3),
-            "yield_curve_10y_2y": spread_10y_2y,
+            "yield_curve_10y_2y": round(us10y - us02y, 3),
             "fed_funds_rate_pct": round(fed_rate, 2),
-            "cpi_yoy_pct": round(cpi_yoy, 2),
-            "nfp_mom_ribu": round(nfp_change_k, 1),
+            "cpi_yoy_pct": round(cpi_yoy, 2) if cpi_yoy is not None else None,
+            "nfp_mom_ribu": round(nfp_change_k, 1) if nfp_change_k is not None else None,
         }
+        _set_cache("fred_makro_detail", hasil, ttl_seconds=1800)
+        return hasil
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
 
 def ambil_orderflow_ccxt(symbol: str = "BTC/USDT") -> dict:
     """Ambil harga, funding rate, dan orderbook imbalance dari bursa publik yang aman di IP cloud."""
-    # Hyperliquid & OKX diprioritaskan karena jarang kena blokir IP server cloud AS/Eropa
     bursa_prioritas = ["hyperliquid", "okx", "kucoin", "bybit"]
     last_err = ""
 
     for ex_id in bursa_prioritas:
         try:
             ex_class = getattr(ccxt, ex_id)
-            exchange = ex_class({"enableRateLimit": True, "timeout": 10000})
+            cfg = {"enableRateLimit": True, "timeout": 10000}
+            if ex_id in ("okx", "kucoin", "bybit"):
+                cfg["options"] = {"defaultType": "swap"}
+            exchange = ex_class(cfg)
 
             pair = "BTC/USDC:USDC" if ex_id == "hyperliquid" and symbol == "BTC/USDT" else symbol
             ticker = exchange.fetch_ticker(pair)
 
-            # Hitung Orderbook Imbalance 20 level teratas
             ob = exchange.fetch_order_book(pair, limit=20)
-            bid_vol = sum(b[1] for b in ob.get("bids", [])[:20])
-            ask_vol = sum(a[1] for a in ob.get("asks", [])[:20])
+            bid_vol = sum(float(b[1]) for b in ob.get("bids", [])[:20])
+            ask_vol = sum(float(a[1]) for a in ob.get("asks", [])[:20])
             total_vol = bid_vol + ask_vol
             imbalance_pct = round(((bid_vol - ask_vol) / total_vol) * 100, 2) if total_vol > 0 else 0.0
 
-            # Ambil Funding Rate perpetual
             funding_pct = None
             try:
                 swap_sym = pair if ":" in pair else f"{pair}:USDT"
@@ -119,7 +173,11 @@ def ambil_orderflow_ccxt(symbol: str = "BTC/USDT") -> dict:
             except Exception:
                 pass
 
-            tekanan = "BUY_DOMINANT" if imbalance_pct > 10 else ("SELL_DOMINANT" if imbalance_pct < -10 else "NEUTRAL")
+            tekanan = (
+                "BUY_DOMINANT"
+                if imbalance_pct > 10
+                else ("SELL_DOMINANT" if imbalance_pct < -10 else "NEUTRAL")
+            )
 
             return {
                 "status": "ok",
