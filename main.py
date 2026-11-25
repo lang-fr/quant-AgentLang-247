@@ -1033,7 +1033,7 @@ def loop_listener_telegram():
                             "/evaluasi - Lihat laporan evaluasi akurasi mingguan"
                         )
                     elif text in ["/cek", "/analisa"]:
-                        kirim_telegram("Menjalankan sidang 4 agen, cek MTF H1/H4/D1, Blockworks & Twelve Data...")
+                        kirim_telegram("AgentLang lagi cek data & analisa market ter update, tunggu bentar...")
 
                         def _run_manual_analisa():
                             try:
