@@ -54,29 +54,37 @@ _COT_CACHE = {"tanggal": "", "nilai": None}
 
 
 # ==============================================================================
-# 2. MODUL TRADING SKILLS (PLAYBOOK DOMAIN UNTUK PENALARAN TINGGI)
+# 2. MODUL TRADING SKILLS (INSTITUTIONAL DESK, MARKET MAKER, QUANT & HEDGE FUND)
 # ==============================================================================
 TRADING_SKILLS = {
+    "MARKET_MAKER_ORDERFLOW": """
+[SKILL: MARKET MAKER LIQUIDITY SWEEP & ORDERFLOW ABSORPTION]
+- Bank besar dan Market Maker membutuhkan likuiditas lawan arah sebelum menggerakkan harga: cari penyapuan (sweep) di atas PDH/PWH/Asia High untuk distribusi short, atau di bawah PDL/PWL/Asia Low untuk akumulasi long.
+- Validasi setiap breakout atau sweep dengan Cumulative Volume Delta (CVD) H1/M15 dan Orderbook Imbalance:
+  * Jika harga naik menembus high tetapi CVD melemah/negatif (Bearish Absorption), itu jebakan likuiditas (bull trap).
+  * Jika harga turun menembus low tetapi CVD menguat/positif (Bullish Absorption), institusi sedang menyerap penjualan panik.
+- Gunakan VWAP & deviasi standar sebagai peta nilai wajar: hindari membuka posisi buy di Extreme Premium (> +1.5 SD) atau sell di Extreme Discount (< -1.5 SD) tanpa konfirmasi momentum ekstrem.
+""",
     "SESSION_ICT_LIQUIDITY": """
-[SKILL: SESSION & ICT LIQUIDITY MODEL]
-- ASIA (00:00-07:00 UTC): Identifikasi pembentukan Asia High & Asia Low sebagai kolam likuiditas awal. Hindari mengejar breakout tipis di tengah sesi Asia kecuali ada katalis makro Asia/RBA/BOJ.
-- LONDON (07:00-13:00 UTC): Fokus pada Judas Swing / liquidity sweep terhadap Asia High atau Asia Low, diikuti displacement dan Fair Value Gap (FVG) atau Order Block pada M5-M15 yang searah bias H1-H4.
+[SKILL: SESSION & ICT LIQUIDITY MODEL (ASIA / LONDON / NEW YORK)]
+- ASIA (00:00-07:00 UTC): Petakan Asia High & Asia Low sebagai kolam likuiditas awal. Hindari mengejar breakout tipis di tengah sesi Asia kecuali ada katalis makro Asia/RBA/BOJ.
+- LONDON (07:00-13:00 UTC): Fokus pada Judas Swing / liquidity sweep terhadap Asia High atau Asia Low, diikuti displacement dan struktur M5-M15 yang searah bias H1-H4.
 - NEW_YORK (13:00-21:00 UTC): Evaluasi kelanjutan tren London atau NY Reversal setelah rilis data makro AS (13:30/14:00 UTC). Waspadai manipulasi awal pembukaan sesi NY sebelum ekspansi utama.
 """,
     "INTRADAY_EXECUTION": """
 [SKILL: INTRADAY & SCALP PRECISION (M1-H4)]
 - Timeframe utama: H4 & H1 sebagai kompas arah, M15 sebagai struktur setup, M5 & M1 sebagai pemicu entry presisi.
-- Wajib cek spread aktual dan ATR H1. Jika spread melampaui batas wajar atau menjelang rilis berita Tier-1 USD (±45 menit), tahan entry.
-- Wajib tetapkan level invalidasi (SL) di balik struktur swing terdekat dengan minimal Risk-to-Reward 1:2.
+- Wajib cek spread aktual, posisi harga terhadap VWAP, dan ATR H1. Jika spread melampaui batas wajar atau menjelang rilis berita Tier-1 USD (±45 menit), tahan entry.
+- Wajib tetapkan level invalidasi (SL) di balik titik sweep/struktur swing terdekat dengan minimal Risk-to-Reward 1:2.
 """,
-    "SWING_MULTI_DAY": """
-[SKILL: SWING TRADING (H4-W1, BEBERAPA HARI - MINGGU)]
+    "SWING_HEDGE_FUND": """
+[SKILL: HEDGE FUND SWING TRADING (H4-W1, BEBERAPA HARI - MINGGU)]
 - Timeframe utama: W1 & D1 sebagai struktur besar, H4 sebagai area akumulasi/distribusi entry. Fluktuasi M1/M5 diabaikan untuk keputusan arah.
 - Gabungkan volatilitas GARCH (perkiraan rentang gerak harian), positioning CFTC COT (hedge fund net), serta untuk kripto wajib audit Funding Rate, Open Interest, dan Deribit DVOL / Put-Call Ratio.
 - Antisipasi potensi sweep mingguan (Previous Weekly High/Low) sebelum masuk posisi swing.
 """,
     "MACRO_POSITION_HOLD": """
-[SKILL: MACRO POSITION & LONG-TERM HOLD (BULANAN - TAHUNAN)]
+[SKILL: INSTITUTIONAL MACRO & LONG-TERM HOLD (BULANAN - TAHUNAN)]
 - Timeframe utama: MN1 (Bulanan), W1 (Mingguan), dan D1 (Harian). Noise M1, M5, M15, dan H1 TIDAK boleh membatalkan tesis investasi jangka panjang.
 - Pilar fundamental wajib: arah US 10Y Real Yield (DFII10), tren Fed Net Liquidity (WALCL - TGA - RRP), siklus suku bunga Fed Funds, indeks DXY, serta ekspansi/kontraksi kapitalisasi Stablecoin 7 hari & global market cap.
 - Gunakan pendekatan akumulasi bertahap (DCA / scaling pada zona diskon bulanan/mingguan) dengan pengukuran risiko ekor CVaR 95% dan invalidasi struktural di level penutupan W1/MN1.
@@ -87,14 +95,14 @@ TRADING_SKILLS = {
 def pilih_skills_konteks(mode_fokus: str = "ALL", sesi_target: str = "") -> str:
     mode = (mode_fokus or "ALL").upper()
     sesi = (sesi_target or deteksi_sesi_trading()).upper()
-    terpilih = []
+    terpilih = [TRADING_SKILLS["MARKET_MAKER_ORDERFLOW"]]
 
     if mode in ("ALL", "SESSION", "INTRADAY") or sesi in ("ASIA", "LONDON", "NEW_YORK"):
         terpilih.append(TRADING_SKILLS["SESSION_ICT_LIQUIDITY"])
     if mode in ("ALL", "INTRADAY"):
         terpilih.append(TRADING_SKILLS["INTRADAY_EXECUTION"])
     if mode in ("ALL", "SWING"):
-        terpilih.append(TRADING_SKILLS["SWING_MULTI_DAY"])
+        terpilih.append(TRADING_SKILLS["SWING_HEDGE_FUND"])
     if mode in ("ALL", "HOLD", "POSITION"):
         terpilih.append(TRADING_SKILLS["MACRO_POSITION_HOLD"])
 
@@ -250,7 +258,7 @@ def ambil_ringkasan_jurnal_dan_evaluasi_mingguan() -> str:
 
 
 # ==============================================================================
-# 4. MODUL KALENDER TIER-1 & MTF LENGKAP (M1-MN1 + SKOR PER HORIZON)
+# 4. MODUL KALENDER TIER-1, MTF (M1-MN1), ORDERFLOW CVD & MARKET MAKER SWEEP
 # ==============================================================================
 def cek_kalender_berita_tier1_otomatis() -> dict:
     try:
@@ -334,10 +342,128 @@ def _hitung_rentang_sesi_hari_ini(df_h1: pd.DataFrame) -> dict:
         return {}
 
 
+def analisa_orderflow_dan_likuiditas(
+    df_m15: pd.DataFrame,
+    df_h1: pd.DataFrame,
+    df_d1: pd.DataFrame,
+    session_ranges: dict,
+) -> dict:
+    """
+    Menghitung proksi Orderflow institusional (Cumulative Volume Delta M15/H1 & divergensi absorpsi),
+    Market Maker Liquidity Sweep (PDH/PDL, PWH/PWL, Asia High/Low), serta VWAP & Premium/Discount zone.
+    """
+    try:
+        if df_h1.empty or len(df_h1) < 30 or df_d1.empty or len(df_d1) < 10:
+            return {"status": "data_tidak_cukup"}
+
+        def _hitung_cvd_dan_divergensi(df_in: pd.DataFrame, lookback: int = 24) -> dict:
+            sub = df_in.tail(max(lookback + 5, 30)).copy()
+            rng = (sub["High"] - sub["Low"]).replace(0, np.nan)
+            clv = (((sub["Close"] - sub["Low"]) - (sub["High"] - sub["Close"])) / rng).fillna(0.0)
+            vol = sub["Volume"].fillna(0.0).replace(0.0, 1.0) if "Volume" in sub.columns else pd.Series(1.0, index=sub.index)
+            bar_delta = clv * vol
+            cvd = bar_delta.cumsum()
+
+            recent = sub.tail(lookback)
+            cvd_recent = cvd.tail(lookback)
+            half = lookback // 2
+
+            p_first_high = float(recent["High"].iloc[:half].max())
+            p_second_high = float(recent["High"].iloc[half:].max())
+            c_first_high = float(cvd_recent.iloc[:half].max())
+            c_second_high = float(cvd_recent.iloc[half:].max())
+
+            p_first_low = float(recent["Low"].iloc[:half].min())
+            p_second_low = float(recent["Low"].iloc[half:].min())
+            c_first_low = float(cvd_recent.iloc[:half].min())
+            c_second_low = float(cvd_recent.iloc[half:].min())
+
+            net_delta = float(bar_delta.tail(lookback).sum())
+            total_vol = float(vol.tail(lookback).sum())
+            delta_ratio_pct = round((net_delta / total_vol) * 100, 1) if total_vol > 0 else 0.0
+
+            divergensi = "ALIGNED_FLOW"
+            if p_second_high > p_first_high and c_second_high < c_first_high:
+                divergensi = "BEARISH_ABSORPTION_DISTRIBUTION"
+            elif p_second_low < p_first_low and c_second_low > c_first_low:
+                divergensi = "BULLISH_ABSORPTION_ACCUMULATION"
+
+            return {
+                "net_delta_ratio_pct": delta_ratio_pct,
+                "flow_bias": "BUY_PRESSURE" if delta_ratio_pct > 5 else ("SELL_PRESSURE" if delta_ratio_pct < -5 else "NEUTRAL_FLOW"),
+                "absorption_signal": divergensi,
+            }
+
+        of_h1 = _hitung_cvd_dan_divergensi(df_h1, 24)
+        of_m15 = _hitung_cvd_dan_divergensi(df_m15, 32) if not df_m15.empty and len(df_m15) >= 32 else {}
+
+        # VWAP 24-bar H1 & Zona Premium / Discount Institusional
+        vwap_df = df_h1.tail(24).copy()
+        tp = (vwap_df["High"] + vwap_df["Low"] + vwap_df["Close"]) / 3.0
+        vol_v = vwap_df["Volume"].fillna(0.0).replace(0.0, 1.0) if "Volume" in vwap_df.columns else pd.Series(1.0, index=vwap_df.index)
+        vwap_val = float((tp * vol_v).sum() / vol_v.sum())
+        vwap_std = float(tp.std()) if pd.notna(tp.std()) and tp.std() > 0 else 1.0
+        last_close = float(df_h1["Close"].iloc[-1])
+        vwap_z = round((last_close - vwap_val) / vwap_std, 2)
+
+        if vwap_z > 1.5:
+            zona_nilai = "EXTREME_PREMIUM"
+        elif vwap_z > 0.3:
+            zona_nilai = "PREMIUM"
+        elif vwap_z < -1.5:
+            zona_nilai = "EXTREME_DISCOUNT"
+        elif vwap_z < -0.3:
+            zona_nilai = "DISCOUNT"
+        else:
+            zona_nilai = "EQUILIBRIUM"
+
+        # Market Maker Liquidity Sweep Detection (PDH/PDL, PWH/PWL, Asia High/Low)
+        pdh = round(float(df_d1["High"].iloc[-2]), 2)
+        pdl = round(float(df_d1["Low"].iloc[-2]), 2)
+        pwh = round(float(df_d1["High"].iloc[-7:-1].max()), 2)
+        pwl = round(float(df_d1["Low"].iloc[-7:-1].min()), 2)
+
+        recent_h1 = df_h1.tail(6)
+        recent_high = float(recent_h1["High"].max())
+        recent_low = float(recent_h1["Low"].min())
+
+        sweeps_terdeteksi = []
+        if recent_high > pdh and last_close < pdh:
+            sweeps_terdeteksi.append(f"SWEEP_PDH_BEARISH ({pdh})")
+        if recent_low < pdl and last_close > pdl:
+            sweeps_terdeteksi.append(f"SWEEP_PDL_BULLISH ({pdl})")
+        if recent_high > pwh and last_close < pwh:
+            sweeps_terdeteksi.append(f"SWEEP_PWH_BEARISH ({pwh})")
+        if recent_low < pwl and last_close > pwl:
+            sweeps_terdeteksi.append(f"SWEEP_PWL_BULLISH ({pwl})")
+
+        asia_rng = session_ranges.get("ASIA", {})
+        if asia_rng:
+            a_high = float(asia_rng.get("high", 0))
+            a_low = float(asia_rng.get("low", 0))
+            if a_high > 0 and recent_high > a_high and last_close < a_high:
+                sweeps_terdeteksi.append(f"SWEEP_ASIA_HIGH_BEARISH ({a_high})")
+            if a_low > 0 and recent_low < a_low and last_close > a_low:
+                sweeps_terdeteksi.append(f"SWEEP_ASIA_LOW_BULLISH ({a_low})")
+
+        return {
+            "H1_orderflow": of_h1,
+            "M15_orderflow": of_m15,
+            "VWAP_24h": round(vwap_val, 2),
+            "VWAP_zscore": vwap_z,
+            "value_zone": zona_nilai,
+            "liquidity_levels": {"PDH": pdh, "PDL": pdl, "PWH": pwh, "PWL": pwl},
+            "liquidity_sweeps": sweeps_terdeteksi if sweeps_terdeteksi else ["NONE_ACTIVE"],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def cek_konfluensi_mtf_dan_regime(ticker: str = "GC=F") -> dict:
     """
     Menghitung struktur EMA lintas timeframe M1, M5, M15, H1, H4, D1, W1, MN1,
-    rentang high/low per sesi (Asia/London/NY), serta skor terpisah untuk Intraday, Swing, dan Hold.
+    rentang high/low per sesi (Asia/London/NY), orderflow CVD & liquidity sweep,
+    serta skor terpisah untuk Intraday, Swing, dan Hold.
     """
     try:
         df_m1 = yf.download(ticker, period="2d", interval="1m", progress=False)
@@ -394,6 +520,9 @@ def cek_konfluensi_mtf_dan_regime(ticker: str = "GC=F") -> dict:
 
         regime = "TRENDING" if adx_val >= 22 else ("TRANSITION" if adx_val >= 18 else "CHOPPY_SIDEWAYS")
 
+        session_ranges = _hitung_rentang_sesi_hari_ini(df_h1)
+        orderflow_mm = analisa_orderflow_dan_likuiditas(df_m15, df_h1, df_d1, session_ranges)
+
         def _skor_grup(tfs: list, arah_ref: str) -> int:
             if arah_ref not in ("BULLISH", "BEARISH"):
                 return 35
@@ -422,7 +551,8 @@ def cek_konfluensi_mtf_dan_regime(ticker: str = "GC=F") -> dict:
             "D1_trend": d1_trend,
             "W1_trend": w1_trend,
             "MN1_trend": mn1_trend,
-            "session_ranges_utc": _hitung_rentang_sesi_hari_ini(df_h1),
+            "session_ranges_utc": session_ranges,
+            "orderflow_and_liquidity": orderflow_mm,
             "intraday_bias": arah_intraday,
             "intraday_score": skor_intraday,
             "swing_bias": arah_swing,
@@ -439,6 +569,108 @@ def cek_konfluensi_mtf_dan_regime(ticker: str = "GC=F") -> dict:
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+def audit_high_probability_setup(
+    aset_label: str,
+    mtf: dict,
+    data_makro: dict,
+    data_institusi: dict,
+    spread_pips: float,
+    is_news_blocked: bool,
+) -> dict:
+    """
+    Mesin Critical Thinking Institusional: mengaudit benturan struktur, orderflow CVD,
+    posisi VWAP premium/discount, market regime, serta positioning hedge fund/derivatif.
+    """
+    red_flags = []
+    edge_confirmations = []
+
+    if not isinstance(mtf, dict) or "error" in mtf:
+        return {
+            "asset": aset_label,
+            "max_allowed_score": 40,
+            "red_flags": ["Data struktur & orderflow tidak lengkap"],
+            "edge_confirmations": [],
+        }
+
+    regime = mtf.get("market_regime", "CHOPPY_SIDEWAYS")
+    adx = mtf.get("ADX_14", 0)
+    if regime == "CHOPPY_SIDEWAYS":
+        red_flags.append(f"Regime CHOPPY_SIDEWAYS (ADX {adx} < 18): risiko whipsaw tinggi")
+    else:
+        edge_confirmations.append(f"Regime {regime} (ADX {adx})")
+
+    of_liq = mtf.get("orderflow_and_liquidity", {})
+    h1_of = of_liq.get("H1_orderflow", {})
+    flow_bias = h1_of.get("flow_bias", "NEUTRAL_FLOW")
+    abs_sig = h1_of.get("absorption_signal", "ALIGNED_FLOW")
+    val_zone = of_liq.get("value_zone", "EQUILIBRIUM")
+    sweeps = of_liq.get("liquidity_sweeps", [])
+
+    intraday_bias = mtf.get("intraday_bias", "NETRAL")
+    if intraday_bias == "BULLISH" and flow_bias == "SELL_PRESSURE":
+        red_flags.append("Divergensi Orderflow: tren H1 bullish tetapi CVD H1 negatif (distribusi)")
+    elif intraday_bias == "BEARISH" and flow_bias == "BUY_PRESSURE":
+        red_flags.append("Divergensi Orderflow: tren H1 bearish tetapi CVD H1 positif (akumulasi)")
+    elif flow_bias != "NEUTRAL_FLOW":
+        edge_confirmations.append(f"Orderflow CVD selaras ({flow_bias}, {h1_of.get('net_delta_ratio_pct')}%)")
+
+    if abs_sig != "ALIGNED_FLOW":
+        edge_confirmations.append(f"Sinyal Absorpsi Institusi: {abs_sig}")
+
+    if intraday_bias == "BULLISH" and val_zone == "EXTREME_PREMIUM":
+        red_flags.append(f"Overextended: harga di {val_zone} (VWAP Z={of_liq.get('VWAP_zscore')}), dilarang FOMO buy")
+    elif intraday_bias == "BEARISH" and val_zone == "EXTREME_DISCOUNT":
+        red_flags.append(f"Overextended: harga di {val_zone} (VWAP Z={of_liq.get('VWAP_zscore')}), dilarang FOMO sell")
+    elif val_zone in ("DISCOUNT", "EXTREME_DISCOUNT", "PREMIUM", "EXTREME_PREMIUM"):
+        edge_confirmations.append(f"Posisi nilai institusional: {val_zone} (VWAP Z={of_liq.get('VWAP_zscore')})")
+
+    if sweeps and sweeps != ["NONE_ACTIVE"]:
+        edge_confirmations.append(f"Market Maker Sweep terdeteksi: {', '.join(sweeps)}")
+
+    if aset_label == "XAUUSD":
+        if spread_pips > MAX_SPREAD_PIPS:
+            red_flags.append(f"Spread XAUUSD lebar ({spread_pips} > {MAX_SPREAD_PIPS} pips)")
+        cot_net = data_institusi.get("cftc_cot", {}).get("GOLD_Net_HedgeFund_Contracts")
+        if isinstance(cot_net, int):
+            edge_confirmations.append(f"CFTC COT Hedge Fund Net Gold: {cot_net:,} kontrak")
+        real_yield = data_makro.get("fred_macro", {}).get("REAL_YIELD_DFII10")
+        if real_yield is not None:
+            edge_confirmations.append(f"US 10Y Real Yield (DFII10): {real_yield}%")
+
+    if aset_label == "BTCUSDT":
+        ccxt_of = data_institusi.get("orderflow_ccxt", {})
+        if isinstance(ccxt_of, dict) and ccxt_of.get("imbalance"):
+            edge_confirmations.append(f"Orderbook CCXT BTC: {ccxt_of.get('imbalance')}")
+        deriv = data_institusi.get("kripto_derivatif", {})
+        fr = deriv.get("funding_rate_pct")
+        if isinstance(fr, (int, float)):
+            if fr > 0.03 and intraday_bias == "BULLISH":
+                red_flags.append(f"Crowded Long: Funding rate tinggi ({fr}%), rawan long squeeze")
+            elif fr < -0.02 and intraday_bias == "BEARISH":
+                red_flags.append(f"Crowded Short: Funding rate negatif ({fr}%), rawan short squeeze")
+        deribit = data_institusi.get("deribit_options", {})
+        if isinstance(deribit, dict) and deribit.get("Put_Call_OI_Ratio") is not None:
+            edge_confirmations.append(
+                f"Deribit DVOL: {deribit.get('DVOL_BTC')} | Put/Call OI: {deribit.get('Put_Call_OI_Ratio')}"
+            )
+
+    if is_news_blocked:
+        red_flags.append("Circuit Breaker Berita USD Tier-1 aktif (±45 menit)")
+
+    max_cap = 100
+    if len(red_flags) >= 2 or is_news_blocked:
+        max_cap = 68
+    elif len(red_flags) == 1:
+        max_cap = 78
+
+    return {
+        "asset": aset_label,
+        "max_allowed_score": max_cap,
+        "red_flags": red_flags if red_flags else ["Tidak ada red flag struktural mayor"],
+        "edge_confirmations": edge_confirmations,
+    }
 
 
 # ==============================================================================
@@ -496,7 +728,7 @@ class TrendQuantStrategy(Strategy):
         self.sma_fast = self.I(lambda x: pd.Series(x).rolling(self.fast_period).mean(), close)
         self.sma_slow = self.I(lambda x: pd.Series(x).rolling(self.slow_period).mean(), close)
 
-    def next(self):
+    def next():
         if self.sma_fast[-1] > self.sma_slow[-1] and not self.position:
             self.buy(size=0.1)
         elif self.sma_fast[-1] < self.sma_slow[-1] and self.position:
@@ -871,7 +1103,7 @@ def cek_spread_mt5_cloud(symbol: str = "XAUUSD") -> float:
 
 
 # ==============================================================================
-# 8. LAPISAN 4: GEMINI 4 HYDROGEN (THINKING HIGH) & DEWAN JURI MULTI-HORIZON
+# 8. LAPISAN 4: GEMINI 4 HYDROGEN (THINKING HIGH) & DEWAN JURI INSTITUSIONAL
 # ==============================================================================
 def bersihkan_teks_telegram(teks: str) -> str:
     if not teks:
@@ -939,10 +1171,6 @@ def kirim_telegram(pesan: str, log_id: int = None):
 
 
 def panggil_gemini_hydrogen_high(client, prompt: str, use_google_search: bool = True) -> str:
-    """
-    Memanggil models/gemini-4-hydrogen dengan thinking_level='high' dan Google Search grounding
-    sesuai API interactions pada Google AI Studio.
-    """
     if not client:
         return ""
     try:
@@ -1027,13 +1255,19 @@ def analisa_dengan_retry(client, models: list, prompt: str, config=None, retries
 def _ringkas_mtf(mtf: dict) -> str:
     if not isinstance(mtf, dict) or "error" in mtf:
         return "MTF: tidak tersedia"
+    of_liq = mtf.get("orderflow_and_liquidity", {})
+    h1_of = of_liq.get("H1_orderflow", {})
+    sweeps = ", ".join(of_liq.get("liquidity_sweeps", ["NONE"]))
     return (
         f"M1:{mtf.get('M1_trend')} | M5:{mtf.get('M5_trend')} | M15:{mtf.get('M15_trend')} | "
         f"H1:{mtf.get('H1_trend')} | H4:{mtf.get('H4_trend')} | D1:{mtf.get('D1_trend')} | "
         f"W1:{mtf.get('W1_trend')} | MN1:{mtf.get('MN1_trend')}\n"
-        f"  Skor Horizon -> Intraday:{mtf.get('intraday_score')}/100 ({mtf.get('intraday_bias')}) | "
-        f"Swing:{mtf.get('swing_score')}/100 ({mtf.get('swing_bias')}) | "
-        f"Hold:{mtf.get('hold_position_score')}/100 ({mtf.get('hold_position_bias')})"
+        f"  Orderflow H1: {h1_of.get('flow_bias')} ({h1_of.get('net_delta_ratio_pct')}%) | "
+        f"{h1_of.get('absorption_signal')} | Zona: {of_liq.get('value_zone')} (VWAP Z={of_liq.get('VWAP_zscore')})\n"
+        f"  Liquidity Sweep: {sweeps}\n"
+        f"  Horizon -> Intraday:{mtf.get('intraday_score')} ({mtf.get('intraday_bias')}) | "
+        f"Swing:{mtf.get('swing_score')} ({mtf.get('swing_bias')}) | "
+        f"Hold:{mtf.get('hold_position_score')} ({mtf.get('hold_position_bias')})"
     )
 
 
@@ -1090,17 +1324,22 @@ def jalankan_analisa_lengkap(
         "BTCUSD_live": btc_live or "TIDAK_TERSEDIA",
     }
 
+    is_news_blocked = data_institusi.get("kalender_ff", {}).get(
+        "blokir_entry_news", kalender_news.get("is_high_impact_active", False)
+    )
+
     risk_status = validasi_hardcoded_risk(
         balance=1000.0,
         sl_pips=30.0,
         pip_value=1.0,
         layers=1,
         spread_pips=spread_aktif,
-        is_high_impact_news=data_institusi.get("kalender_ff", {}).get(
-            "blokir_entry_news", kalender_news.get("is_high_impact_active", False)
-        ),
+        is_high_impact_news=is_news_blocked,
         z_score_h1=mtf_gold.get("Z_score_H1_latest", 0.0),
     )
+
+    audit_gold = audit_high_probability_setup("XAUUSD", mtf_gold, data_makro, data_institusi, spread_aktif, is_news_blocked)
+    audit_btc = audit_high_probability_setup("BTCUSDT", mtf_btc, data_makro, data_institusi, spread_aktif, is_news_blocked)
 
     sesi_aktif = sesi_target.upper() if sesi_target else deteksi_sesi_trading()
     skills_aktif = pilih_skills_konteks(mode_fokus=mode_fokus, sesi_target=sesi_aktif)
@@ -1110,9 +1349,9 @@ def jalankan_analisa_lengkap(
         laporan = (
             f"[MODE DATA MENTAH - {pemicu}]\n"
             f"Live Prices: {live_prices_ctx}\n"
-            f"Risk: {risk_status}\n"
-            f"MTF Gold: {mtf_gold}\n"
-            f"MTF BTC: {mtf_btc}"
+            f"Audit XAU: {audit_gold}\n"
+            f"Audit BTC: {audit_btc}\n"
+            f"Risk: {risk_status}"
         )
         log_id = simpan_log("XAUUSD/BTC", "WAIT", 0, spread_aktif, macro_snap, "NO_API_KEY", laporan[:400])
         kirim_telegram(laporan, log_id=log_id)
@@ -1120,70 +1359,77 @@ def jalankan_analisa_lengkap(
 
     client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-    SYSTEM_INSTRUCTION_QUANT = f"""Kamu adalah Dewan Juri 4-Agen Kuantitatif Institusional dengan penalaran tinggi.
+    SYSTEM_INSTRUCTION_QUANT = f"""Kamu adalah Dewan Juri Institusional 4-Divisi:
+1. Quant & Statistical Arbitrage Desk (GARCH, CVaR, Z-Score, korelasi lintas aset)
+2. Bank FX / Commodity & Market Maker Desk (Orderflow CVD, Liquidity Sweep PDH/PDL/PWH/PWL/Asia, VWAP Premium/Discount)
+3. Global Macro Hedge Fund PM (FRED Real Yield DFII10, Fed Net Liquidity, CFTC COT, Deribit Options, Stablecoin Flow)
+4. Skeptic Risk Officer (audit red flag, trap likuiditas, dan rem darurat)
+
 Gunakan playbook skill berikut dalam mengevaluasi setup:
 {skills_aktif}
 
-Prinsip wajib:
-1. Pisahkan dengan tegas evaluasi per horizon waktu:
-   - Sesi Aktif / Target ({sesi_aktif}: ASIA / LONDON / NEW_YORK)
-   - Intraday (M1, M5, M15, H1, H4)
-   - Swing (H4, D1, W1)
-   - Hold Position Berbulan-bulan sampai Bertahun-tahun (D1, W1, MN1 + Makro Real Yield, Net Liquidity, DXY, COT, Stablecoin)
-2. Jangan membatalkan tesis Hold Bulanan/Tahunan hanya karena M1/M5 berlawanan, dan sebaliknya jangan memaksakan entry Intraday hanya karena MN1 bullish jika M5-H1 masih bearish/choppy.
-3. DILARANG mengarang level harga atau berita yang tidak ada di data atau hasil pencarian.
-4. JANGAN pakai tanda bintang (* atau **) dalam teks."""
+Prinsip Critical Thinking & High Probability Wajib:
+- Hormati batas skor maksimum dari Audit Deterministik (XAU max={audit_gold['max_allowed_score']}, BTC max={audit_btc['max_allowed_score']}). Jika ada red flag mayor atau tidak ada konfluensi orderflow/likuiditas, WAJIB beri skor < 75 dan bias WAIT_NO_TRADE.
+- Pisahkan evaluasi per horizon waktu: Sesi ({sesi_aktif}), Intraday (M1-H4), Swing (H4-W1), dan Hold Position (D1-MN1).
+- DILARANG mengarang harga atau katalis yang tidak ada di data.
+- JANGAN pakai tanda bintang (* atau **) dalam teks."""
 
     prompt = f"""
-Analisa data pasar berikut untuk XAUUSD dan BTCUSDT dalam Bahasa Indonesia yang singkat, padat, dan tajam untuk Telegram.
+Analisa data pasar institusional berikut untuk XAUUSD dan BTCUSDT dalam Bahasa Indonesia yang tajam, singkat, dan terukur untuk Telegram.
 Pemicu: {pemicu} | Mode Fokus: {mode_fokus} | Sesi Fokus: {sesi_aktif} | Spread XAUUSD: {spread_aktif} pips
 
 Harga Rujukan Utama: {live_prices_ctx}
 
-Data Kuantitatif & Multi-Timeframe (M1-MN1):
+Hasil Audit Critical Thinking Deterministik:
+- XAUUSD Audit: {audit_gold}
+- BTCUSDT Audit: {audit_btc}
+
+Data Kuantitatif, Orderflow & Multi-Timeframe (M1-MN1):
 1. Makro & Risiko Ekor (FRED, Korelasi, GARCH, CVaR): {data_makro}
-2. MTF Lengkap & Rentang Sesi (Asia/London/NY):
+2. MTF Lengkap, Orderflow CVD, VWAP & Market Maker Sweeps:
    - Gold: {mtf_gold}
    - BTC: {mtf_btc}
    - CoinMarketCap: {cmc_data}
-3. Institusi, Derivatif, Deribit Options & Stablecoin: {data_institusi}
+3. Institusi, Orderbook CCXT, Derivatif OKX, Deribit Options & Stablecoin: {data_institusi}
 4. Blockworks & TwelveData: {blockworks_intel} | {twelvedata_quote}
 5. Kalender Berita & Risk Guardrail: {kalender_news} | {risk_status}
 
 Kembalikan HANYA JSON valid dengan struktur persis berikut:
 {{
-  "xau_score": integer (0-100, sesuaikan dengan mode fokus {mode_fokus}),
+  "xau_score": integer (0-{audit_gold['max_allowed_score']}),
   "xau_bias": "BULLISH" | "BEARISH" | "WAIT_NO_TRADE",
-  "btc_score": integer (0-100, sesuaikan dengan mode fokus {mode_fokus}),
+  "btc_score": integer (0-{audit_btc['max_allowed_score']}),
   "btc_bias": "BULLISH" | "BEARISH" | "WAIT_NO_TRADE",
+  "orderflow_mm_view": "- pembacaan CVD, VWAP premium/discount & liquidity sweep (maks 22 kata)",
   "session_plan": "- rencana sesi ASIA / LONDON / NEW_YORK singkat (maks 20 kata)",
   "intraday_setup": "- bias, pemicu M1-H1 & invalidasi intraday singkat (maks 20 kata)",
-  "swing_setup": "- bias, area H4-W1 & invalidasi swing singkat (maks 20 kata)",
+  "swing_setup": "- bias, area H4-W1, COT/derivatif & invalidasi swing (maks 20 kata)",
   "hold_position_plan": "- tesis makro D1-MN1 & zona akumulasi hold bulanan-tahunan (maks 22 kata)",
-  "bear_skeptic_veto": "- jebakan likuiditas / blind spot utama (maks 18 kata)",
+  "bear_skeptic_veto": "- red flag & blind spot paling kritis dari data di atas (maks 20 kata)",
   "final_verdict": "- keputusan eksekusi, ukuran risiko & syarat batal (maks 20 kata)"
 }}
 """
 
     def _susun_laporan_json(verdict_dict: dict, label_engine: str) -> tuple[str, int, str, bool]:
-        x_sc = int(verdict_dict.get("xau_score", 0))
-        b_sc = int(verdict_dict.get("btc_score", 0))
+        x_sc = min(int(verdict_dict.get("xau_score", 0)), audit_gold["max_allowed_score"])
+        b_sc = min(int(verdict_dict.get("btc_score", 0)), audit_btc["max_allowed_score"])
         top_s = max(x_sc, b_sc)
         bias_sum = f"[{mode_fokus}] XAU:{verdict_dict.get('xau_bias')}({x_sc}) | BTC:{verdict_dict.get('btc_bias')}({b_sc})"
         lolos = bool(risk_status.get("approved")) and (top_s >= 75)
         teks_out = (
-            f"QUANT AGENT v2.6 [{label_engine}] — {pemicu}\n"
+            f"QUANT AGENT v2.7 [{label_engine}] — {pemicu}\n"
             f"Fokus: {mode_fokus} | Sesi: {sesi_aktif} | Spread XAU: {spread_aktif} pips\n\n"
             f"• XAUUSD ({live_prices_ctx['XAUUSD_live']}): {verdict_dict.get('xau_bias')} ({x_sc}/100) | {mtf_gold.get('market_regime')}\n"
             f"  {_ringkas_mtf(mtf_gold)}\n"
             f"• BTCUSDT ({live_prices_ctx['BTCUSD_live']}): {verdict_dict.get('btc_bias')} ({b_sc}/100) | {mtf_btc.get('market_regime')}\n"
             f"  {_ringkas_mtf(mtf_btc)}\n\n"
-            f"1. Sesi (Asia / London / NY):\n{verdict_dict.get('session_plan')}\n\n"
-            f"2. Intraday (M1-H4):\n{verdict_dict.get('intraday_setup')}\n\n"
-            f"3. Swing (H4-W1):\n{verdict_dict.get('swing_setup')}\n\n"
-            f"4. Hold Position (Bulanan - Tahunan / D1-MN1):\n{verdict_dict.get('hold_position_plan')}\n\n"
-            f"5. Skeptic Veto & Blind Spot:\n{verdict_dict.get('bear_skeptic_veto')}\n\n"
-            f"6. Final Verdict & Guardrail:\n{verdict_dict.get('final_verdict')}\n"
+            f"1. Orderflow & Market Maker:\n{verdict_dict.get('orderflow_mm_view')}\n\n"
+            f"2. Sesi (Asia / London / NY):\n{verdict_dict.get('session_plan')}\n\n"
+            f"3. Intraday (M1-H4):\n{verdict_dict.get('intraday_setup')}\n\n"
+            f"4. Swing Hedge Fund (H4-W1):\n{verdict_dict.get('swing_setup')}\n\n"
+            f"5. Hold Position (Bulanan - Tahunan / D1-MN1):\n{verdict_dict.get('hold_position_plan')}\n\n"
+            f"6. Skeptic Audit & Red Flag:\n{verdict_dict.get('bear_skeptic_veto')}\n\n"
+            f"7. Final Verdict & Guardrail:\n{verdict_dict.get('final_verdict')}\n"
             f"Status Eksekusi: {'LOLOS HIGH-PROB (>=75)' if lolos else 'DITAHAN / WAIT'}"
         )
         return teks_out, top_s, bias_sum, lolos
@@ -1191,7 +1437,6 @@ Kembalikan HANYA JSON valid dengan struktur persis berikut:
     raw_json = ""
     engine_dipakai = "GEMINI-4-HYDROGEN (HIGH)"
 
-    # 1. Prioritas Utama: Gemini 4 Hydrogen (thinking_level='high' + google_search)
     if client:
         raw_json = panggil_gemini_hydrogen_high(
             client,
@@ -1199,7 +1444,6 @@ Kembalikan HANYA JSON valid dengan struktur persis berikut:
             use_google_search=True,
         )
 
-    # 2. Cadangan 1: Gemini 2.5 Pro (thinking_budget=24576)
     if not raw_json and client:
         engine_dipakai = "GEMINI-2.5-PRO (THINKING)"
         raw_json = analisa_dengan_retry(
@@ -1214,7 +1458,6 @@ Kembalikan HANYA JSON valid dengan struktur persis berikut:
             retries=1,
         )
 
-    # 3. Cadangan 2: Groq Llama 3.3 70B
     if not raw_json and GROQ_API_KEY:
         engine_dipakai = "GROQ-LLAMA-3.3-70B"
         raw_json = panggil_groq_fallback(prompt, system_prompt=SYSTEM_INSTRUCTION_QUANT)
@@ -1239,7 +1482,7 @@ Kembalikan HANYA JSON valid dengan struktur persis berikut:
             return hasil_teks
         except Exception:
             hasil_teks = (
-                f"QUANT AGENT v2.6 [{engine_dipakai}] — {pemicu}\n"
+                f"QUANT AGENT v2.7 [{engine_dipakai}] — {pemicu}\n"
                 f"• XAUUSD: {_ringkas_mtf(mtf_gold)}\n"
                 f"• BTCUSDT: {_ringkas_mtf(mtf_btc)}\n\n"
                 f"{raw_json}"
@@ -1249,11 +1492,11 @@ Kembalikan HANYA JSON valid dengan struktur persis berikut:
             return hasil_teks
 
     hasil_teks = (
-        f"QUANT AGENT v2.6 [DATA MENTAH] — {pemicu}\n"
+        f"QUANT AGENT v2.7 [DATA MENTAH] — {pemicu}\n"
         f"Sesi: {sesi_aktif} | Spread XAU: {spread_aktif} pips\n"
         f"• XAUUSD ({live_prices_ctx['XAUUSD_live']}): {_ringkas_mtf(mtf_gold)}\n"
         f"• BTCUSDT ({live_prices_ctx['BTCUSD_live']}): {_ringkas_mtf(mtf_btc)}\n\n"
-        f"Catatan: Model AI sedang sibuk/limit. Data MTF (M1-MN1) & risiko tetap aman (WAIT_NO_TRADE)."
+        f"Catatan: Model AI sedang sibuk/limit. Data MTF (M1-MN1), Orderflow & risiko tetap aman (WAIT_NO_TRADE)."
     )
     simpan_log("XAUUSD/BTC", "WAIT_NO_MODEL", 0, spread_aktif, macro_snap, "AUTO_WAIT", hasil_teks[:400])
     kirim_telegram(hasil_teks, log_id=None)
@@ -1299,8 +1542,8 @@ def loop_listener_telegram():
         return
     offset = 0
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-    print("Listener Telegram v2.6 aktif polling...", flush=True)
-    kirim_telegram("Bot Quant Agent v2.6 (Gemini 4 Hydrogen High + M1-MN1 + Multi-Horizon Skills) aktif!")
+    print("Listener Telegram v2.7 aktif polling...", flush=True)
+    kirim_telegram("Bot Quant Agent v2.7 (Institutional Orderflow + Market Maker Sweep + Gemini 4 Hydrogen High) aktif!")
     while True:
         try:
             resp = requests.get(
@@ -1352,12 +1595,12 @@ def loop_listener_telegram():
                 if chat_id == str(TELEGRAM_CHAT_ID):
                     if text in ["/start", "/help"]:
                         kirim_telegram(
-                            "Quant Agent v2.6 Aktif (Gemini 4 Hydrogen High + Skills).\n"
+                            "Quant Agent v2.7 Aktif (Institutional Desk + Orderflow + Market Maker Sweep).\n"
                             "Perintah tersedia:\n"
-                            "/cek - Analisa lengkap semua horizon (Sesi, Intraday, Swing, Hold)\n"
+                            "/cek - Analisa lengkap semua horizon (Orderflow, Sesi, Intraday, Swing, Hold)\n"
                             "/cek asia | /cek london | /cek ny - Fokus likuiditas & struktur per sesi\n"
-                            "/cek intraday - Fokus eksekusi M1-H4\n"
-                            "/cek swing - Fokus ayunan H4-W1 & derivatif\n"
+                            "/cek intraday - Fokus eksekusi M1-H4, CVD & VWAP\n"
+                            "/cek swing - Fokus ayunan H4-W1, COT & derivatif\n"
                             "/cek hold - Fokus posisi bulanan-tahunan D1-MN1 & makro\n"
                             "/backtest - Uji statistik backtesting.py & 1.000x Monte Carlo\n"
                             "/jurnal - Lihat jurnal audit SQLite & kuota sesi"
@@ -1365,7 +1608,7 @@ def loop_listener_telegram():
                     elif text.startswith("/cek") or text.startswith("/analisa"):
                         mode_fokus, sesi_target = _deteksi_fokus_dari_teks(text)
                         label_cmd = f"{mode_fokus}" + (f" ({sesi_target})" if sesi_target else "")
-                        kirim_telegram(f"AgentLang lagi menjalankan penalaran tinggi [{label_cmd}] (M1-MN1), tunggu sebentar...")
+                        kirim_telegram(f"AgentLang lagi menjalankan audit institusional [{label_cmd}] (M1-MN1 + Orderflow), tunggu sebentar...")
 
                         def _run_manual_analisa(m_fokus=mode_fokus, s_target=sesi_target, lbl=label_cmd):
                             try:
@@ -1388,14 +1631,15 @@ def loop_listener_telegram():
                     else:
                         pesan_asli = msg.get("text", "").strip()
                         if pesan_asli:
-                            kirim_telegram("Sedang meracik jawaban dengan penalaran tinggi...")
+                            kirim_telegram("Sedang meracik jawaban dengan penalaran institusional...")
                             try:
                                 snap_db = ambil_ringkasan_jurnal_dan_evaluasi_mingguan()
                                 mode_chat, sesi_chat = _deteksi_fokus_dari_teks(text)
                                 skill_chat = pilih_skills_konteks(mode_fokus=mode_chat, sesi_target=sesi_chat)
                                 prompt_chat = (
-                                    f"Kamu adalah AgentLang, partner diskusi quant, makro, dan eksekusi trading di Telegram. "
-                                    f"Bicara lugas, tenang, kritis, dan analitis—JANGAN pakai tanda bintang (* atau **) karena Telegram teks polos.\n"
+                                    f"Kamu adalah AgentLang, partner diskusi quant trader, desk bank besar, hedge fund, dan market maker di Telegram. "
+                                    f"Bicara lugas, tenang, kritis, dan analitis—uji setiap asumsi user, soroti likuiditas sweep, orderflow CVD, VWAP premium/discount, dan makro. "
+                                    f"JANGAN pakai tanda bintang (* atau **) karena Telegram teks polos.\n"
                                     f"Skill aktif sesuai konteks pesan:\n{skill_chat}\n\n"
                                     f"Konteks jurnal & kuota sesi terakhir:\n{snap_db}\n\n"
                                     f"Pesan user: {pesan_asli}"
@@ -1411,7 +1655,7 @@ def loop_listener_telegram():
                                 if not balasan and GROQ_API_KEY:
                                     balasan = panggil_groq_fallback(
                                         prompt_chat,
-                                        system_prompt="Kamu adalah AgentLang, partner diskusi quant & trading. Jawab kritis, lugas, dan tanpa tanda bintang.",
+                                        system_prompt="Kamu adalah AgentLang, partner diskusi quant & institusional trading. Jawab kritis, lugas, dan tanpa tanda bintang.",
                                     )
                                 if not balasan and GEMINI_API_KEY:
                                     client_chat = genai.Client(api_key=GEMINI_API_KEY)
@@ -1437,7 +1681,7 @@ def loop_listener_telegram():
 def health_check():
     return jsonify({
         "status": "alive",
-        "version": "2.6",
+        "version": "2.7",
         "primary_model": "models/gemini-4-hydrogen (thinking_level=high)",
         "session": deteksi_sesi_trading(),
         "utc": datetime.now(timezone.utc).isoformat(),
