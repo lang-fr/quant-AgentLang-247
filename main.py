@@ -890,13 +890,15 @@ def loop_listener_telegram():
                             "/evaluasi - Lihat laporan evaluasi akurasi mingguan"
                         )
                     elif text in ["/cek", "/analisa"]:
-            kirim_telegram("Menjalankan sidang 4 agen, cek MTF H1/H4/D1, Blockworks & Twelve Data...")
-            def _run_manual_analisa():
-                try:
-                    jalankan_analisa_lengkap(pemicu="Perintah Manual /cek dari HP")
-                except Exception as exc:
-                    kirim_telegram(f"Error saat menjalankan /cek: {exc}")
-            threading.Thread(target=_run_manual_analisa, daemon=True).start()
+                        kirim_telegram("Menjalankan sidang 4 agen, cek MTF H1/H4/D1, Blockworks & Twelve Data...")
+
+                        def _run_manual_analisa():
+                            try:
+                                jalankan_analisa_lengkap(pemicu="Perintah Manual /cek dari HP")
+                            except Exception as exc:
+                                kirim_telegram(f"Error saat menjalankan /cek: {exc}")
+
+                        threading.Thread(target=_run_manual_analisa, daemon=True).start()
                     elif text == "/backtest":
                         kirim_telegram("Menjalankan Backtest Out-of-Sample & 1.000x Monte Carlo...")
                         bt_gold = jalankan_backtest_dan_montecarlo("GC=F", "2y")
@@ -911,24 +913,22 @@ def loop_listener_telegram():
                             try:
                                 snap_db = ambil_ringkasan_jurnal_dan_evaluasi_mingguan()
                                 prompt_chat = (
-    f"Kamu adalah AgentLang, partner diskusi quant, makro, dan eksekusi trading di Telegram. "
-    f"Bicara seperti manusia yang lugas, tenang, dan analitis—hindari gaya bahasa robotik, klise, atau template kaku, "
-    f"dan JANGAN pakai tanda bintang (* atau **) karena Telegram menampilkan teks polos. "
-    f"Saat menjawab, utamakan critical thinking: uji asumsi user, soroti potensi jebakan atau blind spot (seperti bias konfirmasi, "
-    f"likuiditas palsu, risiko makro/berita, atau rasio risiko yang kurang masuk akal), dan beri perbandingan skenario jika relevan. "
-    f"Jika ada data yang tidak ada di konteks, katakan terus terang tanpa mengarang. "
-    f"Jika ditanya nama atau menyapa, perkenalkan diri secara wajar sebagai AgentLang.\n"
-    f"Konteks jurnal & kuota sesi terakhir:\n{snap_db}\n\n"
-    f"Pesan user: {pesan_asli}"
-)
+                                    f"Kamu adalah AgentLang, partner diskusi quant, makro, dan eksekusi trading di Telegram. "
+                                    f"Bicara seperti manusia yang lugas, tenang, dan analitis—hindari gaya bahasa robotik, klise, atau template kaku, "
+                                    f"dan JANGAN pakai tanda bintang (* atau **) karena Telegram menampilkan teks polos. "
+                                    f"Saat menjawab, utamakan critical thinking: uji asumsi user, soroti potensi jebakan atau blind spot (seperti bias konfirmasi, "
+                                    f"likuiditas palsu, risiko makro/berita, atau rasio risiko yang kurang masuk akal), dan beri perbandingan skenario jika relevan. "
+                                    f"Jika ada data yang tidak ada di konteks, katakan terus terang tanpa mengarang. "
+                                    f"Jika ditanya nama atau menyapa, perkenalkan diri secara wajar sebagai AgentLang.\n"
+                                    f"Konteks jurnal & kuota sesi terakhir:\n{snap_db}\n\n"
+                                    f"Pesan user: {pesan_asli}"
+                                )
                                 client_chat = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
                                 balasan = analisa_dengan_retry(
                                     client_chat,
-                                    ["gemini-4-hydrogen", "gemini-3.6-flash", "gemini-3.5-flash-lite"],
+                                    ["gemini-2.5-flash", "gemini-2.0-flash"],
                                     prompt_chat,
-                                    config=genai.types.GenerateContentConfig(
-                                        thinking_config=genai.types.ThinkingConfig(thinking_level="XHIGH")
-                                    ),
+                                    config=None,
                                 )
                                 kirim_telegram(balasan)
                             except Exception as e:
