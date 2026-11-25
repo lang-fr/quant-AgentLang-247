@@ -51,43 +51,43 @@ AUTO_SCAN_INTERVAL_SEC = int(os.getenv("AUTO_SCAN_INTERVAL_SEC", "14400"))
 app = Flask(__name__)
 DB_PATH = "quant_cloud_audit.db"
 _COT_CACHE = {"tanggal": "", "nilai": None}
+_LAST_MARKET_CONTEXT = {"updated_utc": "", "summary": "Belum ada scan pasar di sesi ini."}
+_MODEL_CACHE = {"checked": False, "models": []}
 
 
 # ==============================================================================
-# 2. MODUL TRADING SKILLS (INSTITUTIONAL DESK, MARKET MAKER, QUANT & HEDGE FUND)
+# 2. MODUL TRADING SKILLS (QUANT, BANK DESK, HEDGE FUND & MARKET MAKER)
 # ==============================================================================
 TRADING_SKILLS = {
     "MARKET_MAKER_ORDERFLOW": """
 [SKILL: MARKET MAKER LIQUIDITY SWEEP & ORDERFLOW ABSORPTION]
-- Bank besar dan Market Maker membutuhkan likuiditas lawan arah sebelum menggerakkan harga: cari penyapuan (sweep) di atas PDH/PWH/Asia High untuk distribusi short, atau di bawah PDL/PWL/Asia Low untuk akumulasi long.
-- Validasi setiap breakout atau sweep dengan Cumulative Volume Delta (CVD) H1/M15 dan Orderbook Imbalance:
-  * Jika harga naik menembus high tetapi CVD melemah/negatif (Bearish Absorption), itu jebakan likuiditas (bull trap).
-  * Jika harga turun menembus low tetapi CVD menguat/positif (Bullish Absorption), institusi sedang menyerap penjualan panik.
-- Gunakan VWAP & deviasi standar sebagai peta nilai wajar: hindari membuka posisi buy di Extreme Premium (> +1.5 SD) atau sell di Extreme Discount (< -1.5 SD) tanpa konfirmasi momentum ekstrem.
+- Bank besar & Market Maker menyapu likuiditas lawan arah sebelum menggerakkan harga: cari sweep di atas PDH/PWH/Asia High untuk distribusi short, atau di bawah PDL/PWL/Asia Low untuk akumulasi long.
+- Validasi breakout/sweep dengan Cumulative Volume Delta (CVD) H1/M15 & Orderbook Imbalance:
+  * Harga naik menembus high tetapi CVD melemah/negatif = Bearish Absorption (bull trap).
+  * Harga turun menembus low tetapi CVD menguat/positif = Bullish Absorption (akumulasi institusi).
+- Peta nilai wajar VWAP: hindari FOMO buy di Extreme Premium (> +1.5 SD) atau FOMO sell di Extreme Discount (< -1.5 SD).
 """,
     "SESSION_ICT_LIQUIDITY": """
 [SKILL: SESSION & ICT LIQUIDITY MODEL (ASIA / LONDON / NEW YORK)]
-- ASIA (00:00-07:00 UTC): Petakan Asia High & Asia Low sebagai kolam likuiditas awal. Hindari mengejar breakout tipis di tengah sesi Asia kecuali ada katalis makro Asia/RBA/BOJ.
-- LONDON (07:00-13:00 UTC): Fokus pada Judas Swing / liquidity sweep terhadap Asia High atau Asia Low, diikuti displacement dan struktur M5-M15 yang searah bias H1-H4.
-- NEW_YORK (13:00-21:00 UTC): Evaluasi kelanjutan tren London atau NY Reversal setelah rilis data makro AS (13:30/14:00 UTC). Waspadai manipulasi awal pembukaan sesi NY sebelum ekspansi utama.
+- ASIA (00:00-07:00 UTC): Petakan Asia High & Asia Low sebagai kolam likuiditas awal. Hindari mengejar breakout tipis di tengah sesi Asia tanpa katalis makro Asia.
+- LONDON (07:00-13:00 UTC): Fokus pada Judas Swing / liquidity sweep terhadap Asia High atau Asia Low, diikuti displacement M5-M15 yang searah bias H1-H4.
+- NEW_YORK (13:00-21:00 UTC): Evaluasi kelanjutan tren London atau NY Reversal setelah rilis data makro AS (13:30/14:00 UTC).
 """,
     "INTRADAY_EXECUTION": """
 [SKILL: INTRADAY & SCALP PRECISION (M1-H4)]
-- Timeframe utama: H4 & H1 sebagai kompas arah, M15 sebagai struktur setup, M5 & M1 sebagai pemicu entry presisi.
-- Wajib cek spread aktual, posisi harga terhadap VWAP, dan ATR H1. Jika spread melampaui batas wajar atau menjelang rilis berita Tier-1 USD (±45 menit), tahan entry.
-- Wajib tetapkan level invalidasi (SL) di balik titik sweep/struktur swing terdekat dengan minimal Risk-to-Reward 1:2.
+- Kompas arah: H4 & H1; struktur setup: M15; pemicu entry presisi: M5 & M1.
+- Cek spread aktual, jarak ke VWAP, dan berita USD Tier-1 (±45 menit). Tetapkan SL di balik struktur swing/sweep dengan minimal R:R 1:2.
 """,
     "SWING_HEDGE_FUND": """
 [SKILL: HEDGE FUND SWING TRADING (H4-W1, BEBERAPA HARI - MINGGU)]
-- Timeframe utama: W1 & D1 sebagai struktur besar, H4 sebagai area akumulasi/distribusi entry. Fluktuasi M1/M5 diabaikan untuk keputusan arah.
-- Gabungkan volatilitas GARCH (perkiraan rentang gerak harian), positioning CFTC COT (hedge fund net), serta untuk kripto wajib audit Funding Rate, Open Interest, dan Deribit DVOL / Put-Call Ratio.
-- Antisipasi potensi sweep mingguan (Previous Weekly High/Low) sebelum masuk posisi swing.
+- Fokus pada struktur W1 & D1 serta area akumulasi/distribusi H4 (abaikan noise M1/M5).
+- Gabungkan volatilitas GARCH, positioning CFTC COT (hedge fund net), serta untuk kripto wajib audit Funding Rate, Open Interest, dan Deribit DVOL / Put-Call OI Ratio.
 """,
     "MACRO_POSITION_HOLD": """
 [SKILL: INSTITUTIONAL MACRO & LONG-TERM HOLD (BULANAN - TAHUNAN)]
-- Timeframe utama: MN1 (Bulanan), W1 (Mingguan), dan D1 (Harian). Noise M1, M5, M15, dan H1 TIDAK boleh membatalkan tesis investasi jangka panjang.
-- Pilar fundamental wajib: arah US 10Y Real Yield (DFII10), tren Fed Net Liquidity (WALCL - TGA - RRP), siklus suku bunga Fed Funds, indeks DXY, serta ekspansi/kontraksi kapitalisasi Stablecoin 7 hari & global market cap.
-- Gunakan pendekatan akumulasi bertahap (DCA / scaling pada zona diskon bulanan/mingguan) dengan pengukuran risiko ekor CVaR 95% dan invalidasi struktural di level penutupan W1/MN1.
+- Fokus pada MN1 (Bulanan), W1 (Mingguan), dan D1 (Harian). Fluktuasi M1-H1 tidak membatalkan tesis jangka panjang.
+- Pilar fundamental wajib: arah US 10Y Real Yield (DFII10), tren Fed Net Liquidity (WALCL - TGA - RRP), siklus Fed Funds, indeks DXY, serta aliran Stablecoin 7 hari & kapitalisasi pasar global.
+- Gunakan akumulasi bertahap (DCA/scaling pada zona diskon W1/MN1) dengan kontrol risiko ekor CVaR 95%.
 """,
 }
 
@@ -348,10 +348,6 @@ def analisa_orderflow_dan_likuiditas(
     df_d1: pd.DataFrame,
     session_ranges: dict,
 ) -> dict:
-    """
-    Menghitung proksi Orderflow institusional (Cumulative Volume Delta M15/H1 & divergensi absorpsi),
-    Market Maker Liquidity Sweep (PDH/PDL, PWH/PWL, Asia High/Low), serta VWAP & Premium/Discount zone.
-    """
     try:
         if df_h1.empty or len(df_h1) < 30 or df_d1.empty or len(df_d1) < 10:
             return {"status": "data_tidak_cukup"}
@@ -384,20 +380,19 @@ def analisa_orderflow_dan_likuiditas(
 
             divergensi = "ALIGNED_FLOW"
             if p_second_high > p_first_high and c_second_high < c_first_high:
-                divergensi = "BEARISH_ABSORPTION_DISTRIBUTION"
+                divergensi = "BEARISH_ABSORPTION"
             elif p_second_low < p_first_low and c_second_low > c_first_low:
-                divergensi = "BULLISH_ABSORPTION_ACCUMULATION"
+                divergensi = "BULLISH_ABSORPTION"
 
             return {
-                "net_delta_ratio_pct": delta_ratio_pct,
-                "flow_bias": "BUY_PRESSURE" if delta_ratio_pct > 5 else ("SELL_PRESSURE" if delta_ratio_pct < -5 else "NEUTRAL_FLOW"),
-                "absorption_signal": divergensi,
+                "net_delta_pct": delta_ratio_pct,
+                "flow_bias": "BUY_PRESSURE" if delta_ratio_pct > 5 else ("SELL_PRESSURE" if delta_ratio_pct < -5 else "NEUTRAL"),
+                "absorption": divergensi,
             }
 
         of_h1 = _hitung_cvd_dan_divergensi(df_h1, 24)
         of_m15 = _hitung_cvd_dan_divergensi(df_m15, 32) if not df_m15.empty and len(df_m15) >= 32 else {}
 
-        # VWAP 24-bar H1 & Zona Premium / Discount Institusional
         vwap_df = df_h1.tail(24).copy()
         tp = (vwap_df["High"] + vwap_df["Low"] + vwap_df["Close"]) / 3.0
         vol_v = vwap_df["Volume"].fillna(0.0).replace(0.0, 1.0) if "Volume" in vwap_df.columns else pd.Series(1.0, index=vwap_df.index)
@@ -417,7 +412,6 @@ def analisa_orderflow_dan_likuiditas(
         else:
             zona_nilai = "EQUILIBRIUM"
 
-        # Market Maker Liquidity Sweep Detection (PDH/PDL, PWH/PWL, Asia High/Low)
         pdh = round(float(df_d1["High"].iloc[-2]), 2)
         pdl = round(float(df_d1["Low"].iloc[-2]), 2)
         pwh = round(float(df_d1["High"].iloc[-7:-1].max()), 2)
@@ -429,42 +423,37 @@ def analisa_orderflow_dan_likuiditas(
 
         sweeps_terdeteksi = []
         if recent_high > pdh and last_close < pdh:
-            sweeps_terdeteksi.append(f"SWEEP_PDH_BEARISH ({pdh})")
+            sweeps_terdeteksi.append(f"SWEEP_PDH_BEARISH({pdh})")
         if recent_low < pdl and last_close > pdl:
-            sweeps_terdeteksi.append(f"SWEEP_PDL_BULLISH ({pdl})")
+            sweeps_terdeteksi.append(f"SWEEP_PDL_BULLISH({pdl})")
         if recent_high > pwh and last_close < pwh:
-            sweeps_terdeteksi.append(f"SWEEP_PWH_BEARISH ({pwh})")
+            sweeps_terdeteksi.append(f"SWEEP_PWH_BEARISH({pwh})")
         if recent_low < pwl and last_close > pwl:
-            sweeps_terdeteksi.append(f"SWEEP_PWL_BULLISH ({pwl})")
+            sweeps_terdeteksi.append(f"SWEEP_PWL_BULLISH({pwl})")
 
         asia_rng = session_ranges.get("ASIA", {})
         if asia_rng:
             a_high = float(asia_rng.get("high", 0))
             a_low = float(asia_rng.get("low", 0))
             if a_high > 0 and recent_high > a_high and last_close < a_high:
-                sweeps_terdeteksi.append(f"SWEEP_ASIA_HIGH_BEARISH ({a_high})")
+                sweeps_terdeteksi.append(f"SWEEP_ASIA_HIGH_BEARISH({a_high})")
             if a_low > 0 and recent_low < a_low and last_close > a_low:
-                sweeps_terdeteksi.append(f"SWEEP_ASIA_LOW_BULLISH ({a_low})")
+                sweeps_terdeteksi.append(f"SWEEP_ASIA_LOW_BULLISH({a_low})")
 
         return {
-            "H1_orderflow": of_h1,
-            "M15_orderflow": of_m15,
+            "H1_of": of_h1,
+            "M15_of": of_m15,
             "VWAP_24h": round(vwap_val, 2),
-            "VWAP_zscore": vwap_z,
-            "value_zone": zona_nilai,
-            "liquidity_levels": {"PDH": pdh, "PDL": pdl, "PWH": pwh, "PWL": pwl},
-            "liquidity_sweeps": sweeps_terdeteksi if sweeps_terdeteksi else ["NONE_ACTIVE"],
+            "VWAP_z": vwap_z,
+            "zone": zona_nilai,
+            "levels": {"PDH": pdh, "PDL": pdl, "PWH": pwh, "PWL": pwl},
+            "sweeps": sweeps_terdeteksi if sweeps_terdeteksi else ["NONE"],
         }
     except Exception as e:
         return {"error": str(e)}
 
 
 def cek_konfluensi_mtf_dan_regime(ticker: str = "GC=F") -> dict:
-    """
-    Menghitung struktur EMA lintas timeframe M1, M5, M15, H1, H4, D1, W1, MN1,
-    rentang high/low per sesi (Asia/London/NY), orderflow CVD & liquidity sweep,
-    serta skor terpisah untuk Intraday, Swing, dan Hold.
-    """
     try:
         df_m1 = yf.download(ticker, period="2d", interval="1m", progress=False)
         df_m5 = yf.download(ticker, period="5d", interval="5m", progress=False)
@@ -543,28 +532,25 @@ def cek_konfluensi_mtf_dan_regime(ticker: str = "GC=F") -> dict:
         return {
             "ticker": ticker,
             "last_close": last_close_val,
-            "M1_trend": m1_trend,
-            "M5_trend": m5_trend,
-            "M15_trend": m15_trend,
-            "H1_trend": h1_trend,
-            "H4_trend": h4_trend,
-            "D1_trend": d1_trend,
-            "W1_trend": w1_trend,
-            "MN1_trend": mn1_trend,
+            "M1": m1_trend,
+            "M5": m5_trend,
+            "M15": m15_trend,
+            "H1": h1_trend,
+            "H4": h4_trend,
+            "D1": d1_trend,
+            "W1": w1_trend,
+            "MN1": mn1_trend,
             "session_ranges_utc": session_ranges,
-            "orderflow_and_liquidity": orderflow_mm,
-            "intraday_bias": arah_intraday,
-            "intraday_score": skor_intraday,
-            "swing_bias": arah_swing,
-            "swing_score": skor_swing,
-            "hold_position_bias": arah_hold,
-            "hold_position_score": skor_hold,
+            "orderflow_liq": orderflow_mm,
+            "intraday": {"bias": arah_intraday, "score": skor_intraday},
+            "swing": {"bias": arah_swing, "score": skor_swing},
+            "hold": {"bias": arah_hold, "score": skor_hold},
             "ADX_14": adx_val,
-            "RSI_H1_14": rsi_h1,
-            "RSI_D1_14": rsi_d1,
+            "RSI_H1": rsi_h1,
+            "RSI_D1": rsi_d1,
             "ATR_H1_pct": atr_h1_pct,
-            "market_regime": regime,
-            "Z_score_H1_latest": z_score_h1,
+            "regime": regime,
+            "Z_score_H1": z_score_h1,
             "confluence_score": confluence_score,
         }
     except Exception as e:
@@ -579,10 +565,6 @@ def audit_high_probability_setup(
     spread_pips: float,
     is_news_blocked: bool,
 ) -> dict:
-    """
-    Mesin Critical Thinking Institusional: mengaudit benturan struktur, orderflow CVD,
-    posisi VWAP premium/discount, market regime, serta positioning hedge fund/derivatif.
-    """
     red_flags = []
     edge_confirmations = []
 
@@ -594,81 +576,70 @@ def audit_high_probability_setup(
             "edge_confirmations": [],
         }
 
-    regime = mtf.get("market_regime", "CHOPPY_SIDEWAYS")
+    regime = mtf.get("regime", "CHOPPY_SIDEWAYS")
     adx = mtf.get("ADX_14", 0)
     if regime == "CHOPPY_SIDEWAYS":
-        red_flags.append(f"Regime CHOPPY_SIDEWAYS (ADX {adx} < 18): risiko whipsaw tinggi")
+        red_flags.append(f"Regime CHOPPY_SIDEWAYS (ADX {adx} < 18)")
     else:
         edge_confirmations.append(f"Regime {regime} (ADX {adx})")
 
-    of_liq = mtf.get("orderflow_and_liquidity", {})
-    h1_of = of_liq.get("H1_orderflow", {})
-    flow_bias = h1_of.get("flow_bias", "NEUTRAL_FLOW")
-    abs_sig = h1_of.get("absorption_signal", "ALIGNED_FLOW")
-    val_zone = of_liq.get("value_zone", "EQUILIBRIUM")
-    sweeps = of_liq.get("liquidity_sweeps", [])
+    of_liq = mtf.get("orderflow_liq", {})
+    h1_of = of_liq.get("H1_of", {})
+    flow_bias = h1_of.get("flow_bias", "NEUTRAL")
+    abs_sig = h1_of.get("absorption", "ALIGNED_FLOW")
+    val_zone = of_liq.get("zone", "EQUILIBRIUM")
+    sweeps = of_liq.get("sweeps", [])
 
-    intraday_bias = mtf.get("intraday_bias", "NETRAL")
+    intraday_bias = mtf.get("intraday", {}).get("bias", "NETRAL")
     if intraday_bias == "BULLISH" and flow_bias == "SELL_PRESSURE":
-        red_flags.append("Divergensi Orderflow: tren H1 bullish tetapi CVD H1 negatif (distribusi)")
+        red_flags.append("Divergensi CVD: H1 bullish tapi delta H1 negatif (distribusi)")
     elif intraday_bias == "BEARISH" and flow_bias == "BUY_PRESSURE":
-        red_flags.append("Divergensi Orderflow: tren H1 bearish tetapi CVD H1 positif (akumulasi)")
-    elif flow_bias != "NEUTRAL_FLOW":
-        edge_confirmations.append(f"Orderflow CVD selaras ({flow_bias}, {h1_of.get('net_delta_ratio_pct')}%)")
+        red_flags.append("Divergensi CVD: H1 bearish tapi delta H1 positif (akumulasi)")
+    elif flow_bias != "NEUTRAL":
+        edge_confirmations.append(f"CVD H1 selaras ({flow_bias}, {h1_of.get('net_delta_pct')}%)")
 
     if abs_sig != "ALIGNED_FLOW":
-        edge_confirmations.append(f"Sinyal Absorpsi Institusi: {abs_sig}")
+        edge_confirmations.append(f"Absorpsi: {abs_sig}")
 
     if intraday_bias == "BULLISH" and val_zone == "EXTREME_PREMIUM":
-        red_flags.append(f"Overextended: harga di {val_zone} (VWAP Z={of_liq.get('VWAP_zscore')}), dilarang FOMO buy")
+        red_flags.append(f"Overextended di {val_zone} (VWAP Z={of_liq.get('VWAP_z')})")
     elif intraday_bias == "BEARISH" and val_zone == "EXTREME_DISCOUNT":
-        red_flags.append(f"Overextended: harga di {val_zone} (VWAP Z={of_liq.get('VWAP_zscore')}), dilarang FOMO sell")
-    elif val_zone in ("DISCOUNT", "EXTREME_DISCOUNT", "PREMIUM", "EXTREME_PREMIUM"):
-        edge_confirmations.append(f"Posisi nilai institusional: {val_zone} (VWAP Z={of_liq.get('VWAP_zscore')})")
+        red_flags.append(f"Overextended di {val_zone} (VWAP Z={of_liq.get('VWAP_z')})")
+    else:
+        edge_confirmations.append(f"Zona VWAP: {val_zone} (Z={of_liq.get('VWAP_z')})")
 
-    if sweeps and sweeps != ["NONE_ACTIVE"]:
-        edge_confirmations.append(f"Market Maker Sweep terdeteksi: {', '.join(sweeps)}")
+    if sweeps and sweeps != ["NONE"]:
+        edge_confirmations.append(f"Liquidity Sweep: {', '.join(sweeps)}")
 
     if aset_label == "XAUUSD":
         if spread_pips > MAX_SPREAD_PIPS:
-            red_flags.append(f"Spread XAUUSD lebar ({spread_pips} > {MAX_SPREAD_PIPS} pips)")
+            red_flags.append(f"Spread lebar ({spread_pips} pips)")
         cot_net = data_institusi.get("cftc_cot", {}).get("GOLD_Net_HedgeFund_Contracts")
         if isinstance(cot_net, int):
-            edge_confirmations.append(f"CFTC COT Hedge Fund Net Gold: {cot_net:,} kontrak")
-        real_yield = data_makro.get("fred_macro", {}).get("REAL_YIELD_DFII10")
-        if real_yield is not None:
-            edge_confirmations.append(f"US 10Y Real Yield (DFII10): {real_yield}%")
+            edge_confirmations.append(f"CFTC COT Net Gold: {cot_net:,}")
 
     if aset_label == "BTCUSDT":
-        ccxt_of = data_institusi.get("orderflow_ccxt", {})
-        if isinstance(ccxt_of, dict) and ccxt_of.get("imbalance"):
-            edge_confirmations.append(f"Orderbook CCXT BTC: {ccxt_of.get('imbalance')}")
         deriv = data_institusi.get("kripto_derivatif", {})
         fr = deriv.get("funding_rate_pct")
         if isinstance(fr, (int, float)):
             if fr > 0.03 and intraday_bias == "BULLISH":
-                red_flags.append(f"Crowded Long: Funding rate tinggi ({fr}%), rawan long squeeze")
+                red_flags.append(f"Crowded Long (Funding {fr}%)")
             elif fr < -0.02 and intraday_bias == "BEARISH":
-                red_flags.append(f"Crowded Short: Funding rate negatif ({fr}%), rawan short squeeze")
-        deribit = data_institusi.get("deribit_options", {})
-        if isinstance(deribit, dict) and deribit.get("Put_Call_OI_Ratio") is not None:
-            edge_confirmations.append(
-                f"Deribit DVOL: {deribit.get('DVOL_BTC')} | Put/Call OI: {deribit.get('Put_Call_OI_Ratio')}"
-            )
+                red_flags.append(f"Crowded Short (Funding {fr}%)")
 
     if is_news_blocked:
-        red_flags.append("Circuit Breaker Berita USD Tier-1 aktif (±45 menit)")
+        red_flags.append("Circuit Breaker Berita USD Tier-1 aktif (±45m)")
 
     max_cap = 100
     if len(red_flags) >= 2 or is_news_blocked:
-        max_cap = 68
+        max_cap = 70
     elif len(red_flags) == 1:
-        max_cap = 78
+        max_cap = 82
 
     return {
         "asset": aset_label,
         "max_allowed_score": max_cap,
-        "red_flags": red_flags if red_flags else ["Tidak ada red flag struktural mayor"],
+        "red_flags": red_flags if red_flags else ["Clean"],
         "edge_confirmations": edge_confirmations,
     }
 
@@ -728,7 +699,7 @@ class TrendQuantStrategy(Strategy):
         self.sma_fast = self.I(lambda x: pd.Series(x).rolling(self.fast_period).mean(), close)
         self.sma_slow = self.I(lambda x: pd.Series(x).rolling(self.slow_period).mean(), close)
 
-    def next():
+    def next(self):
         if self.sma_fast[-1] > self.sma_slow[-1] and not self.position:
             self.buy(size=0.1)
         elif self.sma_fast[-1] < self.sma_slow[-1] and self.position:
@@ -805,7 +776,7 @@ def ambil_statistik_dan_makro() -> dict:
         except Exception:
             pass
 
-    hasil = {"harga_terakhir": {}, "korelasi": {}, "garch_risk": {}, "fred_macro": {}}
+    hasil = {"harga_terakhir": {}, "korelasi_gold_btc": {}, "garch_risk": {}, "fred_macro": {}}
 
     if not prices.empty:
         for col in prices.columns:
@@ -813,7 +784,10 @@ def ambil_statistik_dan_makro() -> dict:
             if not valid_vals.empty:
                 hasil["harga_terakhir"][col] = round(float(valid_vals.iloc[-1]), 2)
         log_ret = np.log(prices / prices.shift(1)).dropna(how="all")
-        hasil["korelasi"] = log_ret.corr().round(3).to_dict()
+        corr_mat = log_ret.corr().round(3)
+        for aset in ["GOLD", "BTC"]:
+            if aset in corr_mat.columns:
+                hasil["korelasi_gold_btc"][aset] = corr_mat[aset].to_dict()
 
         for aset in ["GOLD", "BTC"]:
             if aset in log_ret.columns and len(log_ret[aset]) > 30:
@@ -828,8 +802,8 @@ def ambil_statistik_dan_makro() -> dict:
                 var_95 = float(np.percentile(ret_pct, 5))
                 cvar_95 = float(ret_pct[ret_pct <= var_95].mean())
                 hasil["garch_risk"][aset] = {
-                    "prediksi_vol_besok_pct": round(pred_vol, 3),
-                    "CVaR_95_ekstrem_pct": round(cvar_95, 3),
+                    "vol_besok_pct": round(pred_vol, 3),
+                    "CVaR_95_pct": round(cvar_95, 3),
                 }
 
     if FRED_API_KEY:
@@ -840,7 +814,7 @@ def ambil_statistik_dan_makro() -> dict:
             walcl = float(fred.get_series("WALCL").iloc[-1]) / 1000.0
             tga = float(fred.get_series("WTREGEN").iloc[-1]) / 1000.0
             rrp = float(fred.get_series("RRPONTSYD").iloc[-1])
-            hasil["fred_macro"]["FED_NET_LIQUIDITY_B_USD"] = round(walcl - tga - rrp, 2)
+            hasil["fred_macro"]["FED_NET_LIQ_B"] = round(walcl - tga - rrp, 2)
         except Exception as e:
             hasil["fred_macro"]["error"] = str(e)
 
@@ -881,9 +855,7 @@ def ambil_deribit_options_btc() -> dict:
         put_call_ratio = round(put_oi / call_oi, 3) if call_oi > 0 else None
         return {
             "DVOL_BTC": dvol_terakhir,
-            "Put_Call_OI_Ratio": put_call_ratio,
-            "Call_OI_BTC": round(call_oi, 1),
-            "Put_OI_BTC": round(put_oi, 1),
+            "Put_Call_OI": put_call_ratio,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -944,8 +916,8 @@ def ambil_data_institusi_dan_berita() -> dict:
             mcap_7d = float(sc_data[-8]["totalCirculatingUSD"]["peggedUSD"])
             diff_b = (mcap_now - mcap_7d) / 1e9
             info["stablecoin_flow"] = {
-                "total_stablecoin_B_USD": round(mcap_now / 1e9, 2),
-                "perubahan_7hari_B_USD": round(diff_b, 2),
+                "total_B_USD": round(mcap_now / 1e9, 2),
+                "change_7d_B": round(diff_b, 2),
             }
     except Exception as e:
         info["stablecoin_flow"]["error"] = str(e)
@@ -972,7 +944,8 @@ def ambil_data_institusi_dan_berita() -> dict:
             if resp.status_code == 200:
                 feed = feedparser.parse(resp.content)
                 for entry in feed.entries[:4]:
-                    info["berita"].append(entry.title)
+                    if entry.title not in info["berita"]:
+                        info["berita"].append(entry.title)
         except Exception:
             pass
 
@@ -982,12 +955,9 @@ def ambil_data_institusi_dan_berita() -> dict:
 def ambil_intelijen_blockworks() -> dict:
     api_key = os.getenv("BLOCKWORKS_API_KEY", "").strip()
     if not api_key:
-        return {"status": "nonaktif_tanpa_key", "catatan": "BLOCKWORKS_API_KEY kosong"}
+        return {"status": "nonaktif_tanpa_key"}
 
-    headers = {
-        "x-blockworks-api-key": api_key,
-        "Accept": "application/json",
-    }
+    headers = {"x-blockworks-api-key": api_key, "Accept": "application/json"}
     kandidat_url = [
         ("https://api.blockworks.com/query/tabular/assets", {"pageSize": 5}),
         ("https://api.blockworks.com/v1/assets", None),
@@ -998,33 +968,19 @@ def ambil_intelijen_blockworks() -> dict:
             resp = requests.get(url, headers=headers, params=params, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
-                return {
-                    "status": "aktif",
-                    "endpoint": url,
-                    "ringkasan": data if isinstance(data, (dict, list)) else str(data)[:300],
-                }
+                return {"status": "aktif", "ringkasan": str(data)[:350]}
             if resp.status_code != 401:
-                return {
-                    "status": f"http_{resp.status_code}",
-                    "endpoint": url,
-                    "catatan": resp.text[:200],
-                }
+                return {"status": f"http_{resp.status_code}"}
         except Exception as e:
-            return {"status": "error_koneksi", "endpoint": url, "catatan": str(e)}
+            return {"status": "error", "detail": str(e)}
 
-    return {
-        "status": "http_401",
-        "catatan": "Periksa masa aktif/izin endpoint API key di Blockworks Intel",
-    }
+    return {"status": "http_401"}
 
 
 def ambil_data_coinmarketcap() -> dict:
     if not CMC_API_KEY:
         return {"status": "opsional_belum_diisi"}
-    headers = {
-        "X-CMC_PRO_API_KEY": CMC_API_KEY,
-        "Accept": "application/json",
-    }
+    headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY, "Accept": "application/json"}
     hasil = {"status": "aktif"}
     try:
         g_resp = requests.get(
@@ -1036,10 +992,9 @@ def ambil_data_coinmarketcap() -> dict:
         usd_quote = g_data.get("quote", {}).get("USD", {})
         if usd_quote:
             hasil["global"] = {
-                "total_mcap_B_USD": round(float(usd_quote.get("total_market_cap", 0)) / 1e9, 2),
-                "vol_24h_B_USD": round(float(usd_quote.get("total_volume_24h", 0)) / 1e9, 2),
-                "btc_dominance_pct": round(float(g_data.get("btc_dominance", 0)), 2),
-                "mcap_change_24h_pct": round(float(usd_quote.get("total_market_cap_yesterday_percentage_change", 0)), 2),
+                "mcap_B": round(float(usd_quote.get("total_market_cap", 0)) / 1e9, 2),
+                "btc_dom_pct": round(float(g_data.get("btc_dominance", 0)), 2),
+                "chg_24h_pct": round(float(usd_quote.get("total_market_cap_yesterday_percentage_change", 0)), 2),
             }
 
         q_resp = requests.get(
@@ -1053,7 +1008,7 @@ def ambil_data_coinmarketcap() -> dict:
             btc_usd = btc_list[0].get("quote", {}).get("USD", {})
             hasil["BTC_USD"] = {
                 "price": round(float(btc_usd.get("price", 0)), 2),
-                "percent_change_24h": round(float(btc_usd.get("percent_change_24h", 0)), 2),
+                "chg_24h": round(float(btc_usd.get("percent_change_24h", 0)), 2),
             }
         return hasil
     except Exception as e:
@@ -1074,13 +1029,10 @@ def ambil_data_twelvedata_intraday() -> dict:
             if "close" in resp:
                 hasil[label] = {
                     "close": resp.get("close"),
-                    "percent_change": resp.get("percent_change"),
+                    "chg_pct": resp.get("percent_change"),
                     "high": resp.get("high"),
                     "low": resp.get("low"),
-                    "fifty_two_week_range": resp.get("fifty_two_week", {}).get("range"),
                 }
-            else:
-                hasil[label] = {"error": resp.get("message", "gagal_ambil_quote")}
         except Exception as e:
             hasil[label] = {"error": str(e)}
     return hasil
@@ -1103,45 +1055,17 @@ def cek_spread_mt5_cloud(symbol: str = "XAUUSD") -> float:
 
 
 # ==============================================================================
-# 8. LAPISAN 4: GEMINI 4 HYDROGEN (THINKING HIGH) & DEWAN JURI INSTITUSIONAL
+# 8. LAPISAN 4: AUTO-DISCOVERY MODEL AI & DEWAN JURI 4-AGEN (SKOR >= 75)
 # ==============================================================================
 def bersihkan_teks_telegram(teks: str) -> str:
     if not teks:
         return ""
-
     teks_bersih = teks.strip()
     if teks_bersih.startswith("```"):
         lines = teks_bersih.splitlines()
         if len(lines) >= 2 and lines[-1].strip().startswith("```"):
             teks_bersih = "\n".join(lines[1:-1]).strip()
-
-    try:
-        data = json.loads(teks_bersih)
-    except Exception:
-        return teks.replace("**", "")
-
-    if not isinstance(data, dict):
-        return teks.replace("**", "")
-
-    baris = []
-    if data.get("greeting"):
-        baris.append(str(data["greeting"]).strip())
-
-    for key, label in [
-        ("observations", "\nCatatan Utama:"),
-        ("risk_considerations", "\nPertimbangan Risiko:"),
-        ("recommendations", "\nRekomendasi:"),
-    ]:
-        val = data.get(key)
-        if isinstance(val, list) and val:
-            baris.append(label)
-            for idx, poin in enumerate(val, 1):
-                baris.append(f"{idx}. {str(poin).strip()}")
-
-    if data.get("recommendation") and isinstance(data.get("recommendation"), str):
-        baris.append(f"\nKesimpulan: {data['recommendation'].strip()}")
-
-    return "\n".join(baris).strip() if baris else teks
+    return teks_bersih.replace("**", "")
 
 
 def kirim_telegram(pesan: str, log_id: int = None):
@@ -1170,104 +1094,176 @@ def kirim_telegram(pesan: str, log_id: int = None):
         requests.post(url, json=payload, timeout=15)
 
 
-def panggil_gemini_hydrogen_high(client, prompt: str, use_google_search: bool = True) -> str:
-    if not client:
-        return ""
-    try:
-        tools_cfg = [{"type": "google_search"}] if use_google_search else []
-        interaction = client.interactions.create(
-            model="models/gemini-4-hydrogen",
-            input=prompt,
-            tools=tools_cfg,
-            generation_config={
-                "max_output_tokens": 65536,
-                "thinking_level": "high",
-            },
-        )
-        teks_langsung = getattr(interaction, "text", None)
-        if teks_langsung and str(teks_langsung).strip():
-            return str(teks_langsung).strip()
+def deteksi_model_gemini_aktif(client) -> list:
+    """
+    Mendeteksi otomatis daftar model Gemini yang benar-benar tersedia di akun/API key
+    agar tidak pernah terkena error 404 NOT_FOUND.
+    """
+    if _MODEL_CACHE["checked"] and _MODEL_CACHE["models"]:
+        return _MODEL_CACHE["models"]
 
-        outputs = getattr(interaction, "outputs", None) or []
-        potongan = []
-        for out in outputs:
-            txt = getattr(out, "text", None)
-            if txt and str(txt).strip():
-                potongan.append(str(txt).strip())
-            elif isinstance(out, dict) and out.get("text"):
-                potongan.append(str(out["text"]).strip())
-        return "\n".join(potongan).strip()
+    prioritas_prefix = [
+        "gemini-4-hydrogen",
+        "gemini-3.1-pro",
+        "gemini-3-pro",
+        "gemini-3-flash",
+        "gemini-3.1-flash",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+    ]
+    ditemukan = []
+    try:
+        for m in client.models.list():
+            nama = getattr(m, "name", "") or ""
+            nama_bersih = nama.replace("models/", "")
+            methods = getattr(m, "supported_generation_methods", None) or []
+            if methods and "generateContent" not in methods:
+                continue
+            if "gemini" in nama_bersih and not any(
+                x in nama_bersih for x in ["embedding", "imagen", "veo", "aqa", "tts", "audio", "robotics"]
+            ):
+                ditemukan.append(nama_bersih)
     except Exception as e:
-        print(f"Gemini 4 Hydrogen gagal ({str(e)[:150]}), lanjut ke fallback...")
-        return ""
+        print(f"Gagal list model Gemini: {str(e)[:120]}", flush=True)
+
+    terurut = []
+    for pref in prioritas_prefix:
+        for m in ditemukan:
+            if m.startswith(pref) and m not in terurut:
+                terurut.append(m)
+    for m in ditemukan:
+        if m not in terurut:
+            terurut.append(m)
+
+    if not terurut:
+        terurut = ["gemini-3-flash-preview", "gemini-3.1-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash"]
+
+    _MODEL_CACHE["checked"] = True
+    _MODEL_CACHE["models"] = terurut[:6]
+    print(f"Model Gemini aktif terdeteksi: {_MODEL_CACHE['models']}", flush=True)
+    return _MODEL_CACHE["models"]
 
 
-def panggil_groq_fallback(prompt: str, system_prompt: str = "", model: str = "llama-3.3-70b-versatile") -> str:
+def panggil_groq_api(prompt: str, system_prompt: str = "", json_mode: bool = False) -> tuple[str, str]:
     if not GROQ_API_KEY:
-        return ""
-    try:
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
+        return "", ""
+    kandidat_groq = ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "qwen/qwen3-32b"]
+    for model_name in kandidat_groq:
+        try:
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
 
-        resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
+            body = {
+                "model": model_name,
                 "messages": messages,
                 "temperature": 0.2,
                 "max_tokens": 2400,
-            },
-            timeout=25,
-        )
-        data = resp.json()
-        konten = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return konten.strip()
-    except Exception:
-        return ""
+            }
+            if json_mode:
+                body["response_format"] = {"type": "json_object"}
+
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                print(f"Groq {model_name} HTTP {resp.status_code}: {resp.text[:160]}", flush=True)
+                continue
+            data = resp.json()
+            konten = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if konten and konten.strip():
+                return konten.strip(), f"GROQ ({model_name})"
+        except Exception as e:
+            print(f"Groq {model_name} exception: {str(e)[:120]}", flush=True)
+    return "", ""
 
 
-def analisa_dengan_retry(client, models: list, prompt: str, config=None, retries: int = 1) -> str:
-    if not client:
-        return ""
-    for model_name in models:
-        for attempt in range(retries + 1):
-            try:
-                res = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=config,
-                )
-                teks = getattr(res, "text", None)
-                if teks and teks.strip():
-                    return teks.strip()
-            except Exception as e:
-                print(f"Gemini {model_name} gagal: {str(e)[:120]}")
-                time.sleep(1.5 * (attempt + 1))
-    return ""
+def panggil_ai_reasoning_terbaik(
+    prompt: str,
+    system_prompt: str,
+    json_mode: bool = False,
+) -> tuple[str, str]:
+    """
+    Mencoba seluruh model Gemini aktif dengan High Reasoning/Thinking terlebih dahulu,
+    lalu otomatis jatuh ke Groq bila Gemini limit/tidak tersedia.
+    """
+    if GEMINI_API_KEY:
+        try:
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            daftar_model = deteksi_model_gemini_aktif(client)
+            for nama_model in daftar_model:
+                # 1. Coba interactions API jika model hydrogen
+                if "hydrogen" in nama_model:
+                    try:
+                        inter = client.interactions.create(
+                            model=f"models/{nama_model}",
+                            input=f"{system_prompt}\n\n{prompt}",
+                            generation_config={"max_output_tokens": 32768, "thinking_level": "high"},
+                        )
+                        txt = getattr(inter, "text", None)
+                        if txt and str(txt).strip():
+                            return str(txt).strip(), f"{nama_model} (HIGH)"
+                    except Exception as e_int:
+                        print(f"Interactions {nama_model} skip: {str(e_int)[:110]}", flush=True)
+
+                # 2. Coba generate_content dengan thinking_config, lalu tanpa thinking_config jika model tidak mendukung
+                cfg_list = []
+                cfg_kwargs = {"system_instruction": system_prompt}
+                if json_mode:
+                    cfg_kwargs["response_mime_type"] = "application/json"
+
+                if any(k in nama_model for k in ["2.5", "3", "4", "thinking", "pro"]):
+                    cfg_think = dict(cfg_kwargs)
+                    cfg_think["thinking_config"] = types.ThinkingConfig(thinking_budget=8192)
+                    cfg_list.append((types.GenerateContentConfig(**cfg_think), "THINKING"))
+
+                cfg_list.append((types.GenerateContentConfig(**cfg_kwargs), "STANDARD"))
+
+                for cfg_obj, label_mode in cfg_list:
+                    try:
+                        res = client.models.generate_content(
+                            model=nama_model,
+                            contents=prompt,
+                            config=cfg_obj,
+                        )
+                        teks = getattr(res, "text", None)
+                        if teks and teks.strip():
+                            return teks.strip(), f"{nama_model} ({label_mode})"
+                    except Exception as e_gen:
+                        print(f"Gemini {nama_model} [{label_mode}] gagal: {str(e_gen)[:130]}", flush=True)
+        except Exception as e_cli:
+            print(f"Gemini client error: {str(e_cli)[:130]}", flush=True)
+
+    return panggil_groq_api(prompt, system_prompt=system_prompt, json_mode=json_mode)
 
 
 def _ringkas_mtf(mtf: dict) -> str:
     if not isinstance(mtf, dict) or "error" in mtf:
         return "MTF: tidak tersedia"
-    of_liq = mtf.get("orderflow_and_liquidity", {})
-    h1_of = of_liq.get("H1_orderflow", {})
-    sweeps = ", ".join(of_liq.get("liquidity_sweeps", ["NONE"]))
+    of_liq = mtf.get("orderflow_liq", {})
+    h1_of = of_liq.get("H1_of", {})
+    sweeps = ", ".join(of_liq.get("sweeps", ["NONE"]))
+    intra = mtf.get("intraday", {})
+    swg = mtf.get("swing", {})
+    hld = mtf.get("hold", {})
     return (
-        f"M1:{mtf.get('M1_trend')} | M5:{mtf.get('M5_trend')} | M15:{mtf.get('M15_trend')} | "
-        f"H1:{mtf.get('H1_trend')} | H4:{mtf.get('H4_trend')} | D1:{mtf.get('D1_trend')} | "
-        f"W1:{mtf.get('W1_trend')} | MN1:{mtf.get('MN1_trend')}\n"
-        f"  Orderflow H1: {h1_of.get('flow_bias')} ({h1_of.get('net_delta_ratio_pct')}%) | "
-        f"{h1_of.get('absorption_signal')} | Zona: {of_liq.get('value_zone')} (VWAP Z={of_liq.get('VWAP_zscore')})\n"
+        f"M1:{mtf.get('M1')} | M5:{mtf.get('M5')} | M15:{mtf.get('M15')} | "
+        f"H1:{mtf.get('H1')} | H4:{mtf.get('H4')} | D1:{mtf.get('D1')} | "
+        f"W1:{mtf.get('W1')} | MN1:{mtf.get('MN1')}\n"
+        f"  Orderflow H1: {h1_of.get('flow_bias')} ({h1_of.get('net_delta_pct')}%) | "
+        f"{h1_of.get('absorption')} | Zona: {of_liq.get('zone')} (VWAP Z={of_liq.get('VWAP_z')})\n"
         f"  Liquidity Sweep: {sweeps}\n"
-        f"  Horizon -> Intraday:{mtf.get('intraday_score')} ({mtf.get('intraday_bias')}) | "
-        f"Swing:{mtf.get('swing_score')} ({mtf.get('swing_bias')}) | "
-        f"Hold:{mtf.get('hold_position_score')} ({mtf.get('hold_position_bias')})"
+        f"  Skor Horizon -> Intraday:{intra.get('score')} ({intra.get('bias')}) | "
+        f"Swing:{swg.get('score')} ({swg.get('bias')}) | "
+        f"Hold:{hld.get('score')} ({hld.get('bias')})"
     )
 
 
@@ -1319,9 +1315,9 @@ def jalankan_analisa_lengkap(
         btc_live = round(float(cmc_btc_px), 2) if cmc_btc_px else None
 
     live_prices_ctx = {
-        "XAUUSD_live": xau_live_main or "TIDAK_TERSEDIA",
-        "XAUUSD_sumber": "TwelveData" if xau_live_td else ("yfinance_GC=F" if xau_live_main else "TIDAK_TERSEDIA"),
-        "BTCUSD_live": btc_live or "TIDAK_TERSEDIA",
+        "XAUUSD": xau_live_main or "TIDAK_TERSEDIA",
+        "sumber_XAU": "TwelveData" if xau_live_td else ("yfinance_GC=F" if xau_live_main else "TIDAK_TERSEDIA"),
+        "BTCUSDT": btc_live or "TIDAK_TERSEDIA",
     }
 
     is_news_blocked = data_institusi.get("kalender_ff", {}).get(
@@ -1335,7 +1331,7 @@ def jalankan_analisa_lengkap(
         layers=1,
         spread_pips=spread_aktif,
         is_high_impact_news=is_news_blocked,
-        z_score_h1=mtf_gold.get("Z_score_H1_latest", 0.0),
+        z_score_h1=mtf_gold.get("Z_score_H1", 0.0),
     )
 
     audit_gold = audit_high_probability_setup("XAUUSD", mtf_gold, data_makro, data_institusi, spread_aktif, is_news_blocked)
@@ -1345,122 +1341,73 @@ def jalankan_analisa_lengkap(
     skills_aktif = pilih_skills_konteks(mode_fokus=mode_fokus, sesi_target=sesi_aktif)
     macro_snap = json.dumps(data_makro.get("harga_terakhir", {}))
 
-    if not GEMINI_API_KEY and not GROQ_API_KEY:
-        laporan = (
-            f"[MODE DATA MENTAH - {pemicu}]\n"
-            f"Live Prices: {live_prices_ctx}\n"
-            f"Audit XAU: {audit_gold}\n"
-            f"Audit BTC: {audit_btc}\n"
-            f"Risk: {risk_status}"
-        )
-        log_id = simpan_log("XAUUSD/BTC", "WAIT", 0, spread_aktif, macro_snap, "NO_API_KEY", laporan[:400])
-        kirim_telegram(laporan, log_id=log_id)
-        return laporan
+    ringkas_data_untuk_ai = {
+        "harga_live": live_prices_ctx,
+        "sesi_dan_spread": {"sesi": sesi_aktif, "mode_fokus": mode_fokus, "spread_xau_pips": spread_aktif},
+        "makro_dan_risiko": data_makro,
+        "makro_fred_detail": data_institusi.get("makro_fred_detail", {}),
+        "gold_mtf_orderflow": mtf_gold,
+        "btc_mtf_orderflow": mtf_btc,
+        "derivatif_dan_institusi": {
+            "cftc_cot": data_institusi.get("cftc_cot", {}),
+            "okx_derivatif": data_institusi.get("kripto_derivatif", {}),
+            "deribit_options": data_institusi.get("deribit_options", {}),
+            "orderflow_ccxt": data_institusi.get("orderflow_ccxt", {}),
+            "stablecoin": data_institusi.get("stablecoin_flow", {}),
+            "cmc": cmc_data,
+            "blockworks": blockworks_intel,
+            "twelvedata": twelvedata_quote,
+        },
+        "narasi_dan_news": {
+            "kalender_ff": data_institusi.get("kalender_ff", {}),
+            "kalender_tier1": kalender_news,
+            "headlines": data_institusi.get("berita", [])[:8],
+        },
+        "audit_critical_thinking": {"XAUUSD": audit_gold, "BTCUSDT": audit_btc},
+        "hardcoded_risk": risk_status,
+    }
 
-    client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+    _LAST_MARKET_CONTEXT["updated_utc"] = datetime.now(timezone.utc).isoformat()
+    _LAST_MARKET_CONTEXT["summary"] = json.dumps(ringkas_data_untuk_ai, default=str)[:4500]
 
-    SYSTEM_INSTRUCTION_QUANT = f"""Kamu adalah Dewan Juri Institusional 4-Divisi:
-1. Quant & Statistical Arbitrage Desk (GARCH, CVaR, Z-Score, korelasi lintas aset)
-2. Bank FX / Commodity & Market Maker Desk (Orderflow CVD, Liquidity Sweep PDH/PDL/PWH/PWL/Asia, VWAP Premium/Discount)
-3. Global Macro Hedge Fund PM (FRED Real Yield DFII10, Fed Net Liquidity, CFTC COT, Deribit Options, Stablecoin Flow)
-4. Skeptic Risk Officer (audit red flag, trap likuiditas, dan rem darurat)
-
-Gunakan playbook skill berikut dalam mengevaluasi setup:
+    SYSTEM_INSTRUCTION_4_AGENTS = f"""Kamu adalah Dewan Juri 4-Agen Kuantitatif Institusional (berpikir layaknya Quant Trader, Desk Bank Besar, Hedge Fund PM, dan Market Maker).
+Gunakan playbook skill berikut dalam penalaranmu:
 {skills_aktif}
 
-Prinsip Critical Thinking & High Probability Wajib:
-- Hormati batas skor maksimum dari Audit Deterministik (XAU max={audit_gold['max_allowed_score']}, BTC max={audit_btc['max_allowed_score']}). Jika ada red flag mayor atau tidak ada konfluensi orderflow/likuiditas, WAJIB beri skor < 75 dan bias WAIT_NO_TRADE.
-- Pisahkan evaluasi per horizon waktu: Sesi ({sesi_aktif}), Intraday (M1-H4), Swing (H4-W1), dan Hold Position (D1-MN1).
-- DILARANG mengarang harga atau katalis yang tidak ada di data.
-- JANGAN pakai tanda bintang (* atau **) dalam teks."""
+Aturan Wajib:
+1. Lakukan penalaran kritis (Critical Thinking) yang mendalam di seluruh 4 agen:
+   - Macro Analyst: bedah arah makro (FRED Real Yield DFII10, Fed Net Liquidity, DXY, korelasi, GARCH/CVaR, CFTC COT, Stablecoin) dan konteks siklus besar (D1-MN1 untuk Hold Bulanan-Tahunan).
+   - Bull Researcher: susun tesis bullish terbaik berbasis orderflow CVD, absorpsi pembeli, liquidity sweep bawah (PDL/PWL/Asia Low), katalis berita/narasi, serta peluang per sesi/horizon.
+   - Bear/Skeptic Researcher: bongkar kelemahan tesis, cari distribusi CVD, sweep atas (PDH/PWH/Asia High), crowded funding/options, benturan timeframe, dan jebakan likuiditas.
+   - Risk Judge: timbang bukti ketiga agen, hormati batas skor maksimum audit (XAU max={audit_gold['max_allowed_score']}, BTC max={audit_btc['max_allowed_score']}). Setup HANYA lolos jika skor >= 75 dan konfluensi kuat; jika masih ada red flag atau bentrok, wajib beri skor < 75 dan bias WAIT_NO_TRADE.
+2. Jelaskan secara spesifik implikasi untuk Sesi ({sesi_aktif}: Asia/London/NY), Intraday (M1-H4), Swing (H4-W1), dan Hold Position (D1-MN1).
+3. DILARANG mengarang harga atau berita di luar data. JANGAN pakai tanda bintang (* atau **)."""
 
     prompt = f"""
-Analisa data pasar institusional berikut untuk XAUUSD dan BTCUSDT dalam Bahasa Indonesia yang tajam, singkat, dan terukur untuk Telegram.
-Pemicu: {pemicu} | Mode Fokus: {mode_fokus} | Sesi Fokus: {sesi_aktif} | Spread XAUUSD: {spread_aktif} pips
+Lakukan Sidang Dewan Juri 4-Agen dengan reasoning yang tajam, terstruktur, dan mendalam dalam Bahasa Indonesia untuk Telegram.
+Pemicu: {pemicu} | Mode Fokus: {mode_fokus} | Sesi: {sesi_aktif}
 
-Harga Rujukan Utama: {live_prices_ctx}
+Data Pasar Lengkap (Makro, Mikro M1-MN1, Orderflow CVD, Liquidity Sweep, Fundamental, Derivatif & News):
+{json.dumps(ringkas_data_untuk_ai, default=str)}
 
-Hasil Audit Critical Thinking Deterministik:
-- XAUUSD Audit: {audit_gold}
-- BTCUSDT Audit: {audit_btc}
-
-Data Kuantitatif, Orderflow & Multi-Timeframe (M1-MN1):
-1. Makro & Risiko Ekor (FRED, Korelasi, GARCH, CVaR): {data_makro}
-2. MTF Lengkap, Orderflow CVD, VWAP & Market Maker Sweeps:
-   - Gold: {mtf_gold}
-   - BTC: {mtf_btc}
-   - CoinMarketCap: {cmc_data}
-3. Institusi, Orderbook CCXT, Derivatif OKX, Deribit Options & Stablecoin: {data_institusi}
-4. Blockworks & TwelveData: {blockworks_intel} | {twelvedata_quote}
-5. Kalender Berita & Risk Guardrail: {kalender_news} | {risk_status}
-
-Kembalikan HANYA JSON valid dengan struktur persis berikut:
+Kembalikan HANYA JSON valid dengan struktur berikut:
 {{
   "xau_score": integer (0-{audit_gold['max_allowed_score']}),
   "xau_bias": "BULLISH" | "BEARISH" | "WAIT_NO_TRADE",
   "btc_score": integer (0-{audit_btc['max_allowed_score']}),
   "btc_bias": "BULLISH" | "BEARISH" | "WAIT_NO_TRADE",
-  "orderflow_mm_view": "- pembacaan CVD, VWAP premium/discount & liquidity sweep (maks 22 kata)",
-  "session_plan": "- rencana sesi ASIA / LONDON / NEW_YORK singkat (maks 20 kata)",
-  "intraday_setup": "- bias, pemicu M1-H1 & invalidasi intraday singkat (maks 20 kata)",
-  "swing_setup": "- bias, area H4-W1, COT/derivatif & invalidasi swing (maks 20 kata)",
-  "hold_position_plan": "- tesis makro D1-MN1 & zona akumulasi hold bulanan-tahunan (maks 22 kata)",
-  "bear_skeptic_veto": "- red flag & blind spot paling kritis dari data di atas (maks 20 kata)",
-  "final_verdict": "- keputusan eksekusi, ukuran risiko & syarat batal (maks 20 kata)"
+  "macro_analyst": "Penalaran mendalam makro, fundamental, likuiditas global & bias Hold D1-MN1 (3-4 kalimat padat)",
+  "bull_researcher": "Penalaran tesis bullish, orderflow CVD, sweep likuiditas, narasi/news & setup terbaik (3-4 kalimat padat)",
+  "bear_skeptic": "Audit kritis, red flag, jebakan likuiditas, benturan timeframe & skenario gagal (3-4 kalimat padat)",
+  "risk_judge": "Keputusan final per horizon (Sesi {sesi_aktif}, Intraday, Swing, Hold), titik invalidasi, risiko & alasan lolos/ditahan < 75 (3-4 kalimat padat)"
 }}
 """
 
-    def _susun_laporan_json(verdict_dict: dict, label_engine: str) -> tuple[str, int, str, bool]:
-        x_sc = min(int(verdict_dict.get("xau_score", 0)), audit_gold["max_allowed_score"])
-        b_sc = min(int(verdict_dict.get("btc_score", 0)), audit_btc["max_allowed_score"])
-        top_s = max(x_sc, b_sc)
-        bias_sum = f"[{mode_fokus}] XAU:{verdict_dict.get('xau_bias')}({x_sc}) | BTC:{verdict_dict.get('btc_bias')}({b_sc})"
-        lolos = bool(risk_status.get("approved")) and (top_s >= 75)
-        teks_out = (
-            f"QUANT AGENT v2.7 [{label_engine}] — {pemicu}\n"
-            f"Fokus: {mode_fokus} | Sesi: {sesi_aktif} | Spread XAU: {spread_aktif} pips\n\n"
-            f"• XAUUSD ({live_prices_ctx['XAUUSD_live']}): {verdict_dict.get('xau_bias')} ({x_sc}/100) | {mtf_gold.get('market_regime')}\n"
-            f"  {_ringkas_mtf(mtf_gold)}\n"
-            f"• BTCUSDT ({live_prices_ctx['BTCUSD_live']}): {verdict_dict.get('btc_bias')} ({b_sc}/100) | {mtf_btc.get('market_regime')}\n"
-            f"  {_ringkas_mtf(mtf_btc)}\n\n"
-            f"1. Orderflow & Market Maker:\n{verdict_dict.get('orderflow_mm_view')}\n\n"
-            f"2. Sesi (Asia / London / NY):\n{verdict_dict.get('session_plan')}\n\n"
-            f"3. Intraday (M1-H4):\n{verdict_dict.get('intraday_setup')}\n\n"
-            f"4. Swing Hedge Fund (H4-W1):\n{verdict_dict.get('swing_setup')}\n\n"
-            f"5. Hold Position (Bulanan - Tahunan / D1-MN1):\n{verdict_dict.get('hold_position_plan')}\n\n"
-            f"6. Skeptic Audit & Red Flag:\n{verdict_dict.get('bear_skeptic_veto')}\n\n"
-            f"7. Final Verdict & Guardrail:\n{verdict_dict.get('final_verdict')}\n"
-            f"Status Eksekusi: {'LOLOS HIGH-PROB (>=75)' if lolos else 'DITAHAN / WAIT'}"
-        )
-        return teks_out, top_s, bias_sum, lolos
-
-    raw_json = ""
-    engine_dipakai = "GEMINI-4-HYDROGEN (HIGH)"
-
-    if client:
-        raw_json = panggil_gemini_hydrogen_high(
-            client,
-            f"{SYSTEM_INSTRUCTION_QUANT}\n\n{prompt}",
-            use_google_search=True,
-        )
-
-    if not raw_json and client:
-        engine_dipakai = "GEMINI-2.5-PRO (THINKING)"
-        raw_json = analisa_dengan_retry(
-            client,
-            ["gemini-2.5-pro"],
-            prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION_QUANT,
-                response_mime_type="application/json",
-                thinking_config=types.ThinkingConfig(thinking_budget=24576),
-            ),
-            retries=1,
-        )
-
-    if not raw_json and GROQ_API_KEY:
-        engine_dipakai = "GROQ-LLAMA-3.3-70B"
-        raw_json = panggil_groq_fallback(prompt, system_prompt=SYSTEM_INSTRUCTION_QUANT)
+    raw_json, engine_dipakai = panggil_ai_reasoning_terbaik(
+        prompt=prompt,
+        system_prompt=SYSTEM_INSTRUCTION_4_AGENTS,
+        json_mode=True,
+    )
 
     if raw_json:
         try:
@@ -1468,7 +1415,27 @@ Kembalikan HANYA JSON valid dengan struktur persis berikut:
             if "{" in bersih and "}" in bersih:
                 bersih = bersih[bersih.find("{") : bersih.rfind("}") + 1]
             verdict = json.loads(bersih)
-            hasil_teks, top_score, bias_summary, lolos_final = _susun_laporan_json(verdict, engine_dipakai)
+
+            x_sc = min(int(verdict.get("xau_score", 0)), audit_gold["max_allowed_score"])
+            b_sc = min(int(verdict.get("btc_score", 0)), audit_btc["max_allowed_score"])
+            top_score = max(x_sc, b_sc)
+            bias_summary = f"[{mode_fokus}] XAU:{verdict.get('xau_bias')}({x_sc}) | BTC:{verdict.get('btc_bias')}({b_sc})"
+            lolos_final = bool(risk_status.get("approved")) and (top_score >= 75)
+
+            hasil_teks = (
+                f"QUANT AGENT v2.8 — SIDANG 4 AGEN [{engine_dipakai}]\n"
+                f"Pemicu: {pemicu} | Fokus: {mode_fokus} | Sesi: {sesi_aktif} | Spread XAU: {spread_aktif} pips\n\n"
+                f"• XAUUSD ({live_prices_ctx['XAUUSD']}): {verdict.get('xau_bias')} (Skor: {x_sc}/100) | {mtf_gold.get('regime')}\n"
+                f"  {_ringkas_mtf(mtf_gold)}\n"
+                f"• BTCUSDT ({live_prices_ctx['BTCUSDT']}): {verdict.get('btc_bias')} (Skor: {b_sc}/100) | {mtf_btc.get('regime')}\n"
+                f"  {_ringkas_mtf(mtf_btc)}\n\n"
+                f"1. Macro Analyst (Makro & Fundamental):\n{verdict.get('macro_analyst')}\n\n"
+                f"2. Bull Researcher (Orderflow, Narasi & Peluang):\n{verdict.get('bull_researcher')}\n\n"
+                f"3. Bear / Skeptic Researcher (Blind Spot & Jebakan):\n{verdict.get('bear_skeptic')}\n\n"
+                f"4. Risk Judge (Keputusan Final & Horizon):\n{verdict.get('risk_judge')}\n\n"
+                f"Status Guardrail: {'LOLOS HIGH-PROB (>=75) — SIAP REVIEW' if lolos_final else 'DITAHAN / WAIT (Skor < 75 atau Guardrail Aktif)'}"
+            )
+
             log_id = simpan_log(
                 "XAUUSD/BTC",
                 bias_summary,
@@ -1482,7 +1449,7 @@ Kembalikan HANYA JSON valid dengan struktur persis berikut:
             return hasil_teks
         except Exception:
             hasil_teks = (
-                f"QUANT AGENT v2.7 [{engine_dipakai}] — {pemicu}\n"
+                f"QUANT AGENT v2.8 — SIDANG 4 AGEN [{engine_dipakai}]\n"
                 f"• XAUUSD: {_ringkas_mtf(mtf_gold)}\n"
                 f"• BTCUSDT: {_ringkas_mtf(mtf_btc)}\n\n"
                 f"{raw_json}"
@@ -1492,11 +1459,11 @@ Kembalikan HANYA JSON valid dengan struktur persis berikut:
             return hasil_teks
 
     hasil_teks = (
-        f"QUANT AGENT v2.7 [DATA MENTAH] — {pemicu}\n"
+        f"QUANT AGENT v2.8 [MODE DATA KUANTITATIF] — {pemicu}\n"
         f"Sesi: {sesi_aktif} | Spread XAU: {spread_aktif} pips\n"
-        f"• XAUUSD ({live_prices_ctx['XAUUSD_live']}): {_ringkas_mtf(mtf_gold)}\n"
-        f"• BTCUSDT ({live_prices_ctx['BTCUSD_live']}): {_ringkas_mtf(mtf_btc)}\n\n"
-        f"Catatan: Model AI sedang sibuk/limit. Data MTF (M1-MN1), Orderflow & risiko tetap aman (WAIT_NO_TRADE)."
+        f"• XAUUSD ({live_prices_ctx['XAUUSD']}): {_ringkas_mtf(mtf_gold)}\n"
+        f"• BTCUSDT ({live_prices_ctx['BTCUSDT']}): {_ringkas_mtf(mtf_btc)}\n\n"
+        f"Catatan: Semua provider AI (Gemini & Groq) belum mengembalikan respons. Cek GEMINI_API_KEY / GROQ_API_KEY di GitHub Secrets."
     )
     simpan_log("XAUUSD/BTC", "WAIT_NO_MODEL", 0, spread_aktif, macro_snap, "AUTO_WAIT", hasil_teks[:400])
     kirim_telegram(hasil_teks, log_id=None)
@@ -1542,8 +1509,8 @@ def loop_listener_telegram():
         return
     offset = 0
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-    print("Listener Telegram v2.7 aktif polling...", flush=True)
-    kirim_telegram("Bot Quant Agent v2.7 (Institutional Orderflow + Market Maker Sweep + Gemini 4 Hydrogen High) aktif!")
+    print("Listener Telegram v2.8 aktif polling...", flush=True)
+    kirim_telegram("Bot Quant Agent v2.8 (Sidang 4 Agen Skor >= 75 + M1-MN1 + Orderflow + Chat Aktif) terhubung!")
     while True:
         try:
             resp = requests.get(
@@ -1595,20 +1562,21 @@ def loop_listener_telegram():
                 if chat_id == str(TELEGRAM_CHAT_ID):
                     if text in ["/start", "/help"]:
                         kirim_telegram(
-                            "Quant Agent v2.7 Aktif (Institutional Desk + Orderflow + Market Maker Sweep).\n"
+                            "Quant Agent v2.8 Aktif (Sidang 4 Agen Skor >= 75 + M1-MN1 + Orderflow).\n"
                             "Perintah tersedia:\n"
-                            "/cek - Analisa lengkap semua horizon (Orderflow, Sesi, Intraday, Swing, Hold)\n"
-                            "/cek asia | /cek london | /cek ny - Fokus likuiditas & struktur per sesi\n"
+                            "/cek - Sidang 4 Agen lengkap (Makro, Mikro, Narasi, Fundamental, News)\n"
+                            "/cek asia | /cek london | /cek ny - Fokus likuiditas per sesi\n"
                             "/cek intraday - Fokus eksekusi M1-H4, CVD & VWAP\n"
                             "/cek swing - Fokus ayunan H4-W1, COT & derivatif\n"
                             "/cek hold - Fokus posisi bulanan-tahunan D1-MN1 & makro\n"
                             "/backtest - Uji statistik backtesting.py & 1.000x Monte Carlo\n"
-                            "/jurnal - Lihat jurnal audit SQLite & kuota sesi"
+                            "/jurnal - Lihat jurnal audit SQLite & kuota sesi\n"
+                            "Atau ketik pesan biasa untuk ngobrol & diskusi analisa langsung."
                         )
                     elif text.startswith("/cek") or text.startswith("/analisa"):
                         mode_fokus, sesi_target = _deteksi_fokus_dari_teks(text)
                         label_cmd = f"{mode_fokus}" + (f" ({sesi_target})" if sesi_target else "")
-                        kirim_telegram(f"AgentLang lagi menjalankan audit institusional [{label_cmd}] (M1-MN1 + Orderflow), tunggu sebentar...")
+                        kirim_telegram(f"AgentLang menjalankan Sidang 4 Agen [{label_cmd}] (Makro, Mikro M1-MN1, Orderflow, News), tunggu sebentar...")
 
                         def _run_manual_analisa(m_fokus=mode_fokus, s_target=sesi_target, lbl=label_cmd):
                             try:
@@ -1631,43 +1599,40 @@ def loop_listener_telegram():
                     else:
                         pesan_asli = msg.get("text", "").strip()
                         if pesan_asli:
-                            kirim_telegram("Sedang meracik jawaban dengan penalaran institusional...")
-                            try:
-                                snap_db = ambil_ringkasan_jurnal_dan_evaluasi_mingguan()
-                                mode_chat, sesi_chat = _deteksi_fokus_dari_teks(text)
-                                skill_chat = pilih_skills_konteks(mode_fokus=mode_chat, sesi_target=sesi_chat)
-                                prompt_chat = (
-                                    f"Kamu adalah AgentLang, partner diskusi quant trader, desk bank besar, hedge fund, dan market maker di Telegram. "
-                                    f"Bicara lugas, tenang, kritis, dan analitis—uji setiap asumsi user, soroti likuiditas sweep, orderflow CVD, VWAP premium/discount, dan makro. "
-                                    f"JANGAN pakai tanda bintang (* atau **) karena Telegram teks polos.\n"
-                                    f"Skill aktif sesuai konteks pesan:\n{skill_chat}\n\n"
-                                    f"Konteks jurnal & kuota sesi terakhir:\n{snap_db}\n\n"
-                                    f"Pesan user: {pesan_asli}"
-                                )
-                                balasan = ""
-                                if GEMINI_API_KEY:
-                                    client_chat = genai.Client(api_key=GEMINI_API_KEY)
-                                    balasan = panggil_gemini_hydrogen_high(
-                                        client_chat,
-                                        prompt_chat,
-                                        use_google_search=True,
+                            def _balas_chat_async(teks_user=pesan_asli, teks_low=text):
+                                try:
+                                    snap_db = ambil_ringkasan_jurnal_dan_evaluasi_mingguan()
+                                    mode_chat, sesi_chat = _deteksi_fokus_dari_teks(teks_low)
+                                    skill_chat = pilih_skills_konteks(mode_fokus=mode_chat, sesi_target=sesi_chat)
+                                    sys_chat = (
+                                        "Kamu adalah AgentLang (Quant Agent v2.8), partner diskusi quant trader, desk bank besar, "
+                                        "hedge fund, dan market maker di Telegram. Jawab lugas, tenang, kritis, dan mengalir seperti "
+                                        "rekan diskusi profesional. JANGAN pakai tanda bintang (* atau **)."
                                     )
-                                if not balasan and GROQ_API_KEY:
-                                    balasan = panggil_groq_fallback(
-                                        prompt_chat,
-                                        system_prompt="Kamu adalah AgentLang, partner diskusi quant & institusional trading. Jawab kritis, lugas, dan tanpa tanda bintang.",
+                                    prompt_chat = (
+                                        f"Status sistem saat ini: Sesi={deteksi_sesi_trading()}, Ambang lolos sinyal=Skor >= 75, "
+                                        f"Data terakhir={_LAST_MARKET_CONTEXT['updated_utc'] or 'belum di-scan'}.\n"
+                                        f"Skill relevan:\n{skill_chat}\n\n"
+                                        f"Snapshot data pasar terakhir:\n{_LAST_MARKET_CONTEXT['summary']}\n\n"
+                                        f"Jurnal & kuota sesi:\n{snap_db}\n\n"
+                                        f"Pesan user: {teks_user}"
                                     )
-                                if not balasan and GEMINI_API_KEY:
-                                    client_chat = genai.Client(api_key=GEMINI_API_KEY)
-                                    balasan = analisa_dengan_retry(
-                                        client_chat,
-                                        ["gemini-2.5-pro"],
-                                        prompt_chat,
-                                        config=None,
+                                    balasan, engine_used = panggil_ai_reasoning_terbaik(
+                                        prompt=prompt_chat,
+                                        system_prompt=sys_chat,
+                                        json_mode=False,
                                     )
-                                kirim_telegram(balasan or "Maaf, layanan AI sedang sibuk. Coba kirim ulang sebentar lagi.")
-                            except Exception as e:
-                                kirim_telegram(f"Gagal balas chat: {str(e)[:150]}")
+                                    if balasan:
+                                        kirim_telegram(balasan)
+                                    else:
+                                        kirim_telegram(
+                                            "Semua koneksi model AI (Gemini & Groq) sedang tidak merespons. "
+                                            "Pastikan GEMINI_API_KEY dan GROQ_API_KEY di GitHub Secrets masih aktif."
+                                        )
+                                except Exception as e:
+                                    kirim_telegram(f"Gagal balas chat: {str(e)[:150]}")
+
+                            threading.Thread(target=_balas_chat_async, daemon=True).start()
         except Exception as e:
             print("Listener error:", e)
             time.sleep(5)
@@ -1681,8 +1646,7 @@ def loop_listener_telegram():
 def health_check():
     return jsonify({
         "status": "alive",
-        "version": "2.7",
-        "primary_model": "models/gemini-4-hydrogen (thinking_level=high)",
+        "version": "2.8",
         "session": deteksi_sesi_trading(),
         "utc": datetime.now(timezone.utc).isoformat(),
     })
