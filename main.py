@@ -627,7 +627,7 @@ def ambil_intelijen_blockworks():
         "catatan": "Periksa masa aktif/izin endpoint API key di Blockworks Intel",
     }
     
-    def ambil_data_coinmarketcap() -> dict:
+def ambil_data_coinmarketcap() -> dict:
     if not CMC_API_KEY:
         return {"status": "opsional_belum_diisi"}
     headers = {
