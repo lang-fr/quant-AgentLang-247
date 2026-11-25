@@ -1405,23 +1405,23 @@ Kembalikan HANYA JSON valid dengan struktur berikut:
   "bull_researcher": "Penalaran tesis bullish, orderflow CVD, sweep likuiditas, narasi/news & setup terbaik (3-4 kalimat padat)",
   "bear_skeptic": "Audit kritis, red flag, jebakan likuiditas, benturan timeframe & skenario gagal (3-4 kalimat padat)",
   "risk_judge": "Keputusan final per horizon (Sesi {sesi_aktif}, Intraday, Swing, Hold), titik invalidasi, risiko & alasan lolos/ditahan < 75 (3-4 kalimat padat)",
-  "critical_thinking_check": {
+  "critical_thinking_check": {{
     "data_coverage": "Ringkasan sumber data yang aktif vs gagal/kosong pada scan ini",
     "macro_vs_flow": "Apakah makro, narasi/news, dan orderflow/likuiditas saling mengonfirmasi atau bentrok",
     "sop_guardrail_check": "Status kuota sesi (maks 3/sesi), maks 3 layer, risiko (maks 1%), spread & berita"
-  },
-  "xau_setups": {
+  }},
+  "xau_setups": {{
     "sesi": "Entry: ... | SL: ... | TP1: ... | TP2: ... | Max Layer (<=3) & Risiko: ... (atau WAIT)",
     "intraday": "Entry: ... | SL: ... | TP1: ... | TP2: ... | Max Layer (<=3) & Risiko: ... (atau WAIT)",
     "swing": "Entry: ... | SL: ... | TP1: ... | TP2: ... | Max Layer (<=3) & Risiko: ... (atau WAIT)",
     "hold": "Zona Akumulasi/Distribusi: ... | Invalidasi W1/MN1: ... | Target Makro: ... | Risiko: ..."
-  },
-  "btc_setups": {
+  }},
+  "btc_setups": {{
     "sesi": "Entry: ... | SL: ... | TP1: ... | TP2: ... | Max Layer (<=3) & Risiko: ... (atau WAIT)",
     "intraday": "Entry: ... | SL: ... | TP1: ... | TP2: ... | Max Layer (<=3) & Risiko: ... (atau WAIT)",
     "swing": "Entry: ... | SL: ... | TP1: ... | TP2: ... | Max Layer (<=3) & Risiko: ... (atau WAIT)",
     "hold": "Zona Akumulasi/Distribusi: ... | Invalidasi W1/MN1: ... | Target Makro: ... | Risiko: ..."
-  }
+  }}
 }}
 """
 
