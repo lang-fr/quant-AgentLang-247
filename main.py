@@ -761,13 +761,38 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
     kalender_news = cek_kalender_berita_tier1_otomatis()
     spread_aktif = cek_spread_mt5_cloud("XAUUSD")
 
+    xau_live_td = (
+        twelvedata_quote.get("XAUUSD", {}).get("close")
+        if isinstance(twelvedata_quote, dict) and isinstance(twelvedata_quote.get("XAUUSD"), dict)
+        else None
+    )
+    xau_live_yf = (
+        mtf_gold.get("last_close") or mtf_gold.get("close_terakhir")
+        if isinstance(mtf_gold, dict)
+        else None
+    )
+    btc_live = (
+        mtf_btc.get("last_close") or mtf_btc.get("close_terakhir")
+        if isinstance(mtf_btc, dict)
+        else None
+    )
+
+    live_prices_ctx = {
+        "XAUUSD_live": xau_live_td or xau_live_yf or "TIDAK_TERSEDIA",
+        "XAUUSD_twelvedata": xau_live_td,
+        "XAUUSD_yfinance_gcf": xau_live_yf,
+        "BTCUSD_live": btc_live or "TIDAK_TERSEDIA",
+    }
+
     risk_status = validasi_hardcoded_risk(
         balance=1000.0,
         sl_pips=30.0,
         pip_value=1.0,
         layers=1,
         spread_pips=spread_aktif,
-        is_high_impact_news=data_institusi.get("kalender_ff", {}).get("blokir_entry_news", False),
+        is_high_impact_news=data_institusi.get("kalender_ff", {}).get(
+            "blokir_entry_news", kalender_news.get("is_high_impact_active", False)
+        ),
         z_score_h1=mtf_gold.get("Z_score_H1_latest", 0.0),
     )
 
@@ -776,6 +801,7 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
     if not GEMINI_API_KEY:
         laporan = (
             f"[MODE DATA MENTAH - {pemicu}]\n"
+            f"Live Prices: {live_prices_ctx}\n"
             f"Risk: {risk_status}\n"
             f"MTF Gold: {mtf_gold}\n"
             f"Blockworks: {blockworks_intel}\n"
@@ -785,13 +811,17 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
         kirim_telegram(laporan, log_id=log_id)
         return laporan
 
-    
-
     client = genai.Client(api_key=GEMINI_API_KEY)
     prompt = f"""
 Kamu adalah Dewan Juri 4-Agen Kuantitatif Institusional. Analisa data riil berikut dalam Bahasa Indonesia:
-
 Pemicu: {pemicu} | Sesi: {deteksi_sesi_trading()} | Spread XAUUSD: {spread_aktif} pips
+
+ATURAN DATA HARGA & SOP WAJIB:
+- Harga rujukan utama HANYA boleh memakai nilai pada LIVE_PRICES: {live_prices_ctx}.
+- DILARANG KERAS mengarang, menebak, atau memakai level harga lama/contoh (seperti 1950 atau 26500) jika tidak ada di LIVE_PRICES.
+- Jika XAUUSD_live atau BTCUSD_live bernilai "TIDAK_TERSEDIA", beri skor < 75 dan wajibkan bias "WAIT_NO_TRADE".
+- Fokuskan analisis utama pada XAUUSD dan BTCUSDT sesuai sesi aktif (maks 3 entry/sesi, 1-3 layer/setup, risiko setup maks 1%, perhatikan SL struktur & geser SL ke BE setelah TP1).
+
 1. Makro, Korelasi Log Return, GARCH & CVaR: {data_makro}
 2. Multi-Timeframe & ADX Regime (Gold & BTC): {mtf_gold} | {mtf_btc}
 3. Posisi Institusi (COT), Derivatif OI, & Stablecoin Flow: {data_institusi}
@@ -808,47 +838,50 @@ Kembalikan HANYA format JSON valid dengan kunci:
 {{
   "xau_score": integer (0-100),
   "xau_bias": "BULLISH" | "BEARISH" | "WAIT_NO_TRADE",
-  "xau_entry": "estimasi zona entry spesifik berbasis harga terakhir",
-  "xau_sl": "level Stop Loss spesifik",
-  "xau_tp": "level Take Profit 1 & 2 spesifik",
   "btc_score": integer (0-100),
   "btc_bias": "BULLISH" | "BEARISH" | "WAIT_NO_TRADE",
-  "btc_entry": "estimasi zona entry spesifik berbasis harga terakhir",
-  "btc_sl": "level Stop Loss spesifik",
-  "btc_tp": "level Take Profit 1 & 2 spesifik",
   "macro_view": "ringkasan 1 kalimat",
   "bull_case": "ringkasan 1 kalimat",
   "bear_skeptic_veto": "ringkasan 1 kalimat",
   "final_verdict": "kesimpulan singkat berbasis angka"
 }}
 """
+
     try:
-        response = analisa_dengan_retry(
-            client,
-            ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-4-hydrogen"],
-            prompt,
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
-        verdict = json.loads(response)
+        verdict = json.loads(response.text)
         xau_score = int(verdict.get("xau_score", 0))
         btc_score = int(verdict.get("btc_score", 0))
         top_score = max(xau_score, btc_score)
         bias_summary = f"XAU:{verdict.get('xau_bias')}({xau_score}) | BTC:{verdict.get('btc_bias')}({btc_score})"
-
         lolos_final = risk_status.get("approved") and (top_score >= 75)
+
         hasil_teks = (
             f"QUANT AGENT v2.3 — SIDANG 4 AGEN ({pemicu})\n"
-            f"Sesi: {deteksi_sesi_trading()} | Spread XAU: {spread_aktif} pips\n\n"
-            f"• XAUUSD: {verdict.get('xau_bias')} (Skor: {xau_score}/100) | {mtf_gold.get('market_regime')}\n"
-            f"  Entry: {verdict.get('xau_entry')} | SL: {verdict.get('xau_sl')} | TP: {verdict.get('xau_tp')}\n\n"
-            f"• BTCUSDT: {verdict.get('btc_bias')} (Skor: {btc_score}/100) | {mtf_btc.get('market_regime')}\n"
-            f"  Entry: {verdict.get('btc_entry')} | SL: {verdict.get('btc_sl')} | TP: {verdict.get('btc_tp')}\n\n"
+            f"Sesi: {deteksi_sesi_trading()} | Spread XAU: {spread_aktif} pips\n"
+            f"• XAUUSD ({live_prices_ctx['XAUUSD_live']}): {verdict.get('xau_bias')} (Skor: {xau_score}/100) | Regime: {mtf_gold.get('market_regime')}\n"
+            f"• BTCUSDT ({live_prices_ctx['BTCUSD_live']}): {verdict.get('btc_bias')} (Skor: {btc_score}/100) | Regime: {mtf_btc.get('market_regime')}\n\n"
             f"1. Macro Analyst: {verdict.get('macro_view')}\n"
             f"2. Bull Case: {verdict.get('bull_case')}\n"
             f"3. Bear/Skeptic Veto: {verdict.get('bear_skeptic_veto')}\n"
             f"4. Risk Judge: {verdict.get('final_verdict')}\n"
             f"Status Guardrail: {'LOLOS (>=75)' if lolos_final else 'DITAHAN / WAIT'}"
         )
+        log_id = simpan_log(
+            "XAUUSD/BTC",
+            bias_summary,
+            top_score,
+            spread_aktif,
+            macro_snap,
+            "PENDING_REVIEW" if lolos_final else "AUTO_WAIT",
+            hasil_teks[:400],
+        )
+        kirim_telegram(hasil_teks, log_id=log_id if lolos_final else None)
+        return hasil_teks
     except Exception as e:
         top_score = 0
         bias_summary = "ERROR"
