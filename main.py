@@ -417,16 +417,21 @@ def ambil_statistik_dan_makro() -> dict:
     for nama, kode in tickers.items():
         try:
             df = yf.download(kode, period="6mo", interval="1d", progress=False)
-            if not df.empty:
-                prices[nama] = df["Close"].squeeze()
+            if not df.empty and "Close" in df:
+                s = df["Close"].squeeze().dropna()
+                if not s.empty:
+                    prices[nama] = s
         except Exception:
             pass
 
     hasil = {"harga_terakhir": {}, "korelasi": {}, "garch_risk": {}, "fred_macro": {}}
 
     if not prices.empty:
-        hasil["harga_terakhir"] = prices.iloc[-1].round(2).to_dict()
-        log_ret = np.log(prices / prices.shift(1)).dropna()
+        for col in prices.columns:
+            valid_vals = prices[col].dropna()
+            if not valid_vals.empty:
+                hasil["harga_terakhir"][col] = round(float(valid_vals.iloc[-1]), 2)
+        log_ret = np.log(prices / prices.shift(1)).dropna(how="all")
         hasil["korelasi"] = log_ret.corr().round(3).to_dict()
 
         for aset in ["GOLD", "BTC"]:
@@ -803,11 +808,15 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
         if isinstance(twelvedata_quote, dict) and isinstance(twelvedata_quote.get("XAUUSD"), dict)
         else None
     )
-    xau_live_yf = (
-        mtf_gold.get("last_close") or mtf_gold.get("close_terakhir")
-        if isinstance(mtf_gold, dict)
-        else None
-    )
+    xau_live_main = xau_live_td
+    if not xau_live_main:
+        try:
+            fast_px = yf.Ticker("GC=F").fast_info.get("lastPrice")
+            if fast_px is not None:
+                xau_live_main = round(float(fast_px), 5)
+        except Exception:
+            xau_live_main = None
+
     btc_live = (
         mtf_btc.get("last_close") or mtf_btc.get("close_terakhir")
         if isinstance(mtf_btc, dict)
@@ -823,9 +832,8 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
                 btc_live = None
 
     live_prices_ctx = {
-        "XAUUSD_live": xau_live_td or xau_live_yf or "TIDAK_TERSEDIA",
-        "XAUUSD_twelvedata": xau_live_td,
-        "XAUUSD_yfinance_gcf": xau_live_yf,
+        "XAUUSD_live": xau_live_main or "TIDAK_TERSEDIA",
+        "XAUUSD_sumber": "TwelveData" if xau_live_td else ("yfinance_GC=F" if xau_live_main else "TIDAK_TERSEDIA"),
         "BTCUSD_live": btc_live or "TIDAK_TERSEDIA",
     }
 
@@ -942,10 +950,10 @@ Setiap kali menjawab atau menganalisis:
             f"Sesi: {deteksi_sesi_trading()} | Spread XAU: {spread_aktif} pips\n"
             f"• XAUUSD ({live_prices_ctx['XAUUSD_live']}): {verdict.get('xau_bias')} (Skor: {xau_score}/100) | Regime: {mtf_gold.get('market_regime')}\n"
             f"• BTCUSDT ({live_prices_ctx['BTCUSD_live']}): {verdict.get('btc_bias')} (Skor: {btc_score}/100) | Regime: {mtf_btc.get('market_regime')}\n\n"
-            f"1. Macro Analyst: {verdict.get('macro_view')}\n"
-            f"2. Bull Case: {verdict.get('bull_case')}\n"
-            f"3. Bear/Skeptic Veto: {verdict.get('bear_skeptic_veto')}\n"
-            f"4. Risk Judge: {verdict.get('final_verdict')}\n"
+            f"1. Macro Analyst:\n{verdict.get('macro_view')}\n\n"
+            f"2. Bull Case:\n{verdict.get('bull_case')}\n\n"
+            f"3. Bear/Skeptic Veto:\n{verdict.get('bear_skeptic_veto')}\n\n"
+            f"4. Risk Judge:\n{verdict.get('final_verdict')}\n\n"
             f"Status Guardrail: {'LOLOS (>=75)' if lolos_final else 'DITAHAN / WAIT'}"
         )
         log_id = simpan_log(
