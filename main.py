@@ -483,7 +483,10 @@ def cek_konfluensi_mtf_dan_regime(ticker: str = "GC=F") -> dict:
         df_w1 = df_d1.resample("1W-MON").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
         w1_trend = _arah_ema(df_w1["Close"], 10, 20) if len(df_w1) >= 20 else d1_trend
 
-        df_mn1 = df_d1.resample("ME").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
+        try:
+            df_mn1 = df_d1.resample("ME").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
+        except ValueError:
+            df_mn1 = df_d1.resample("M").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
         mn1_trend = _arah_ema(df_mn1["Close"], 6, 12) if len(df_mn1) >= 12 else w1_trend
 
         high, low, close = df_d1["High"], df_d1["Low"], df_d1["Close"]
@@ -1095,10 +1098,6 @@ def kirim_telegram(pesan: str, log_id: int = None):
 
 
 def deteksi_model_gemini_aktif(client) -> list:
-    """
-    Mendeteksi otomatis daftar model Gemini yang benar-benar tersedia di akun/API key
-    agar tidak pernah terkena error 404 NOT_FOUND.
-    """
     if _MODEL_CACHE["checked"] and _MODEL_CACHE["models"]:
         return _MODEL_CACHE["models"]
 
@@ -1191,16 +1190,11 @@ def panggil_ai_reasoning_terbaik(
     system_prompt: str,
     json_mode: bool = False,
 ) -> tuple[str, str]:
-    """
-    Mencoba seluruh model Gemini aktif dengan High Reasoning/Thinking terlebih dahulu,
-    lalu otomatis jatuh ke Groq bila Gemini limit/tidak tersedia.
-    """
     if GEMINI_API_KEY:
         try:
             client = genai.Client(api_key=GEMINI_API_KEY)
             daftar_model = deteksi_model_gemini_aktif(client)
             for nama_model in daftar_model:
-                # 1. Coba interactions API jika model hydrogen
                 if "hydrogen" in nama_model:
                     try:
                         inter = client.interactions.create(
@@ -1214,7 +1208,6 @@ def panggil_ai_reasoning_terbaik(
                     except Exception as e_int:
                         print(f"Interactions {nama_model} skip: {str(e_int)[:110]}", flush=True)
 
-                # 2. Coba generate_content dengan thinking_config, lalu tanpa thinking_config jika model tidak mendukung
                 cfg_list = []
                 cfg_kwargs = {"system_instruction": system_prompt}
                 if json_mode:
