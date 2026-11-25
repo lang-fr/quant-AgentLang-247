@@ -453,13 +453,75 @@ def ambil_statistik_dan_makro() -> dict:
 
     return hasil
 
+def ambil_deribit_options_btc() -> dict:
+    try:
+        dvol_resp = requests.get(
+            "https://www.deribit.com/api/v2/public/get_volatility_index_data",
+            params={
+                "currency": "BTC",
+                "resolution": "60",
+                "start_timestamp": int((datetime.now(timezone.utc) - timedelta(hours=6)).timestamp() * 1000),
+                "end_timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+            },
+            timeout=10,
+        ).json()
+        dvol_data = dvol_resp.get("result", {}).get("data", [])
+        dvol_terakhir = round(float(dvol_data[-1][4]), 2) if dvol_data else None
 
+        books_resp = requests.get(
+            "https://www.deribit.com/api/v2/public/get_book_summary_by_currency",
+            params={"currency": "BTC", "kind": "option"},
+            timeout=12,
+        ).json()
+        summaries = books_resp.get("result", [])
+        call_oi = 0.0
+        put_oi = 0.0
+        for row in summaries:
+            inst = str(row.get("instrument_name", ""))
+            oi_val = float(row.get("open_interest") or 0.0)
+            if inst.endswith("-C"):
+                call_oi += oi_val
+            elif inst.endswith("-P"):
+                put_oi += oi_val
+
+        put_call_ratio = round(put_oi / call_oi, 3) if call_oi > 0 else None
+        return {
+            "DVOL_BTC": dvol_terakhir,
+            "Put_Call_OI_Ratio": put_call_ratio,
+            "Call_OI_BTC": round(call_oi, 1),
+            "Put_OI_BTC": round(put_oi, 1),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def ambil_berita_financial_juice(limit: int = 5) -> list:
+    urls_fj = [
+        "https://www.financialjuice.com/feed.ashx?xy=rss",
+        "https://feeds.feedburner.com/financialjuice",
+    ]
+    headlines = []
+    for url in urls_fj:
+        try:
+            feed = feedparser.parse(url)
+            for entry in getattr(feed, "entries", [])[:limit]:
+                judul = getattr(entry, "title", "").strip()
+                if judul and judul not in headlines:
+                    headlines.append(judul)
+            if headlines:
+                break
+        except Exception:
+            continue
+    return headlines[:limit]
 def ambil_data_institusi_dan_berita() -> dict:
     info = {"kripto_derivatif": {}, "stablecoin_flow": {}, "cftc_cot": {}, "berita": []}
     info["kalender_ff"] = ambil_kalender_ff(("USD",))
     info["makro_fred_detail"] = ambil_makro_fred()
     info["orderflow_ccxt"] = ambil_orderflow_ccxt("BTC/USDT")
-
+    info["deribit_options"] = ambil_deribit_options_btc()
+    for judul in ambil_berita_financial_juice(limit=5):
+        if judul not in info["berita"]:
+            info["berita"].append(judul)
     # 1. Derivatif Kripto (Funding Rate + Open Interest)
     try:
         ex = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
