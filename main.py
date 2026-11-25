@@ -858,13 +858,50 @@ Kembalikan HANYA format JSON valid dengan kunci:
 }}
 """
 
+    SYSTEM_INSTRUCTION_QUANT = """Kamu adalah mitra analisis kuantitatif, makro, dan evaluasi setup trading yang kritis, objektif, dan tidak asal mengiyakan.
+Setiap kali menjawab atau menganalisis:
+1. Audit Sumber & Kesegaran Data: Pisahkan secara jelas mana angka/fakta yang benar-benar berasal dari data/API/MCP/konteks yang diberikan vs mana yang belum tersedia, bersifat historis/lag, atau sedang di luar sesi aktif. Jangan mengarang harga live, berita terbaru, atau angka yang tidak ada.
+2. Uji Asumsi & Cari Blind Spot: Bongkar asumsi utama dari tesis/setup pengguna, lalu cari celah kegagalan terkuat (counter-thesis / skeptic view), jebakan likuiditas (sweep/false breakout), kondisi pasar sideways/choppy, atau benturan korelasi antar aset.
+3. Skenario, Invalidasi & Risiko: Selalu sertakan titik invalidasi yang jelas sebelum target, perhitungkan biaya transaksi/spread/slippage, dan hormati batas risiko (risiko per setup, batas layer, kuota sesi, serta rem darurat saat rilis berita berdampak tinggi).
+4. Berani Menahan Eksekusi: Jika data kurang lengkap, konfluensi lemah, atau profil risiko tidak seimbang, nyatakan sikap WAIT / NO TRADE secara tegas.
+5. Format Jelas & Terukur: Jawab lugas, terstruktur, dan fokus pada pengujian logika serta probabilitas."""
+
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
-        verdict = json.loads(response.text)
+        raw_json = ""
+        anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
+        if anthropic_key:
+            try:
+                import anthropic
+                claude_client = anthropic.Anthropic(api_key=anthropic_key)
+                claude_res = claude_client.messages.create(
+                    model="claude-opus-4-6",
+                    max_tokens=20000,
+                    system=SYSTEM_INSTRUCTION_QUANT,
+                    thinking={"type": "enabled", "budget_tokens": 16000},
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                for block in claude_res.content:
+                    if getattr(block, "type", "") == "text":
+                        raw_json = block.text.strip()
+                        break
+            except Exception as claude_err:
+                print("Fallback ke Gemini 4 Hydrogen karena Claude error:", claude_err)
+
+        if not raw_json:
+            response = client.models.generate_content(
+                model="models/gemini-4-hydrogen",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION_QUANT,
+                    response_mime_type="application/json",
+                    thinking_config=types.ThinkingConfig(thinking_level="XHIGH"),
+                ),
+            )
+            raw_json = response.text.strip()
+
+        if "{" in raw_json and "}" in raw_json:
+            raw_json = raw_json[raw_json.find("{") : raw_json.rfind("}") + 1]
+        verdict = json.loads(raw_json)
         xau_score = int(verdict.get("xau_score", 0))
         btc_score = int(verdict.get("btc_score", 0))
         top_score = max(xau_score, btc_score)
