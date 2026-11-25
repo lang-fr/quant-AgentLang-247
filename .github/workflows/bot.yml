@@ -3,12 +3,15 @@ name: Run Quant Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 */4 * * *' # Jalan setiap 4 jam (selaras pergantian sesi Asia, London, NY)
+
+permissions:
+  contents: write
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -16,6 +19,8 @@ jobs:
           python-version: '3.11'
       - run: pip install -r requirements.txt
       - env:
+          RUN_MODE: GITHUB_ACTIONS
+          AUTO_EXECUTE_DEMO: "false"
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
@@ -24,4 +29,18 @@ jobs:
           BLOCKWORKS_API_KEY: ${{ secrets.BLOCKWORKS_API_KEY }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           CMC_API_KEY: ${{ secrets.CMC_API_KEY }}
+          METAAPI_TOKEN: ${{ secrets.METAAPI_TOKEN }}
+          METAAPI_ACCOUNT_ID: ${{ secrets.METAAPI_ACCOUNT_ID }}
+          BINANCE_TESTNET_API_KEY: ${{ secrets.BINANCE_TESTNET_API_KEY }}
+          BINANCE_TESTNET_SECRET: ${{ secrets.BINANCE_TESTNET_SECRET }}
         run: python main.py
+      - name: Simpan Database Audit SQLite ke Repo
+        if: always()
+        run: |
+          if [ -f "quant_cloud_audit.db" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add quant_cloud_audit.db
+            git diff --staged --quiet || git commit -m "chore: update quant_cloud_audit.db [skip ci]"
+            git push
+          fi
