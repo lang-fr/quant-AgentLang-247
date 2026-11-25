@@ -1218,7 +1218,7 @@ def loop_listener_telegram():
                                 client_chat = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
                                 balasan = analisa_dengan_retry(
                                     client_chat,
-                                    ["gemini-2.5-flash", "gemini-2.0-flash"],
+                                    ["gemini-2.5-flash"],
                                     prompt_chat,
                                     config=None,
                                 )
