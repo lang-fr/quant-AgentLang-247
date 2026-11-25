@@ -816,6 +816,37 @@ def kirim_telegram(pesan: str, log_id: int = None):
         if reply_markup and idx == len(chunks) - 1:
             payload["reply_markup"] = json.dumps(reply_markup)
         requests.post(url, json=payload, timeout=15)
+        GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+
+
+def panggil_groq_fallback(prompt: str, system_prompt: str = "", model: str = "llama-3.3-70b-versatile") -> str:
+    if not GROQ_API_KEY:
+        return ""
+    try:
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": messages,
+                "temperature": 0.2,
+                "max_tokens": 1200,
+            },
+            timeout=20,
+        )
+        data = resp.json()
+        konten = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return konten.strip()
+    except Exception:
+        return ""
 def analisa_dengan_retry(client, models: list, prompt: str, config=None, retries: int = 2) -> str:
     if not client:
         return "GEMINI_API_KEY belum diisi."
@@ -862,26 +893,23 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
             xau_live_main = None
 
     btc_live = (
-    mtf_btc.get("last_close") or mtf_btc.get("close_terakhir")
-    if isinstance(mtf_btc, dict)
-    else None
-)
-if not btc_live or btc_live == "TIDAK_TERSEDIA":
-    cmc_btc_px = (
-        cmc_data.get("BTC_USD", {}).get("price")
-        if isinstance(cmc_data, dict)
+        mtf_btc.get("last_close") or mtf_btc.get("close_terakhir")
+        if isinstance(mtf_btc, dict)
         else None
     )
-    if cmc_btc_px:
-        btc_live = round(float(cmc_btc_px), 2)
+    if not btc_live or btc_live == "TIDAK_TERSEDIA":
         try:
             btc_live = round(float(ccxt.okx({"enableRateLimit": True}).fetch_ticker("BTC/USDT:USDT")["last"]), 2)
         except Exception:
             try:
                 btc_live = round(float(yf.Ticker("BTC-USD").fast_info["lastPrice"]), 2)
             except Exception:
-                btc_live = None
-
+                cmc_btc_px = (
+                    cmc_data.get("BTC_USD", {}).get("price")
+                    if isinstance(cmc_data, dict)
+                    else None
+                )
+                btc_live = round(float(cmc_btc_px), 2) if cmc_btc_px else None
     live_prices_ctx = {
         "XAUUSD_live": xau_live_main or "TIDAK_TERSEDIA",
         "XAUUSD_sumber": "TwelveData" if xau_live_td else ("yfinance_GC=F" if xau_live_main else "TIDAK_TERSEDIA"),
@@ -1162,6 +1190,16 @@ def loop_listener_telegram():
                                     prompt_chat,
                                     config=None,
                                 )
+                                if not balasan or balasan.startswith("Maaf, semua percobaan model gagal"):
+                                    groq_balasan = panggil_groq_fallback(
+                                        prompt_chat,
+                                        system_prompt=(
+                                            "Kamu adalah AgentLang, partner diskusi quant, makro, dan eksekusi trading di Telegram. "
+                                            "Jawab lugas, tenang, kritis, dan tanpa tanda bintang (* atau **)."
+                                        ),
+                                    )
+                                    if groq_balasan:
+                                        balasan = groq_balasan
                                 kirim_telegram(balasan)
                             except Exception as e:
                                 kirim_telegram(f"Gagal balas chat: {str(e)[:150]}")
