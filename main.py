@@ -589,41 +589,45 @@ def ambil_data_institusi_dan_berita() -> dict:
     return info
 
 
-def ambil_intelijen_blockworks() -> dict:
-    if not BLOCKWORKS_API_KEY:
-        return {"status": "opsional_belum_diisi"}
-    try:
-        headers = {
-            "x-blockworks-api-key": BLOCKWORKS_API_KEY,
-            "Accept": "application/json",
-        }
-        resp = requests.get(
-            "https://api.blockworks.com/v1/assets",
-            headers=headers,
-            params={"limit": 5},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            items = data.get("data", data) if isinstance(data, dict) else data
-            ringkasan = []
-            if isinstance(items, list):
-                for item in items[:5]:
-                    if isinstance(item, dict):
-                        ringkasan.append({
-                            "symbol": item.get("symbol") or item.get("ticker"),
-                            "name": item.get("name"),
-                            "price": item.get("price"),
-                            "mcap": item.get("marketCap") or item.get("market_cap"),
-                            "vol_24h": item.get("volume24h") or item.get("volume_24h"),
-                        })
-            return {"status": "aktif", "top_assets": ringkasan or str(data)[:300]}
-        return {"status": f"http_{resp.status_code}", "detail": resp.text[:150]}
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
+def ambil_intelijen_blockworks():
+    api_key = os.getenv("BLOCKWORKS_API_KEY", "").strip()
+    if not api_key:
+        return {"status": "nonaktif_tanpa_key", "catatan": "BLOCKWORKS_API_KEY kosong"}
 
+    headers = {
+        "x-blockworks-api-key": api_key,
+        "Accept": "application/json",
+    }
+    kandidat_url = [
+        ("https://api.blockworks.com/query/tabular/assets", {"pageSize": 5}),
+        ("https://api.blockworks.com/v1/assets", None),
+    ]
 
-def ambil_data_coinmarketcap() -> dict:
+    for url, params in kandidat_url:
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                return {
+                    "status": "aktif",
+                    "endpoint": url,
+                    "ringkasan": data if isinstance(data, (dict, list)) else str(data)[:300],
+                }
+            if resp.status_code != 401:
+                return {
+                    "status": f"http_{resp.status_code}",
+                    "endpoint": url,
+                    "catatan": resp.text[:200],
+                }
+        except Exception as e:
+            return {"status": "error_koneksi", "endpoint": url, "catatan": str(e)}
+
+    return {
+        "status": "http_401",
+        "catatan": "Periksa masa aktif/izin endpoint API key di Blockworks Intel",
+    }
+    
+    def ambil_data_coinmarketcap() -> dict:
     if not CMC_API_KEY:
         return {"status": "opsional_belum_diisi"}
     headers = {
