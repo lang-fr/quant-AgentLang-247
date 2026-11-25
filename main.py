@@ -22,6 +22,7 @@ from fredapi import Fred
 from flask import Flask, request, jsonify
 from google import genai
 from google.genai import types
+from market_feeds import ambil_kalender_ff, ambil_makro_fred, ambil_orderflow_ccxt
 
 # ==============================================================================
 # 1. LAPISAN 5: KEAMANAN KUNCI API (.env LOKAL & ENVIRONMENT VARIABLES CLOUD)
@@ -34,6 +35,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BLOCKWORKS_API_KEY = os.getenv("BLOCKWORKS_API_KEY", "")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
+CMC_API_KEY = os.getenv("CMC_API_KEY", "")
 METAAPI_TOKEN = os.getenv("METAAPI_TOKEN", "")
 METAAPI_ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "")
 
@@ -454,6 +456,9 @@ def ambil_statistik_dan_makro() -> dict:
 
 def ambil_data_institusi_dan_berita() -> dict:
     info = {"kripto_derivatif": {}, "stablecoin_flow": {}, "cftc_cot": {}, "berita": []}
+    info["kalender_ff"] = ambil_kalender_ff(("USD",))
+    info["makro_fred_detail"] = ambil_makro_fred()
+    info["orderflow_ccxt"] = ambil_orderflow_ccxt("BTC/USDT")
 
     # 1. Derivatif Kripto (Funding Rate + Open Interest)
     try:
@@ -502,7 +507,10 @@ def ambil_data_institusi_dan_berita() -> dict:
                 info["berita"].append(entry.title)
         except Exception:
             pass
-
+    # 5. Kalender High-Impact FF, Makro FRED Detail & Orderflow CCXT
+    info["kalender_ff"] = ambil_kalender_ff(("USD",))
+    info["makro_fred_detail"] = ambil_makro_fred()
+    info["orderflow_ccxt"] = ambil_orderflow_ccxt("BTC/USDT")
     return info
 
 
@@ -666,7 +674,10 @@ def analisa_dengan_retry(client, model_daftar: list, prompt: str, config=None) -
             },
             json={
                 "model": "openai/gpt-oss-120b",
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [
+    {"role": "system", "content": "Kamu adalah asisten AI quant. Balas dalam format json yang valid."},
+    {"role": "user", "content": prompt}
+],
                 "response_format": {"type": "json_object"} if config is not None else {"type": "text"},
                 "temperature": 0.2,
                 "max_tokens": 4096,
@@ -694,7 +705,7 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
         pip_value=1.0,
         layers=1,
         spread_pips=spread_aktif,
-        is_high_impact_news=kalender_news.get("is_high_impact_active", False),
+        is_high_impact_news=institusi.get("kalender_ff", {}).get("blokir_entry_news", False),
         z_score_h1=mtf_gold.get("Z_score_H1_latest", 0.0),
     )
 
