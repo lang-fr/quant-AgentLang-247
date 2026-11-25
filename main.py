@@ -1404,7 +1404,7 @@ Kembalikan HANYA JSON valid dengan struktur berikut:
   "macro_analyst": "Penalaran mendalam makro, fundamental, likuiditas global & bias Hold D1-MN1 (3-4 kalimat padat)",
   "bull_researcher": "Penalaran tesis bullish, orderflow CVD, sweep likuiditas, narasi/news & setup terbaik (3-4 kalimat padat)",
   "bear_skeptic": "Audit kritis, red flag, jebakan likuiditas, benturan timeframe & skenario gagal (3-4 kalimat padat)",
-  "risk_judge": "Keputusan final per horizon (Sesi {sesi_aktif}, Intraday, Swing, Hold), titik invalidasi, risiko & alasan lolos/ditahan < 75 (3-4 kalimat padat)"
+  "risk_judge": "Keputusan final per horizon (Sesi {sesi_aktif}, Intraday, Swing, Hold), titik invalidasi, risiko & alasan lolos/ditahan < 75 (3-4 kalimat padat)",
   "critical_thinking_check": {
     "data_coverage": "Ringkasan sumber data yang aktif vs gagal/kosong pada scan ini",
     "macro_vs_flow": "Apakah makro, narasi/news, dan orderflow/likuiditas saling mengonfirmasi atau bentrok",
