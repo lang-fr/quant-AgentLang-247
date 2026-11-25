@@ -1405,6 +1405,23 @@ Kembalikan HANYA JSON valid dengan struktur berikut:
   "bull_researcher": "Penalaran tesis bullish, orderflow CVD, sweep likuiditas, narasi/news & setup terbaik (3-4 kalimat padat)",
   "bear_skeptic": "Audit kritis, red flag, jebakan likuiditas, benturan timeframe & skenario gagal (3-4 kalimat padat)",
   "risk_judge": "Keputusan final per horizon (Sesi {sesi_aktif}, Intraday, Swing, Hold), titik invalidasi, risiko & alasan lolos/ditahan < 75 (3-4 kalimat padat)"
+  "critical_thinking_check": {
+    "data_coverage": "Ringkasan sumber data yang aktif vs gagal/kosong pada scan ini",
+    "macro_vs_flow": "Apakah makro, narasi/news, dan orderflow/likuiditas saling mengonfirmasi atau bentrok",
+    "sop_guardrail_check": "Status kuota sesi (maks 3/sesi), maks 3 layer, risiko (maks 1%), spread & berita"
+  },
+  "xau_setups": {
+    "sesi": "Entry: ... | SL: ... | TP1: ... | TP2: ... | Max Layer (<=3) & Risiko: ... (atau WAIT)",
+    "intraday": "Entry: ... | SL: ... | TP1: ... | TP2: ... | Max Layer (<=3) & Risiko: ... (atau WAIT)",
+    "swing": "Entry: ... | SL: ... | TP1: ... | TP2: ... | Max Layer (<=3) & Risiko: ... (atau WAIT)",
+    "hold": "Zona Akumulasi/Distribusi: ... | Invalidasi W1/MN1: ... | Target Makro: ... | Risiko: ..."
+  },
+  "btc_setups": {
+    "sesi": "Entry: ... | SL: ... | TP1: ... | TP2: ... | Max Layer (<=3) & Risiko: ... (atau WAIT)",
+    "intraday": "Entry: ... | SL: ... | TP1: ... | TP2: ... | Max Layer (<=3) & Risiko: ... (atau WAIT)",
+    "swing": "Entry: ... | SL: ... | TP1: ... | TP2: ... | Max Layer (<=3) & Risiko: ... (atau WAIT)",
+    "hold": "Zona Akumulasi/Distribusi: ... | Invalidasi W1/MN1: ... | Target Makro: ... | Risiko: ..."
+  }
 }}
 """
 
@@ -1426,6 +1443,26 @@ Kembalikan HANYA JSON valid dengan struktur berikut:
             top_score = max(x_sc, b_sc)
             bias_summary = f"[{mode_fokus}] XAU:{verdict.get('xau_bias')}({x_sc}) | BTC:{verdict.get('btc_bias')}({b_sc})"
             lolos_final = bool(risk_status.get("approved")) and (top_score >= 75)
+            ct = verdict.get("critical_thinking_check", {}) if isinstance(verdict.get("critical_thinking_check"), dict) else {}
+            x_set = verdict.get("xau_setups", {}) if isinstance(verdict.get("xau_setups"), dict) else {}
+            b_set = verdict.get("btc_setups", {}) if isinstance(verdict.get("btc_setups"), dict) else {}
+
+            blok_tambahan = (
+                f"\nKonfirmasi Critical Thinking & SOP:\n"
+                f"- Cakupan Data: {ct.get('data_coverage', '-')}\n"
+                f"- Makro vs Orderflow: {ct.get('macro_vs_flow', '-')}\n"
+                f"- Guardrail SOP: {ct.get('sop_guardrail_check', '-')}\n\n"
+                f"Setup XAUUSD (Terpisah per Horizon):\n"
+                f"- Sesi: {x_set.get('sesi', 'WAIT')}\n"
+                f"- Intraday: {x_set.get('intraday', 'WAIT')}\n"
+                f"- Swing: {x_set.get('swing', 'WAIT')}\n"
+                f"- Hold: {x_set.get('hold', 'WAIT')}\n\n"
+                f"Setup BTCUSDT (Terpisah per Horizon):\n"
+                f"- Sesi: {b_set.get('sesi', 'WAIT')}\n"
+                f"- Intraday: {b_set.get('intraday', 'WAIT')}\n"
+                f"- Swing: {b_set.get('swing', 'WAIT')}\n"
+                f"- Hold: {b_set.get('hold', 'WAIT')}\n"
+            )
 
             hasil_teks = (
                 f"QUANT AGENT v2.8 — SIDANG 4 AGEN [{engine_dipakai}]\n"
@@ -1439,6 +1476,7 @@ Kembalikan HANYA JSON valid dengan struktur berikut:
                 f"3. Bear / Skeptic Researcher (Blind Spot & Jebakan):\n{verdict.get('bear_skeptic')}\n\n"
                 f"4. Risk Judge (Keputusan Final & Horizon):\n{verdict.get('risk_judge')}\n\n"
                 f"Status Guardrail: {'LOLOS HIGH-PROB (>=75) — SIAP REVIEW' if lolos_final else 'DITAHAN / WAIT (Skor < 75 atau Guardrail Aktif)'}"
+                f"{blok_tambahan}\n"
             )
 
             log_id = simpan_log(
