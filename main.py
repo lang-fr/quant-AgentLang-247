@@ -858,37 +858,32 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     prompt = f"""
-Kamu adalah Dewan Juri 4-Agen Kuantitatif Institusional. Analisa data riil berikut dalam Bahasa Indonesia:
+Kamu adalah Dewan Juri 4-Agen Kuantitatif Institusional. Analisa data riil berikut dalam Bahasa Indonesia dengan format SINGKAT, BERSIH, dan MUDAH DIBACA di Telegram.
 Pemicu: {pemicu} | Sesi: {deteksi_sesi_trading()} | Spread XAUUSD: {spread_aktif} pips
 
-ATURAN DATA HARGA & SOP WAJIB:
-- Harga rujukan utama HANYA boleh memakai nilai pada LIVE_PRICES: {live_prices_ctx}.
-- DILARANG KERAS mengarang, menebak, atau memakai level harga lama/contoh (seperti 1950 atau 26500) jika tidak ada di LIVE_PRICES.
-- Jika XAUUSD_live atau BTCUSD_live bernilai "TIDAK_TERSEDIA", beri skor < 75 dan wajibkan bias "WAIT_NO_TRADE".
-- Fokuskan analisis utama pada XAUUSD dan BTCUSDT sesuai sesi aktif (maks 3 entry/sesi, 1-3 layer/setup, risiko setup maks 1%, perhatikan SL struktur & geser SL ke BE setelah TP1).
+ATURAN DATA & SOP WAJIB:
+- Harga rujukan utama HANYA memakai LIVE_PRICES: {live_prices_ctx}.
+- DILARANG mengarang angka atau level harga yang tidak ada di data.
+- Jika XAUUSD_live atau BTCUSD_live "TIDAK_TERSEDIA", wajib skor < 75 dan bias "WAIT_NO_TRADE".
+- Setiap field teks (macro_view, bull_case, bear_skeptic_veto, final_verdict) WAJIB ditulis singkat (maksimal 2 poin pendek dipisah newline "\\n", tiap poin maksimal 15 kata, JANGAN menumpuk banyak angka dalam satu kalimat panjang, dan JANGAN mengulang daftar error yang sama berkali-kali).
 
-1. Makro, Korelasi Log Return, GARCH & CVaR: {data_makro}
-2. Multi-Timeframe & ADX Regime (Gold & BTC): {mtf_gold} | {mtf_btc}
-3. Posisi Institusi (COT), Derivatif OI, & Stablecoin Flow: {data_institusi}
-4. Intelijen Multi-Aset (Blockworks Intel & Twelve Data): {blockworks_intel} | {twelvedata_quote}
-5. Kalender Berita Tier-1 & Hardcoded Risk Engine: {kalender_news} | {risk_status}
+Data:
+1. Makro & Risiko Ekor: {data_makro}
+2. MTF & ADX Regime: Gold={mtf_gold} | BTC={mtf_btc}
+3. Institusi, Derivatif & Stablecoin: {data_institusi}
+4. Blockworks & TwelveData: {blockworks_intel} | {twelvedata_quote}
+5. Kalender & Risk Engine: {kalender_news} | {risk_status}
 
-Jalankan sidang singkat 4 peran:
-- Macro Analyst: Evaluasi Likuiditas Fed, DFII10, DXY, & COT.
-- Bull Researcher: Argumen terkuat untuk BUY berdasarkan data di atas.
-- Bear/Skeptic Researcher: Argumen terkuat untuk SELL atau VETO (celah kegagalan, choppy ADX < 20, atau korelasi bertabrakan).
-- Risk Judge: Tentukan skor objektif 0-100 untuk XAUUSD dan BTCUSDT. Jika skor < 75 atau risk_status approved=False, wajib rekomendasikan WAIT_NO_TRADE.
-
-Kembalikan HANYA format JSON valid dengan kunci:
+Kembalikan HANYA JSON valid:
 {{
   "xau_score": integer (0-100),
   "xau_bias": "BULLISH" | "BEARISH" | "WAIT_NO_TRADE",
   "btc_score": integer (0-100),
   "btc_bias": "BULLISH" | "BEARISH" | "WAIT_NO_TRADE",
-  "macro_view": "ringkasan 1 kalimat",
-  "bull_case": "ringkasan 1 kalimat",
-  "bear_skeptic_veto": "ringkasan 1 kalimat",
-  "final_verdict": "kesimpulan singkat berbasis angka"
+  "macro_view": "- poin 1 singkat\\n- poin 2 singkat",
+  "bull_case": "- poin 1 singkat\\n- poin 2 singkat",
+  "bear_skeptic_veto": "- poin 1 singkat\\n- poin 2 singkat",
+  "final_verdict": "- keputusan & batas risiko singkat"
 }}
 """
 
