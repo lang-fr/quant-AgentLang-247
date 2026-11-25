@@ -826,7 +826,7 @@ def panggil_groq_fallback(prompt: str, system_prompt: str = "", model: str = "ll
                 "model": model,
                 "messages": messages,
                 "temperature": 0.2,
-                "max_tokens": 1200,
+                "max_tokens": 2200,
             },
             timeout=20,
         )
@@ -1078,12 +1078,25 @@ Setiap kali menjawab atau menganalisis:
                 kirim_telegram(hasil_teks, log_id=log_id if lolos_final else None)
                 return hasil_teks
             except Exception:
-                pass
-
-        top_score = 0
-        bias_summary = "ERROR"
-        lolos_final = False
-        hasil_teks = f"Gagal memproses sidang AI: {str(e)}"
+                top_score = 0
+                bias_summary = "GROQ_TEXT"
+                lolos_final = False
+                hasil_teks = (
+                    f"QUANT AGENT v2.3 — SIDANG 4 AGEN [GROQ FALLBACK] ({pemicu})\n"
+                    f"Sesi: {deteksi_sesi_trading()} | Spread XAU: {spread_aktif} pips\n\n"
+                    f"{groq_raw}"
+                )
+                log_id = simpan_log(
+                    "XAUUSD/BTC",
+                    bias_summary,
+                    top_score,
+                    spread_aktif,
+                    macro_snap,
+                    "AUTO_WAIT",
+                    hasil_teks[:400],
+                )
+                kirim_telegram(hasil_teks, log_id=None)
+                return hasil_teks
 
     log_id = simpan_log(
         "XAUUSD/BTC",
