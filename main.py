@@ -208,7 +208,14 @@ def cek_kalender_berita_tier1_otomatis() -> dict:
     """
     try:
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        events = requests.get(url, timeout=10).json()
+        resp = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return {"is_high_impact_active": False, "error": f"HTTP {resp.status_code}"}
+        events = resp.json()
         now_utc = datetime.now(timezone.utc)
         active_warnings = []
 
@@ -445,7 +452,7 @@ def ambil_statistik_dan_makro() -> dict:
             hasil["fred_macro"]["FEDFUNDS"] = round(float(fred.get_series("FEDFUNDS").iloc[-1]), 2)
             hasil["fred_macro"]["REAL_YIELD_DFII10"] = round(float(fred.get_series("DFII10").iloc[-1]), 2)
             walcl = float(fred.get_series("WALCL").iloc[-1]) / 1000.0
-            tga = float(fred.get_series("WTREGEN").iloc[-1])
+            tga = float(fred.get_series("WTREGEN").iloc[-1]) / 1000.0
             rrp = float(fred.get_series("RRPONTSYD").iloc[-1])
             hasil["fred_macro"]["FED_NET_LIQUIDITY_B_USD"] = round(walcl - tga - rrp, 2)
         except Exception as e:
@@ -524,10 +531,10 @@ def ambil_data_institusi_dan_berita() -> dict:
             info["berita"].append(judul)
     # 1. Derivatif Kripto (Funding Rate + Open Interest)
     try:
-        ex = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
-        ticker = ex.fetch_ticker("BTC/USDT")
-        funding = ex.fetch_funding_rate("BTC/USDT")
-        oi = ex.fetch_open_interest("BTC/USDT")
+        ex = ccxt.okx({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+        ticker = ex.fetch_ticker("BTC/USDT:USDT")
+        funding = ex.fetch_funding_rate("BTC/USDT:USDT")
+        oi = ex.fetch_open_interest("BTC/USDT:USDT")
         info["kripto_derivatif"] = {
             "BTC_last": ticker["last"],
             "funding_rate_pct": round(float(funding["fundingRate"]) * 100, 4),
@@ -585,8 +592,7 @@ def ambil_intelijen_blockworks() -> dict:
         return {"status": "opsional_belum_diisi"}
     try:
         headers = {
-            "Authorization": f"Bearer {BLOCKWORKS_API_KEY}",
-            "x-api-key": BLOCKWORKS_API_KEY,
+            "x-blockworks-api-key": BLOCKWORKS_API_KEY,
             "Accept": "application/json",
         }
         resp = requests.get(
@@ -623,7 +629,7 @@ def ambil_data_twelvedata_intraday() -> dict:
     if not TWELVEDATA_API_KEY:
         return {"status": "opsional_belum_diisi"}
     hasil = {"status": "aktif"}
-    for label, sym in [("XAUUSD", "XAU/USD"), ("QQQ_NASDAQ", "QQQ")]:
+    for label, sym in [("XAUUSD", "XAU/USD"), ("BTCUSD", "BTC/USD"), ("QQQ_NASDAQ", "QQQ")]:
         try:
             resp = requests.get(
                 "https://api.twelvedata.com/quote",
@@ -762,6 +768,26 @@ def kirim_telegram(pesan: str, log_id: int = None):
         if reply_markup and idx == len(chunks) - 1:
             payload["reply_markup"] = json.dumps(reply_markup)
         requests.post(url, json=payload, timeout=15)
+def analisa_dengan_retry(client, models: list, prompt: str, config=None, retries: int = 2) -> str:
+    if not client:
+        return "GEMINI_API_KEY belum diisi."
+    last_err = None
+    for model_name in models:
+        for attempt in range(retries + 1):
+            try:
+                res = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=config,
+                )
+                teks = getattr(res, "text", None)
+                if teks and teks.strip():
+                    return teks.strip()
+            except Exception as e:
+                last_err = e
+                time.sleep(2 * (attempt + 1))
+    return f"Maaf, semua percobaan model gagal ({str(last_err)[:120]})."
+
 def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
     data_makro = ambil_statistik_dan_makro()
     data_institusi = ambil_data_institusi_dan_berita()
@@ -787,6 +813,14 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
         if isinstance(mtf_btc, dict)
         else None
     )
+    if not btc_live or btc_live == "TIDAK_TERSEDIA":
+        try:
+            btc_live = round(float(ccxt.okx({"enableRateLimit": True}).fetch_ticker("BTC/USDT:USDT")["last"]), 2)
+        except Exception:
+            try:
+                btc_live = round(float(yf.Ticker("BTC-USD").fast_info["lastPrice"]), 2)
+            except Exception:
+                btc_live = None
 
     live_prices_ctx = {
         "XAUUSD_live": xau_live_td or xau_live_yf or "TIDAK_TERSEDIA",
