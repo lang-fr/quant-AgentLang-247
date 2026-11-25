@@ -624,7 +624,50 @@ def ambil_intelijen_blockworks() -> dict:
         return {"status": f"http_{resp.status_code}", "detail": resp.text[:150]}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
+def ambil_data_coinmarketcap() -> dict:
+    """
+    Menarik data global market cap, dominansi BTC, dan harga spot BTC
+    dari CoinMarketCap API sebagai konfirmasi & fallback sentimen kripto.
+    """
+    if not CMC_API_KEY:
+        return {"status": "opsional_belum_diisi"}
+    headers = {
+        "X-CMC_PRO_API_KEY": CMC_API_KEY,
+        "Accept": "application/json",
+    }
+    hasil = {"status": "aktif"}
+    try:
+        g_resp = requests.get(
+            "https://pro-api.coinmarketcap.com/v1/global-metrics/quotes/latest",
+            headers=headers,
+            timeout=10,
+        ).json()
+        g_data = g_resp.get("data", {})
+        usd_quote = g_data.get("quote", {}).get("USD", {})
+        if usd_quote:
+            hasil["global"] = {
+                "total_mcap_B_USD": round(float(usd_quote.get("total_market_cap", 0)) / 1e9, 2),
+                "vol_24h_B_USD": round(float(usd_quote.get("total_volume_24h", 0)) / 1e9, 2),
+                "btc_dominance_pct": round(float(g_data.get("btc_dominance", 0)), 2),
+                "mcap_change_24h_pct": round(float(usd_quote.get("total_market_cap_yesterday_percentage_change", 0)), 2),
+            }
 
+        q_resp = requests.get(
+            "https://pro-api.coinmarketcap.com/v2/cryptocurrency/quotes/latest",
+            headers=headers,
+            params={"symbol": "BTC", "convert": "USD"},
+            timeout=10,
+        ).json()
+        btc_list = q_resp.get("data", {}).get("BTC", [])
+        if isinstance(btc_list, list) and btc_list:
+            btc_usd = btc_list[0].get("quote", {}).get("USD", {})
+            hasil["BTC_USD"] = {
+                "price": round(float(btc_usd.get("price", 0)), 2),
+                "percent_change_24h": round(float(btc_usd.get("percent_change_24h", 0)), 2),
+            }
+        return hasil
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
 
 def ambil_data_twelvedata_intraday() -> dict:
     """
@@ -797,6 +840,7 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
     data_makro = ambil_statistik_dan_makro()
     data_institusi = ambil_data_institusi_dan_berita()
     blockworks_intel = ambil_intelijen_blockworks()
+    cmc_data = ambil_data_coinmarketcap()
     twelvedata_quote = ambil_data_twelvedata_intraday()
     mtf_gold = cek_konfluensi_mtf_dan_regime("GC=F")
     mtf_btc = cek_konfluensi_mtf_dan_regime("BTC-USD")
@@ -818,11 +862,18 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
             xau_live_main = None
 
     btc_live = (
-        mtf_btc.get("last_close") or mtf_btc.get("close_terakhir")
-        if isinstance(mtf_btc, dict)
+    mtf_btc.get("last_close") or mtf_btc.get("close_terakhir")
+    if isinstance(mtf_btc, dict)
+    else None
+)
+if not btc_live or btc_live == "TIDAK_TERSEDIA":
+    cmc_btc_px = (
+        cmc_data.get("BTC_USD", {}).get("price")
+        if isinstance(cmc_data, dict)
         else None
     )
-    if not btc_live or btc_live == "TIDAK_TERSEDIA":
+    if cmc_btc_px:
+        btc_live = round(float(cmc_btc_px), 2)
         try:
             btc_live = round(float(ccxt.okx({"enableRateLimit": True}).fetch_ticker("BTC/USDT:USDT")["last"]), 2)
         except Exception:
@@ -878,6 +929,7 @@ ATURAN DATA & SOP WAJIB:
 Data:
 1. Makro & Risiko Ekor: {data_makro}
 2. MTF & ADX Regime: Gold={mtf_gold} | BTC={mtf_btc}
+- CoinMarketCap (Global & BTC): {cmc_data}
 3. Institusi, Derivatif & Stablecoin: {data_institusi}
 4. Blockworks & TwelveData: {blockworks_intel} | {twelvedata_quote}
 5. Kalender & Risk Engine: {kalender_news} | {risk_status}
