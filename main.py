@@ -664,10 +664,86 @@ def cek_spread_mt5_cloud(symbol: str = "XAUUSD") -> float:
 # ==============================================================================
 # 7. LAPISAN 4: DEWAN JURI 4-AGEN GEMINI (JSON) & KONTROL TELEGRAM
 # ==============================================================================
+def bersihkan_teks_telegram(teks: str) -> str:
+    """
+    Mengubah respons yang memuat objek JSON mentah menjadi teks Telegram yang bersih dan mudah dibaca.
+    """
+    if not teks:
+        return ""
+
+    teks_bersih = teks.strip()
+    if teks_bersih.startswith("```"):
+        lines = teks_bersih.splitlines()
+        if len(lines) >= 2 and lines[-1].strip().startswith("```"):
+            teks_bersih = "\n".join(lines[1:-1]).strip()
+
+    try:
+        data = json.loads(teks_bersih)
+    except Exception:
+        return teks
+
+    if not isinstance(data, dict):
+        return teks
+
+    baris = []
+    if data.get("greeting"):
+        baris.append(str(data["greeting"]).strip())
+
+    sesi = data.get("session_status")
+    if isinstance(sesi, dict):
+        ringkas_sesi = []
+        if "total_scans" in sesi:
+            ringkas_sesi.append(f"Scan: {sesi['total_scans']}")
+        if "approved_signals" in sesi:
+            ringkas_sesi.append(f"Disetujui: {sesi['approved_signals']}")
+        if "rejected_signals" in sesi:
+            ringkas_sesi.append(f"Ditolak: {sesi['rejected_signals']}")
+        if "average_confirmation_score" in sesi:
+            ringkas_sesi.append(f"Rata-rata Skor: {sesi['average_confirmation_score']}")
+        if "asia_quota_remaining" in sesi:
+            ringkas_sesi.append(f"Sisa Kuota Asia: {sesi['asia_quota_remaining']}")
+        if ringkas_sesi:
+            baris.append(" | ".join(ringkas_sesi))
+
+        logs = sesi.get("last_logs")
+        if isinstance(logs, list) and logs:
+            baris.append("\nLog Terakhir:")
+            for item in logs[-3:]:
+                if isinstance(item, dict):
+                    reg = item.get("region", "-")
+                    pair = item.get("pair", "-")
+                    xau_st = item.get("XAU_status", "-")
+                    xau_sc = item.get("XAU_score", "-")
+                    btc_st = item.get("BTC_status", "-")
+                    btc_sc = item.get("BTC_score", "-")
+                    spr = item.get("spread", "-")
+                    baris.append(
+                        f"• [{reg}] {pair} | XAU: {xau_st} ({xau_sc}) | BTC: {btc_st} ({btc_sc}) | Spread: {spr}"
+                    )
+
+    for key, label in [
+        ("observations", "\nCatatan Utama:"),
+        ("risk_considerations", "\nPertimbangan Risiko:"),
+        ("recommendations", "\nRekomendasi:"),
+    ]:
+        val = data.get(key)
+        if isinstance(val, list) and val:
+            baris.append(label)
+            for idx, poin in enumerate(val, 1):
+                baris.append(f"{idx}. {str(poin).strip()}")
+
+    if data.get("recommendation") and isinstance(data.get("recommendation"), str):
+        baris.append(f"\nKesimpulan: {data['recommendation'].strip()}")
+
+    return "\n".join(baris).strip() if baris else teks
+
+
 def kirim_telegram(pesan: str, log_id: int = None):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram belum dikonfigurasi:\n", pesan)
         return
+
+    pesan_final = bersihkan_teks_telegram(pesan)
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     reply_markup = None
     if log_id is not None:
@@ -680,77 +756,12 @@ def kirim_telegram(pesan: str, log_id: int = None):
             ]
         }
 
-    chunks = [pesan[i : i + 3900] for i in range(0, len(pesan), 3900)]
+    chunks = [pesan_final[i : i + 3900] for i in range(0, len(pesan_final), 3900)]
     for idx, chunk in enumerate(chunks):
-        payload = {"chat_id": str(TELEGRAM_CHAT_ID).strip(), "text": chunk}
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk}
         if reply_markup and idx == len(chunks) - 1:
             payload["reply_markup"] = json.dumps(reply_markup)
-        for percobaan in range(3):
-            try:
-                r = requests.post(url, json=payload, timeout=30).json()
-                if r.get("ok"):
-                    print("sendMessage terkirim ke Telegram!", flush=True)
-                    break
-                err_code = r.get("error_code")
-                if err_code == 429:
-                    jeda = int(r.get("parameters", {}).get("retry_after", 10)) + 1
-                    print(f"sendMessage kena 429 -> tunggu {jeda}s lalu kirim ulang...", flush=True)
-                    time.sleep(jeda)
-                    continue
-                print(f"sendMessage gagal: {r}", flush=True)
-                break
-            except Exception as e:
-                print(f"Error kirim_telegram (percobaan {percobaan + 1}): {e}", flush=True)
-                time.sleep(3)
-
-def analisa_dengan_retry(client, model_daftar: list, prompt: str, config=None) -> str:
-    error_terakhir = ""
-    for model_name in model_daftar:
-        for percobaan in range(2):
-            try:
-                print(f"Mencoba analisa pakai {model_name}...", flush=True)
-                if client is None:
-                    raise RuntimeError("GEMINI_API_KEY kosong")
-                res = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=config,
-                )
-                return res.text
-            except Exception as e:
-                error_terakhir = str(e)
-                print(f"Gagal {model_name}: {error_terakhir[:150]}", flush=True)
-                if any(k in error_terakhir for k in ["429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE"]):
-                    time.sleep(5)
-                else:
-                    break
-
-    groq_key = os.getenv("GROQ_API_KEY", "").strip()
-    if groq_key:
-        print("Semua Gemini penuh, pindah ke cadangan Groq openai/gpt-oss-120b...", flush=True)
-        resp_groq = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {groq_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "openai/gpt-oss-120b",
-                "messages": [
-    {"role": "system", "content": "Kamu adalah asisten AI quant. Balas dalam format json yang valid."},
-    {"role": "user", "content": prompt}
-],
-                "response_format": {"type": "json_object"} if config is not None else {"type": "text"},
-                "temperature": 0.2,
-                "max_tokens": 4096,
-            },
-            timeout=30,
-        )
-        if resp_groq.status_code == 200:
-            return resp_groq.json()["choices"][0]["message"]["content"]
-        error_terakhir = f"Groq HTTP {resp_groq.status_code}: {resp_groq.text[:100]}"
-
-    raise RuntimeError(f"Semua model gagal ({error_terakhir[:120]})")
+        requests.post(url, json=payload, timeout=15)
 def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
     data_makro = ambil_statistik_dan_makro()
     data_institusi = ambil_data_institusi_dan_berita()
