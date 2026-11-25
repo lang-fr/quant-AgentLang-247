@@ -3,6 +3,7 @@ import json
 import time
 import threading
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
@@ -49,6 +50,7 @@ AUTO_SCAN_INTERVAL_SEC = int(os.getenv("AUTO_SCAN_INTERVAL_SEC", "14400"))  # Ti
 
 app = Flask(__name__)
 DB_PATH = "quant_cloud_audit.db"
+_COT_CACHE = {"tanggal": "", "nilai": None}
 
 
 # ==============================================================================
@@ -212,7 +214,7 @@ def cek_kalender_berita_tier1_otomatis() -> dict:
         resp = requests.get(
             url,
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-            timeout=10,
+            timeout=8,
         )
         if resp.status_code != 200:
             return {"is_high_impact_active": False, "error": f"HTTP {resp.status_code}"}
@@ -254,6 +256,7 @@ def cek_konfluensi_mtf_dan_regime(ticker: str = "GC=F") -> dict:
             df_d1.columns = df_d1.columns.get_level_values(0)
 
         h1_close = df_h1["Close"]
+        last_close_val = round(float(h1_close.iloc[-1]), 2)
         h1_trend = "BULLISH" if h1_close.ewm(span=20).mean().iloc[-1] > h1_close.ewm(span=50).mean().iloc[-1] else "BEARISH"
 
         df_h4 = df_h1.resample("4h").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
@@ -281,6 +284,7 @@ def cek_konfluensi_mtf_dan_regime(ticker: str = "GC=F") -> dict:
 
         return {
             "ticker": ticker,
+            "last_close": last_close_val,
             "H1_trend": h1_trend,
             "H4_trend": h4_trend,
             "D1_trend": d1_trend,
@@ -477,7 +481,7 @@ def ambil_deribit_options_btc() -> dict:
                 "start_timestamp": int((datetime.now(timezone.utc) - timedelta(hours=6)).timestamp() * 1000),
                 "end_timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
             },
-            timeout=10,
+            timeout=8,
         ).json()
         dvol_data = dvol_resp.get("result", {}).get("data", [])
         dvol_terakhir = round(float(dvol_data[-1][4]), 2) if dvol_data else None
@@ -485,7 +489,7 @@ def ambil_deribit_options_btc() -> dict:
         books_resp = requests.get(
             "https://www.deribit.com/api/v2/public/get_book_summary_by_currency",
             params={"currency": "BTC", "kind": "option"},
-            timeout=12,
+            timeout=8,
         ).json()
         summaries = books_resp.get("result", [])
         call_oi = 0.0
@@ -515,9 +519,13 @@ def ambil_berita_financial_juice(limit: int = 5) -> list:
         "https://feeds.feedburner.com/financialjuice",
     ]
     headlines = []
+    headers = {"User-Agent": "Mozilla/5.0"}
     for url in urls_fj:
         try:
-            feed = feedparser.parse(url)
+            resp = requests.get(url, headers=headers, timeout=6)
+            if resp.status_code != 200:
+                continue
+            feed = feedparser.parse(resp.content)
             for entry in getattr(feed, "entries", [])[:limit]:
                 judul = getattr(entry, "title", "").strip()
                 if judul and judul not in headlines:
@@ -535,12 +543,13 @@ def ambil_data_institusi_dan_berita() -> dict:
     info["makro_fred_detail"] = ambil_makro_fred()
     info["orderflow_ccxt"] = ambil_orderflow_ccxt("BTC/USDT")
     info["deribit_options"] = ambil_deribit_options_btc()
+
     for judul in ambil_berita_financial_juice(limit=5):
         if judul not in info["berita"]:
             info["berita"].append(judul)
 
     try:
-        ex = ccxt.okx({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+        ex = ccxt.okx({"enableRateLimit": True, "timeout": 8000, "options": {"defaultType": "swap"}})
         ticker = ex.fetch_ticker("BTC/USDT:USDT")
         funding = ex.fetch_funding_rate("BTC/USDT:USDT")
         oi = ex.fetch_open_interest("BTC/USDT:USDT")
@@ -553,7 +562,7 @@ def ambil_data_institusi_dan_berita() -> dict:
         info["kripto_derivatif"]["error"] = str(e)
 
     try:
-        sc_data = requests.get("https://stablecoins.llama.fi/stablecoincharts/all", timeout=10).json()
+        sc_data = requests.get("https://stablecoins.llama.fi/stablecoincharts/all", timeout=8).json()
         if len(sc_data) >= 8:
             mcap_now = float(sc_data[-1]["totalCirculatingUSD"]["peggedUSD"])
             mcap_7d = float(sc_data[-8]["totalCirculatingUSD"]["peggedUSD"])
@@ -565,31 +574,36 @@ def ambil_data_institusi_dan_berita() -> dict:
     except Exception as e:
         info["stablecoin_flow"]["error"] = str(e)
 
-    try:
-        df_cot = cot.cot_year(year=datetime.now().year, cot_report_type="legacy_fut")
-        gold_row = df_cot[df_cot["Market and Exchange Names"].str.contains("GOLD - COMMODITY EXCHANGE", na=False)].iloc[0]
-        net_pos = int(gold_row["Noncommercial Positions-Long (All)"]) - int(
-            gold_row["Noncommercial Positions-Short (All)"]
-        )
-        info["cftc_cot"]["GOLD_Net_HedgeFund_Contracts"] = net_pos
-    except Exception as e:
-        info["cftc_cot"]["error"] = str(e)
+    hari_ini = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _COT_CACHE["tanggal"] == hari_ini and _COT_CACHE["nilai"] is not None:
+        info["cftc_cot"]["GOLD_Net_HedgeFund_Contracts"] = _COT_CACHE["nilai"]
+    else:
+        try:
+            df_cot = cot.cot_year(year=datetime.now().year, cot_report_type="legacy_fut")
+            gold_row = df_cot[df_cot["Market and Exchange Names"].str.contains("GOLD - COMMODITY EXCHANGE", na=False)].iloc[0]
+            net_pos = int(gold_row["Noncommercial Positions-Long (All)"]) - int(
+                gold_row["Noncommercial Positions-Short (All)"]
+            )
+            _COT_CACHE["tanggal"] = hari_ini
+            _COT_CACHE["nilai"] = net_pos
+            info["cftc_cot"]["GOLD_Net_HedgeFund_Contracts"] = net_pos
+        except Exception as e:
+            info["cftc_cot"]["error"] = str(e)
 
     for url in ["https://www.investing.com/rss/news_25.rss", "https://www.investing.com/rss/news_301.rss"]:
         try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:4]:
-                info["berita"].append(entry.title)
+            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+            if resp.status_code == 200:
+                feed = feedparser.parse(resp.content)
+                for entry in feed.entries[:4]:
+                    info["berita"].append(entry.title)
         except Exception:
             pass
 
-    info["kalender_ff"] = ambil_kalender_ff(("USD",))
-    info["makro_fred_detail"] = ambil_makro_fred()
-    info["orderflow_ccxt"] = ambil_orderflow_ccxt("BTC/USDT")
     return info
 
 
-def ambil_intelijen_blockworks():
+def ambil_intelijen_blockworks() -> dict:
     api_key = os.getenv("BLOCKWORKS_API_KEY", "").strip()
     if not api_key:
         return {"status": "nonaktif_tanpa_key", "catatan": "BLOCKWORKS_API_KEY kosong"}
@@ -605,7 +619,7 @@ def ambil_intelijen_blockworks():
 
     for url, params in kandidat_url:
         try:
-            resp = requests.get(url, headers=headers, params=params, timeout=15)
+            resp = requests.get(url, headers=headers, params=params, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
                 return {
@@ -626,7 +640,8 @@ def ambil_intelijen_blockworks():
         "status": "http_401",
         "catatan": "Periksa masa aktif/izin endpoint API key di Blockworks Intel",
     }
-    
+
+
 def ambil_data_coinmarketcap() -> dict:
     if not CMC_API_KEY:
         return {"status": "opsional_belum_diisi"}
@@ -639,7 +654,7 @@ def ambil_data_coinmarketcap() -> dict:
         g_resp = requests.get(
             "https://pro-api.coinmarketcap.com/v1/global-metrics/quotes/latest",
             headers=headers,
-            timeout=10,
+            timeout=8,
         ).json()
         g_data = g_resp.get("data", {})
         usd_quote = g_data.get("quote", {}).get("USD", {})
@@ -655,7 +670,7 @@ def ambil_data_coinmarketcap() -> dict:
             "https://pro-api.coinmarketcap.com/v2/cryptocurrency/quotes/latest",
             headers=headers,
             params={"symbol": "BTC", "convert": "USD"},
-            timeout=10,
+            timeout=8,
         ).json()
         btc_list = q_resp.get("data", {}).get("BTC", [])
         if isinstance(btc_list, list) and btc_list:
@@ -678,7 +693,7 @@ def ambil_data_twelvedata_intraday() -> dict:
             resp = requests.get(
                 "https://api.twelvedata.com/quote",
                 params={"symbol": sym, "apikey": TWELVEDATA_API_KEY},
-                timeout=10,
+                timeout=8,
             ).json()
             if "close" in resp:
                 hasil[label] = {
@@ -701,7 +716,7 @@ def cek_spread_mt5_cloud(symbol: str = "XAUUSD") -> float:
     try:
         headers = {"auth-token": METAAPI_TOKEN}
         url = f"https://mt-client-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/{METAAPI_ACCOUNT_ID}/symbols/{symbol}/current-price"
-        resp = requests.get(url, headers=headers, timeout=10).json()
+        resp = requests.get(url, headers=headers, timeout=8).json()
         bid = float(resp.get("bid", 0))
         ask = float(resp.get("ask", 0))
         if bid > 0 and ask > 0:
@@ -712,7 +727,7 @@ def cek_spread_mt5_cloud(symbol: str = "XAUUSD") -> float:
 
 
 # ==============================================================================
-# 7. LAPISAN 4: DEWAN JURI 4-AGEN GEMINI (JSON) & KONTROL TELEGRAM
+# 7. LAPISAN 4: DEWAN JURI 4-AGEN (MODE HIGH / ULTRA THINKING) & TELEGRAM
 # ==============================================================================
 def bersihkan_teks_telegram(teks: str) -> str:
     if not teks:
@@ -832,7 +847,7 @@ def panggil_groq_fallback(prompt: str, system_prompt: str = "", model: str = "ll
                 "temperature": 0.2,
                 "max_tokens": 2200,
             },
-            timeout=20,
+            timeout=25,
         )
         data = resp.json()
         konten = data.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -863,15 +878,26 @@ def analisa_dengan_retry(client, models: list, prompt: str, config=None, retries
 
 
 def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
-    data_makro = ambil_statistik_dan_makro()
-    data_institusi = ambil_data_institusi_dan_berita()
-    blockworks_intel = ambil_intelijen_blockworks()
-    cmc_data = ambil_data_coinmarketcap()
-    twelvedata_quote = ambil_data_twelvedata_intraday()
-    mtf_gold = cek_konfluensi_mtf_dan_regime("GC=F")
-    mtf_btc = cek_konfluensi_mtf_dan_regime("BTC-USD")
-    kalender_news = cek_kalender_berita_tier1_otomatis()
-    spread_aktif = cek_spread_mt5_cloud("XAUUSD")
+    with ThreadPoolExecutor(max_workers=9) as pool:
+        f_makro = pool.submit(ambil_statistik_dan_makro)
+        f_inst = pool.submit(ambil_data_institusi_dan_berita)
+        f_bw = pool.submit(ambil_intelijen_blockworks)
+        f_cmc = pool.submit(ambil_data_coinmarketcap)
+        f_td = pool.submit(ambil_data_twelvedata_intraday)
+        f_mtf_g = pool.submit(cek_konfluensi_mtf_dan_regime, "GC=F")
+        f_mtf_b = pool.submit(cek_konfluensi_mtf_dan_regime, "BTC-USD")
+        f_kal = pool.submit(cek_kalender_berita_tier1_otomatis)
+        f_spr = pool.submit(cek_spread_mt5_cloud, "XAUUSD")
+
+        data_makro = f_makro.result()
+        data_institusi = f_inst.result()
+        blockworks_intel = f_bw.result()
+        cmc_data = f_cmc.result()
+        twelvedata_quote = f_td.result()
+        mtf_gold = f_mtf_g.result()
+        mtf_btc = f_mtf_b.result()
+        kalender_news = f_kal.result()
+        spread_aktif = f_spr.result()
 
     xau_live_td = (
         twelvedata_quote.get("XAUUSD", {}).get("close")
@@ -879,6 +905,8 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
         else None
     )
     xau_live_main = xau_live_td
+    if not xau_live_main:
+        xau_live_main = mtf_gold.get("last_close") if isinstance(mtf_gold, dict) else None
     if not xau_live_main:
         try:
             fast_px = yf.Ticker("GC=F").fast_info.get("lastPrice")
@@ -893,18 +921,18 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
         else None
     )
     if not btc_live or btc_live == "TIDAK_TERSEDIA":
-        try:
-            btc_live = round(float(ccxt.okx({"enableRateLimit": True}).fetch_ticker("BTC/USDT:USDT")["last"]), 2)
-        except Exception:
-            try:
-                btc_live = round(float(yf.Ticker("BTC-USD").fast_info["lastPrice"]), 2)
-            except Exception:
-                cmc_btc_px = (
-                    cmc_data.get("BTC_USD", {}).get("price")
-                    if isinstance(cmc_data, dict)
-                    else None
-                )
-                btc_live = round(float(cmc_btc_px), 2) if cmc_btc_px else None
+        btc_live = (
+            data_institusi.get("kripto_derivatif", {}).get("BTC_last")
+            if isinstance(data_institusi, dict)
+            else None
+        )
+    if not btc_live:
+        cmc_btc_px = (
+            cmc_data.get("BTC_USD", {}).get("price")
+            if isinstance(cmc_data, dict)
+            else None
+        )
+        btc_live = round(float(cmc_btc_px), 2) if cmc_btc_px else None
 
     live_prices_ctx = {
         "XAUUSD_live": xau_live_main or "TIDAK_TERSEDIA",
@@ -926,7 +954,7 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
 
     macro_snap = json.dumps(data_makro.get("harga_terakhir", {}))
 
-    if not GEMINI_API_KEY:
+    if not GEMINI_API_KEY and not GROQ_API_KEY:
         laporan = (
             f"[MODE DATA MENTAH - {pemicu}]\n"
             f"Live Prices: {live_prices_ctx}\n"
@@ -939,7 +967,7 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
         kirim_telegram(laporan, log_id=log_id)
         return laporan
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
     prompt = f"""
 Kamu adalah Dewan Juri 4-Agen Kuantitatif Institusional. Analisa data riil berikut dalam Bahasa Indonesia dengan format SINGKAT, BERSIH, dan MUDAH DIBACA di Telegram.
 Pemicu: {pemicu} | Sesi: {deteksi_sesi_trading()} | Spread XAUUSD: {spread_aktif} pips
@@ -983,6 +1011,7 @@ Setiap kali menjawab atau menganalisis:
     bias_summary = "WAIT"
     lolos_final = False
     hasil_teks = ""
+
     try:
         raw_json = ""
         anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -1002,19 +1031,42 @@ Setiap kali menjawab atau menganalisis:
                         raw_json = block.text.strip()
                         break
             except Exception as claude_err:
-                print("Fallback ke Gemini 4 Hydrogen karena Claude error:", claude_err)
+                print("Fallback ke Gemini tertinggi karena Claude error:", claude_err)
+
+        if not raw_json and client:
+            kandidat_gemini_tertinggi = [
+                (
+                    "models/gemini-4-hydrogen",
+                    types.GenerateContentConfig(
+                        system_instruction=SYSTEM_INSTRUCTION_QUANT,
+                        response_mime_type="application/json",
+                        thinking_config=types.ThinkingConfig(thinking_level="XHIGH"),
+                    ),
+                ),
+                (
+                    "gemini-2.5-pro",
+                    types.GenerateContentConfig(
+                        system_instruction=SYSTEM_INSTRUCTION_QUANT,
+                        response_mime_type="application/json",
+                        thinking_config=types.ThinkingConfig(thinking_budget=24576),
+                    ),
+                ),
+            ]
+            for nama_model, cfg_model in kandidat_gemini_tertinggi:
+                try:
+                    response = client.models.generate_content(
+                        model=nama_model,
+                        contents=prompt,
+                        config=cfg_model,
+                    )
+                    if getattr(response, "text", None) and response.text.strip():
+                        raw_json = response.text.strip()
+                        break
+                except Exception as gem_err:
+                    print(f"Model {nama_model} gagal ({gem_err}), coba model berikutnya...")
 
         if not raw_json:
-            response = client.models.generate_content(
-                model="models/gemini-4-hydrogen",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION_QUANT,
-                    response_mime_type="application/json",
-                    thinking_config=types.ThinkingConfig(thinking_level="XHIGH"),
-                ),
-            )
-            raw_json = response.text.strip()
+            raise RuntimeError("Respons model utama kosong, lanjut ke Groq fallback.")
 
         if "{" in raw_json and "}" in raw_json:
             raw_json = raw_json[raw_json.find("{") : raw_json.rfind("}") + 1]
@@ -1106,16 +1158,21 @@ Setiap kali menjawab atau menganalisis:
                 kirim_telegram(hasil_teks, log_id=None)
                 return hasil_teks
 
+        top_score = 0
+        bias_summary = "ERROR"
+        lolos_final = False
+        hasil_teks = f"Gagal memproses sidang AI: {str(e)[:200]}"
+
     log_id = simpan_log(
         "XAUUSD/BTC",
         bias_summary,
         top_score,
         spread_aktif,
         macro_snap,
-        "PENDING_REVIEW" if lolos_final else "AUTO_WAIT",
+        "AUTO_WAIT",
         hasil_teks[:400],
     )
-    kirim_telegram(hasil_teks, log_id=log_id if lolos_final else None)
+    kirim_telegram(hasil_teks, log_id=None)
     return hasil_teks
 
 
@@ -1197,13 +1254,13 @@ def loop_listener_telegram():
                         kirim_telegram(
                             "Quant Agent v2.3 (Institutional Multi-Asset 24/7) Aktif.\n"
                             "Perintah tersedia:\n"
-                            "/cek - Jalankan sidang 4 agen, Blockworks/TwelveData & MTF sekarang\n"
+                            "/cek - Jalankan sidang 4 agen (Mode High/Ultra), Blockworks/TwelveData & MTF\n"
                             "/backtest - Uji statistik backtesting.py & 1.000x Monte Carlo\n"
                             "/jurnal - Lihat jurnal audit SQLite & kuota sesi\n"
                             "/evaluasi - Lihat laporan evaluasi akurasi mingguan"
                         )
                     elif text in ["/cek", "/analisa"]:
-                        kirim_telegram("AgentLang lagi cek data & analisa market ter update, tunggu bentar...")
+                        kirim_telegram("AgentLang lagi cek data & analisa market ter update (mode High/Ultra), tunggu bentar...")
 
                         def _run_manual_analisa():
                             try:
