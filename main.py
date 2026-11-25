@@ -36,6 +36,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BLOCKWORKS_API_KEY = os.getenv("BLOCKWORKS_API_KEY", "")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 CMC_API_KEY = os.getenv("CMC_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 METAAPI_TOKEN = os.getenv("METAAPI_TOKEN", "")
 METAAPI_ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "")
 
@@ -465,6 +466,7 @@ def ambil_statistik_dan_makro() -> dict:
 
     return hasil
 
+
 def ambil_deribit_options_btc() -> dict:
     try:
         dvol_resp = requests.get(
@@ -525,6 +527,8 @@ def ambil_berita_financial_juice(limit: int = 5) -> list:
         except Exception:
             continue
     return headlines[:limit]
+
+
 def ambil_data_institusi_dan_berita() -> dict:
     info = {"kripto_derivatif": {}, "stablecoin_flow": {}, "cftc_cot": {}, "berita": []}
     info["kalender_ff"] = ambil_kalender_ff(("USD",))
@@ -534,7 +538,7 @@ def ambil_data_institusi_dan_berita() -> dict:
     for judul in ambil_berita_financial_juice(limit=5):
         if judul not in info["berita"]:
             info["berita"].append(judul)
-    # 1. Derivatif Kripto (Funding Rate + Open Interest)
+
     try:
         ex = ccxt.okx({"enableRateLimit": True, "options": {"defaultType": "swap"}})
         ticker = ex.fetch_ticker("BTC/USDT:USDT")
@@ -548,7 +552,6 @@ def ambil_data_institusi_dan_berita() -> dict:
     except Exception as e:
         info["kripto_derivatif"]["error"] = str(e)
 
-    # 2. DeFiLlama Stablecoin Supply 7-Day Flow
     try:
         sc_data = requests.get("https://stablecoins.llama.fi/stablecoincharts/all", timeout=10).json()
         if len(sc_data) >= 8:
@@ -562,7 +565,6 @@ def ambil_data_institusi_dan_berita() -> dict:
     except Exception as e:
         info["stablecoin_flow"]["error"] = str(e)
 
-    # 3. CFTC COT Report
     try:
         df_cot = cot.cot_year(year=datetime.now().year, cot_report_type="legacy_fut")
         gold_row = df_cot[df_cot["Market and Exchange Names"].str.contains("GOLD - COMMODITY EXCHANGE", na=False)].iloc[0]
@@ -573,7 +575,6 @@ def ambil_data_institusi_dan_berita() -> dict:
     except Exception as e:
         info["cftc_cot"]["error"] = str(e)
 
-    # 4. Headline Berita Makro & Kripto
     for url in ["https://www.investing.com/rss/news_25.rss", "https://www.investing.com/rss/news_301.rss"]:
         try:
             feed = feedparser.parse(url)
@@ -581,7 +582,7 @@ def ambil_data_institusi_dan_berita() -> dict:
                 info["berita"].append(entry.title)
         except Exception:
             pass
-    # 5. Kalender High-Impact FF, Makro FRED Detail & Orderflow CCXT
+
     info["kalender_ff"] = ambil_kalender_ff(("USD",))
     info["makro_fred_detail"] = ambil_makro_fred()
     info["orderflow_ccxt"] = ambil_orderflow_ccxt("BTC/USDT")
@@ -589,10 +590,6 @@ def ambil_data_institusi_dan_berita() -> dict:
 
 
 def ambil_intelijen_blockworks() -> dict:
-    """
-    Menarik data intelijen pasar & fundamental kripto dari Blockworks Intel API
-    (menggunakan kredit API gratis $100 dari app.blockworks.com/claim).
-    """
     if not BLOCKWORKS_API_KEY:
         return {"status": "opsional_belum_diisi"}
     try:
@@ -624,11 +621,9 @@ def ambil_intelijen_blockworks() -> dict:
         return {"status": f"http_{resp.status_code}", "detail": resp.text[:150]}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
+
+
 def ambil_data_coinmarketcap() -> dict:
-    """
-    Menarik data global market cap, dominansi BTC, dan harga spot BTC
-    dari CoinMarketCap API sebagai konfirmasi & fallback sentimen kripto.
-    """
     if not CMC_API_KEY:
         return {"status": "opsional_belum_diisi"}
     headers = {
@@ -669,11 +664,8 @@ def ambil_data_coinmarketcap() -> dict:
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
+
 def ambil_data_twelvedata_intraday() -> dict:
-    """
-    Menarik kuotasi intraday real-time XAU/USD dan indeks AS (QQQ) dari Twelve Data API
-    untuk memperkuat konfirmasi multi-aset ala meja institusional.
-    """
     if not TWELVEDATA_API_KEY:
         return {"status": "opsional_belum_diisi"}
     hasil = {"status": "aktif"}
@@ -719,9 +711,6 @@ def cek_spread_mt5_cloud(symbol: str = "XAUUSD") -> float:
 # 7. LAPISAN 4: DEWAN JURI 4-AGEN GEMINI (JSON) & KONTROL TELEGRAM
 # ==============================================================================
 def bersihkan_teks_telegram(teks: str) -> str:
-    """
-    Mengubah respons yang memuat objek JSON mentah menjadi teks Telegram yang bersih dan mudah dibaca.
-    """
     if not teks:
         return ""
 
@@ -816,7 +805,6 @@ def kirim_telegram(pesan: str, log_id: int = None):
         if reply_markup and idx == len(chunks) - 1:
             payload["reply_markup"] = json.dumps(reply_markup)
         requests.post(url, json=payload, timeout=15)
-        GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 
 def panggil_groq_fallback(prompt: str, system_prompt: str = "", model: str = "llama-3.3-70b-versatile") -> str:
@@ -847,6 +835,8 @@ def panggil_groq_fallback(prompt: str, system_prompt: str = "", model: str = "ll
         return konten.strip()
     except Exception:
         return ""
+
+
 def analisa_dengan_retry(client, models: list, prompt: str, config=None, retries: int = 2) -> str:
     if not client:
         return "GEMINI_API_KEY belum diisi."
@@ -866,6 +856,7 @@ def analisa_dengan_retry(client, models: list, prompt: str, config=None, retries
                 last_err = e
                 time.sleep(2 * (attempt + 1))
     return f"Maaf, semua percobaan model gagal ({str(last_err)[:120]})."
+
 
 def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
     data_makro = ambil_statistik_dan_makro()
@@ -910,6 +901,7 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
                     else None
                 )
                 btc_live = round(float(cmc_btc_px), 2) if cmc_btc_px else None
+
     live_prices_ctx = {
         "XAUUSD_live": xau_live_main or "TIDAK_TERSEDIA",
         "XAUUSD_sumber": "TwelveData" if xau_live_td else ("yfinance_GC=F" if xau_live_main else "TIDAK_TERSEDIA"),
@@ -1048,6 +1040,46 @@ Setiap kali menjawab atau menganalisis:
         kirim_telegram(hasil_teks, log_id=log_id if lolos_final else None)
         return hasil_teks
     except Exception as e:
+        groq_raw = panggil_groq_fallback(
+            prompt,
+            system_prompt=SYSTEM_INSTRUCTION_QUANT,
+        )
+        if groq_raw:
+            try:
+                bersih = groq_raw.strip()
+                if "{" in bersih and "}" in bersih:
+                    bersih = bersih[bersih.find("{") : bersih.rfind("}") + 1]
+                verdict = json.loads(bersih)
+                xau_score = int(verdict.get("xau_score", 0))
+                btc_score = int(verdict.get("btc_score", 0))
+                top_score = max(xau_score, btc_score)
+                bias_summary = f"XAU:{verdict.get('xau_bias')}({xau_score}) | BTC:{verdict.get('btc_bias')}({btc_score})"
+                lolos_final = risk_status.get("approved") and (top_score >= 75)
+                hasil_teks = (
+                    f"QUANT AGENT v2.3 — SIDANG 4 AGEN [GROQ FALLBACK] ({pemicu})\n"
+                    f"Sesi: {deteksi_sesi_trading()} | Spread XAU: {spread_aktif} pips\n"
+                    f"• XAUUSD ({live_prices_ctx['XAUUSD_live']}): {verdict.get('xau_bias')} (Skor: {xau_score}/100) | Regime: {mtf_gold.get('market_regime')}\n"
+                    f"• BTCUSDT ({live_prices_ctx['BTCUSD_live']}): {verdict.get('btc_bias')} (Skor: {btc_score}/100) | Regime: {mtf_btc.get('market_regime')}\n\n"
+                    f"1. Macro Analyst:\n{verdict.get('macro_view')}\n\n"
+                    f"2. Bull Case:\n{verdict.get('bull_case')}\n\n"
+                    f"3. Bear/Skeptic Veto:\n{verdict.get('bear_skeptic_veto')}\n\n"
+                    f"4. Risk Judge:\n{verdict.get('final_verdict')}\n\n"
+                    f"Status Guardrail: {'LOLOS (>=75)' if lolos_final else 'DITAHAN / WAIT'}"
+                )
+                log_id = simpan_log(
+                    "XAUUSD/BTC",
+                    bias_summary,
+                    top_score,
+                    spread_aktif,
+                    macro_snap,
+                    "PENDING_REVIEW" if lolos_final else "AUTO_WAIT",
+                    hasil_teks[:400],
+                )
+                kirim_telegram(hasil_teks, log_id=log_id if lolos_final else None)
+                return hasil_teks
+            except Exception:
+                pass
+
         top_score = 0
         bias_summary = "ERROR"
         lolos_final = False
@@ -1206,6 +1238,7 @@ def loop_listener_telegram():
         except Exception as e:
             print("Listener error:", e)
             time.sleep(5)
+
 
 # ==============================================================================
 # 9. ENDPOINT WEB (HEALTH CHECK 24/7 & WEBHOOK TRADINGVIEW)
