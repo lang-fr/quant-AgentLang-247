@@ -705,7 +705,7 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
         pip_value=1.0,
         layers=1,
         spread_pips=spread_aktif,
-        is_high_impact_news=institusi.get("kalender_ff", {}).get("blokir_entry_news", False),
+        is_high_impact_news=data_institusi.get("kalender_ff", {}).get("blokir_entry_news", False),
         z_score_h1=mtf_gold.get("Z_score_H1_latest", 0.0),
     )
 
@@ -890,8 +890,13 @@ def loop_listener_telegram():
                             "/evaluasi - Lihat laporan evaluasi akurasi mingguan"
                         )
                     elif text in ["/cek", "/analisa"]:
-                        kirim_telegram("Menjalankan sidang 4 agen, cek MTF H1/H4/D1, Blockworks & Twelve Data...")
-                        jalankan_analisa_lengkap(pemicu="Perintah Manual /cek dari HP")
+            kirim_telegram("Menjalankan sidang 4 agen, cek MTF H1/H4/D1, Blockworks & Twelve Data...")
+            def _run_manual_analisa():
+                try:
+                    jalankan_analisa_lengkap(pemicu="Perintah Manual /cek dari HP")
+                except Exception as exc:
+                    kirim_telegram(f"Error saat menjalankan /cek: {exc}")
+            threading.Thread(target=_run_manual_analisa, daemon=True).start()
                     elif text == "/backtest":
                         kirim_telegram("Menjalankan Backtest Out-of-Sample & 1.000x Monte Carlo...")
                         bt_gold = jalankan_backtest_dan_montecarlo("GC=F", "2y")
