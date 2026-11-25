@@ -21,6 +21,7 @@ jobs:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           BLOCKWORKS_API_KEY: ${{ secrets.BLOCKWORKS_API_KEY }}
+          CMC_API_KEY: ${{ secrets.CMC_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py
