@@ -46,7 +46,7 @@ MAX_ENTRIES_SESSION = int(os.getenv("MAX_ENTRIES_PER_SESSION", "3"))
 MAX_LAYERS_SETUP = int(os.getenv("MAX_LAYERS_PER_SETUP", "3"))
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "2.5"))
 MAX_SPREAD_PIPS = float(os.getenv("MAX_ALLOWED_SPREAD_PIPS", "3.0"))
-AUTO_SCAN_INTERVAL_SEC = int(os.getenv("AUTO_SCAN_INTERVAL_SEC", "14400"))  # Tiap 4 jam
+AUTO_SCAN_INTERVAL_SEC = int(os.getenv("AUTO_SCAN_INTERVAL_SEC", "14400"))
 
 app = Flask(__name__)
 DB_PATH = "quant_cloud_audit.db"
@@ -54,7 +54,55 @@ _COT_CACHE = {"tanggal": "", "nilai": None}
 
 
 # ==============================================================================
-# 2. LAPISAN 2: DATABASE SQLITE, PELACAK SESI & EVALUASI AKURASI MINGGUAN
+# 2. MODUL TRADING SKILLS (PLAYBOOK DOMAIN UNTUK PENALARAN TINGGI)
+# ==============================================================================
+TRADING_SKILLS = {
+    "SESSION_ICT_LIQUIDITY": """
+[SKILL: SESSION & ICT LIQUIDITY MODEL]
+- ASIA (00:00-07:00 UTC): Identifikasi pembentukan Asia High & Asia Low sebagai kolam likuiditas awal. Hindari mengejar breakout tipis di tengah sesi Asia kecuali ada katalis makro Asia/RBA/BOJ.
+- LONDON (07:00-13:00 UTC): Fokus pada Judas Swing / liquidity sweep terhadap Asia High atau Asia Low, diikuti displacement dan Fair Value Gap (FVG) atau Order Block pada M5-M15 yang searah bias H1-H4.
+- NEW_YORK (13:00-21:00 UTC): Evaluasi kelanjutan tren London atau NY Reversal setelah rilis data makro AS (13:30/14:00 UTC). Waspadai manipulasi awal pembukaan sesi NY sebelum ekspansi utama.
+""",
+    "INTRADAY_EXECUTION": """
+[SKILL: INTRADAY & SCALP PRECISION (M1-H4)]
+- Timeframe utama: H4 & H1 sebagai kompas arah, M15 sebagai struktur setup, M5 & M1 sebagai pemicu entry presisi.
+- Wajib cek spread aktual dan ATR H1. Jika spread melampaui batas wajar atau menjelang rilis berita Tier-1 USD (±45 menit), tahan entry.
+- Wajib tetapkan level invalidasi (SL) di balik struktur swing terdekat dengan minimal Risk-to-Reward 1:2.
+""",
+    "SWING_MULTI_DAY": """
+[SKILL: SWING TRADING (H4-W1, BEBERAPA HARI - MINGGU)]
+- Timeframe utama: W1 & D1 sebagai struktur besar, H4 sebagai area akumulasi/distribusi entry. Fluktuasi M1/M5 diabaikan untuk keputusan arah.
+- Gabungkan volatilitas GARCH (perkiraan rentang gerak harian), positioning CFTC COT (hedge fund net), serta untuk kripto wajib audit Funding Rate, Open Interest, dan Deribit DVOL / Put-Call Ratio.
+- Antisipasi potensi sweep mingguan (Previous Weekly High/Low) sebelum masuk posisi swing.
+""",
+    "MACRO_POSITION_HOLD": """
+[SKILL: MACRO POSITION & LONG-TERM HOLD (BULANAN - TAHUNAN)]
+- Timeframe utama: MN1 (Bulanan), W1 (Mingguan), dan D1 (Harian). Noise M1, M5, M15, dan H1 TIDAK boleh membatalkan tesis investasi jangka panjang.
+- Pilar fundamental wajib: arah US 10Y Real Yield (DFII10), tren Fed Net Liquidity (WALCL - TGA - RRP), siklus suku bunga Fed Funds, indeks DXY, serta ekspansi/kontraksi kapitalisasi Stablecoin 7 hari & global market cap.
+- Gunakan pendekatan akumulasi bertahap (DCA / scaling pada zona diskon bulanan/mingguan) dengan pengukuran risiko ekor CVaR 95% dan invalidasi struktural di level penutupan W1/MN1.
+""",
+}
+
+
+def pilih_skills_konteks(mode_fokus: str = "ALL", sesi_target: str = "") -> str:
+    mode = (mode_fokus or "ALL").upper()
+    sesi = (sesi_target or deteksi_sesi_trading()).upper()
+    terpilih = []
+
+    if mode in ("ALL", "SESSION", "INTRADAY") or sesi in ("ASIA", "LONDON", "NEW_YORK"):
+        terpilih.append(TRADING_SKILLS["SESSION_ICT_LIQUIDITY"])
+    if mode in ("ALL", "INTRADAY"):
+        terpilih.append(TRADING_SKILLS["INTRADAY_EXECUTION"])
+    if mode in ("ALL", "SWING"):
+        terpilih.append(TRADING_SKILLS["SWING_MULTI_DAY"])
+    if mode in ("ALL", "HOLD", "POSITION"):
+        terpilih.append(TRADING_SKILLS["MACRO_POSITION_HOLD"])
+
+    return "\n".join(terpilih).strip()
+
+
+# ==============================================================================
+# 3. LAPISAN 2: DATABASE SQLITE, PELACAK SESI & EVALUASI AKURASI MINGGUAN
 # ==============================================================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -202,13 +250,9 @@ def ambil_ringkasan_jurnal_dan_evaluasi_mingguan() -> str:
 
 
 # ==============================================================================
-# 3. MODUL KONFIRMASI TAMBAHAN: KALENDER TIER-1 OTOMATIS & MTF FULL (M1-MN1)
+# 4. MODUL KALENDER TIER-1 & MTF LENGKAP (M1-MN1 + SKOR PER HORIZON)
 # ==============================================================================
 def cek_kalender_berita_tier1_otomatis() -> dict:
-    """
-    Mengecek feed kalender ekonomi mingguan untuk mendeteksi berita High-Impact USD
-    dalam jendela ±45 menit dari waktu sekarang (rem darurat otomatis).
-    """
     try:
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
         resp = requests.get(
@@ -261,17 +305,46 @@ def _hitung_rsi(seri_close: pd.Series, period: int = 14) -> float:
     return round(float(val), 1) if pd.notna(val) else 50.0
 
 
+def _hitung_rentang_sesi_hari_ini(df_h1: pd.DataFrame) -> dict:
+    try:
+        if df_h1.empty:
+            return {}
+        idx_utc = df_h1.index.tz_convert("UTC") if df_h1.index.tz is not None else df_h1.index.tz_localize("UTC")
+        df_utc = df_h1.copy()
+        df_utc.index = idx_utc
+        hari_ini = df_utc.index[-1].date()
+        hari_df = df_utc[df_utc.index.date == hari_ini]
+        if hari_df.empty:
+            return {}
+
+        sesi_ranges = {}
+        for nama, (jam_mulai, jam_selesai) in [
+            ("ASIA", (0, 7)),
+            ("LONDON", (7, 13)),
+            ("NEW_YORK", (13, 21)),
+        ]:
+            sub = hari_df[(hari_df.index.hour >= jam_mulai) & (hari_df.index.hour < jam_selesai)]
+            if not sub.empty:
+                sesi_ranges[nama] = {
+                    "high": round(float(sub["High"].max()), 2),
+                    "low": round(float(sub["Low"].min()), 2),
+                }
+        return sesi_ranges
+    except Exception:
+        return {}
+
+
 def cek_konfluensi_mtf_dan_regime(ticker: str = "GC=F") -> dict:
     """
-    Mengecek konfluensi tren EMA lintas timeframe M1, M5, M15, H1, H4, D1, W1, dan MN1 (bulanan),
-    serta ADX(14), RSI(14) H1, ATR% H1, dan Z-Score H1 untuk menyaring setup high-probability.
+    Menghitung struktur EMA lintas timeframe M1, M5, M15, H1, H4, D1, W1, MN1,
+    rentang high/low per sesi (Asia/London/NY), serta skor terpisah untuk Intraday, Swing, dan Hold.
     """
     try:
         df_m1 = yf.download(ticker, period="2d", interval="1m", progress=False)
         df_m5 = yf.download(ticker, period="5d", interval="5m", progress=False)
         df_m15 = yf.download(ticker, period="5d", interval="15m", progress=False)
         df_h1 = yf.download(ticker, period="30d", interval="1h", progress=False)
-        df_d1 = yf.download(ticker, period="5y", interval="1d", progress=False)
+        df_d1 = yf.download(ticker, period="10y", interval="1d", progress=False)
         if df_h1.empty or df_d1.empty:
             return {"error": f"Data MTF {ticker} tidak tersedia."}
 
@@ -314,25 +387,29 @@ def cek_konfluensi_mtf_dan_regime(ticker: str = "GC=F") -> dict:
         ).max(axis=1)
         atr_h1_pct = round(float((tr_h1.rolling(14).mean().iloc[-1] / h1_close.iloc[-1]) * 100), 3)
         rsi_h1 = _hitung_rsi(h1_close, 14)
+        rsi_d1 = _hitung_rsi(df_d1["Close"], 14)
 
         h1_ret = np.log(h1_close / h1_close.shift(1)).dropna()
         z_score_h1 = round(float((h1_ret.iloc[-1] - h1_ret.mean()) / h1_ret.std()), 2)
 
-        core_aligned = (h1_trend == h4_trend == d1_trend) and (h1_trend in ("BULLISH", "BEARISH"))
-        macro_aligned = core_aligned and (w1_trend == d1_trend) and (mn1_trend == d1_trend)
-        micro_aligned = (m1_trend == m5_trend == m15_trend) and (m15_trend in ("BULLISH", "BEARISH"))
         regime = "TRENDING" if adx_val >= 22 else ("TRANSITION" if adx_val >= 18 else "CHOPPY_SIDEWAYS")
 
-        arah_dominan = h4_trend if h4_trend in ("BULLISH", "BEARISH") else d1_trend
-        daftar_tf = [m1_trend, m5_trend, m15_trend, h1_trend, h4_trend, d1_trend, w1_trend, mn1_trend]
-        tf_cocok = sum(1 for arah in daftar_tf if arah == arah_dominan)
-        skor_struktur = round((tf_cocok / len(daftar_tf)) * 70)  # maks 70 dari 8 timeframe (M1-MN1)
-        skor_adx = 15 if adx_val >= 25 else (8 if adx_val >= 20 else 0)
-        skor_momentum = 15 if (
-            (arah_dominan == "BULLISH" and 45 <= rsi_h1 <= 72)
-            or (arah_dominan == "BEARISH" and 28 <= rsi_h1 <= 55)
-        ) else 5
-        confluence_score = min(100, skor_struktur + skor_adx + skor_momentum)
+        def _skor_grup(tfs: list, arah_ref: str) -> int:
+            if arah_ref not in ("BULLISH", "BEARISH"):
+                return 35
+            cocok = sum(1 for x in tfs if x == arah_ref)
+            return round((cocok / len(tfs)) * 100)
+
+        arah_intraday = h1_trend if h1_trend in ("BULLISH", "BEARISH") else m15_trend
+        skor_intraday = _skor_grup([m1_trend, m5_trend, m15_trend, h1_trend, h4_trend], arah_intraday)
+
+        arah_swing = h4_trend if h4_trend in ("BULLISH", "BEARISH") else d1_trend
+        skor_swing = _skor_grup([h1_trend, h4_trend, d1_trend, w1_trend], arah_swing)
+
+        arah_hold = d1_trend if d1_trend in ("BULLISH", "BEARISH") else w1_trend
+        skor_hold = _skor_grup([d1_trend, w1_trend, mn1_trend], arah_hold)
+
+        confluence_score = round((skor_intraday * 0.35) + (skor_swing * 0.35) + (skor_hold * 0.30))
 
         return {
             "ticker": ticker,
@@ -345,11 +422,16 @@ def cek_konfluensi_mtf_dan_regime(ticker: str = "GC=F") -> dict:
             "D1_trend": d1_trend,
             "W1_trend": w1_trend,
             "MN1_trend": mn1_trend,
-            "micro_M1_M15_aligned": micro_aligned,
-            "core_H1_D1_aligned": core_aligned,
-            "macro_D1_MN1_aligned": macro_aligned,
+            "session_ranges_utc": _hitung_rentang_sesi_hari_ini(df_h1),
+            "intraday_bias": arah_intraday,
+            "intraday_score": skor_intraday,
+            "swing_bias": arah_swing,
+            "swing_score": skor_swing,
+            "hold_position_bias": arah_hold,
+            "hold_position_score": skor_hold,
             "ADX_14": adx_val,
             "RSI_H1_14": rsi_h1,
+            "RSI_D1_14": rsi_d1,
             "ATR_H1_pct": atr_h1_pct,
             "market_regime": regime,
             "Z_score_H1_latest": z_score_h1,
@@ -360,7 +442,7 @@ def cek_konfluensi_mtf_dan_regime(ticker: str = "GC=F") -> dict:
 
 
 # ==============================================================================
-# 4. LAPISAN 3: HARDCODED RISK ENGINE & CIRCUIT BREAKER
+# 5. LAPISAN 3: HARDCODED RISK ENGINE & CIRCUIT BREAKER
 # ==============================================================================
 def validasi_hardcoded_risk(
     balance: float,
@@ -403,7 +485,7 @@ def validasi_hardcoded_risk(
 
 
 # ==============================================================================
-# 5. LAPISAN 1: MESIN BACKTESTING (backtesting.py) & SIMULASI MONTE CARLO
+# 6. LAPISAN 1: MESIN BACKTESTING (backtesting.py) & SIMULASI MONTE CARLO
 # ==============================================================================
 class TrendQuantStrategy(Strategy):
     fast_period = 20
@@ -469,7 +551,7 @@ def jalankan_backtest_dan_montecarlo(ticker: str = "GC=F", period: str = "2y") -
 
 
 # ==============================================================================
-# 6. MODUL PENARIK DATA KUANTITATIF, MAKRO, INSTITUSI & INTELIJEN MULTI-ASET
+# 7. MODUL PENARIK DATA KUANTITATIF, MAKRO, INSTITUSI & INTELIJEN MULTI-ASET
 # ==============================================================================
 def ambil_statistik_dan_makro() -> dict:
     tickers = {
@@ -789,7 +871,7 @@ def cek_spread_mt5_cloud(symbol: str = "XAUUSD") -> float:
 
 
 # ==============================================================================
-# 7. LAPISAN 4: DEWAN JURI 4-AGEN (HIGH PROBABILITY MTF M1-MN1) & TELEGRAM
+# 8. LAPISAN 4: GEMINI 4 HYDROGEN (THINKING HIGH) & DEWAN JURI MULTI-HORIZON
 # ==============================================================================
 def bersihkan_teks_telegram(teks: str) -> str:
     if not teks:
@@ -804,46 +886,14 @@ def bersihkan_teks_telegram(teks: str) -> str:
     try:
         data = json.loads(teks_bersih)
     except Exception:
-        return teks
+        return teks.replace("**", "")
 
     if not isinstance(data, dict):
-        return teks
+        return teks.replace("**", "")
 
     baris = []
     if data.get("greeting"):
         baris.append(str(data["greeting"]).strip())
-
-    sesi = data.get("session_status")
-    if isinstance(sesi, dict):
-        ringkas_sesi = []
-        if "total_scans" in sesi:
-            ringkas_sesi.append(f"Scan: {sesi['total_scans']}")
-        if "approved_signals" in sesi:
-            ringkas_sesi.append(f"Disetujui: {sesi['approved_signals']}")
-        if "rejected_signals" in sesi:
-            ringkas_sesi.append(f"Ditolak: {sesi['rejected_signals']}")
-        if "average_confirmation_score" in sesi:
-            ringkas_sesi.append(f"Rata-rata Skor: {sesi['average_confirmation_score']}")
-        if "asia_quota_remaining" in sesi:
-            ringkas_sesi.append(f"Sisa Kuota Asia: {sesi['asia_quota_remaining']}")
-        if ringkas_sesi:
-            baris.append(" | ".join(ringkas_sesi))
-
-        logs = sesi.get("last_logs")
-        if isinstance(logs, list) and logs:
-            baris.append("\nLog Terakhir:")
-            for item in logs[-3:]:
-                if isinstance(item, dict):
-                    reg = item.get("region", "-")
-                    pair = item.get("pair", "-")
-                    xau_st = item.get("XAU_status", "-")
-                    xau_sc = item.get("XAU_score", "-")
-                    btc_st = item.get("BTC_status", "-")
-                    btc_sc = item.get("BTC_score", "-")
-                    spr = item.get("spread", "-")
-                    baris.append(
-                        f"• [{reg}] {pair} | XAU: {xau_st} ({xau_sc}) | BTC: {btc_st} ({btc_sc}) | Spread: {spr}"
-                    )
 
     for key, label in [
         ("observations", "\nCatatan Utama:"),
@@ -888,6 +938,42 @@ def kirim_telegram(pesan: str, log_id: int = None):
         requests.post(url, json=payload, timeout=15)
 
 
+def panggil_gemini_hydrogen_high(client, prompt: str, use_google_search: bool = True) -> str:
+    """
+    Memanggil models/gemini-4-hydrogen dengan thinking_level='high' dan Google Search grounding
+    sesuai API interactions pada Google AI Studio.
+    """
+    if not client:
+        return ""
+    try:
+        tools_cfg = [{"type": "google_search"}] if use_google_search else []
+        interaction = client.interactions.create(
+            model="models/gemini-4-hydrogen",
+            input=prompt,
+            tools=tools_cfg,
+            generation_config={
+                "max_output_tokens": 65536,
+                "thinking_level": "high",
+            },
+        )
+        teks_langsung = getattr(interaction, "text", None)
+        if teks_langsung and str(teks_langsung).strip():
+            return str(teks_langsung).strip()
+
+        outputs = getattr(interaction, "outputs", None) or []
+        potongan = []
+        for out in outputs:
+            txt = getattr(out, "text", None)
+            if txt and str(txt).strip():
+                potongan.append(str(txt).strip())
+            elif isinstance(out, dict) and out.get("text"):
+                potongan.append(str(out["text"]).strip())
+        return "\n".join(potongan).strip()
+    except Exception as e:
+        print(f"Gemini 4 Hydrogen gagal ({str(e)[:150]}), lanjut ke fallback...")
+        return ""
+
+
 def panggil_groq_fallback(prompt: str, system_prompt: str = "", model: str = "llama-3.3-70b-versatile") -> str:
     if not GROQ_API_KEY:
         return ""
@@ -907,7 +993,7 @@ def panggil_groq_fallback(prompt: str, system_prompt: str = "", model: str = "ll
                 "model": model,
                 "messages": messages,
                 "temperature": 0.2,
-                "max_tokens": 2200,
+                "max_tokens": 2400,
             },
             timeout=25,
         )
@@ -944,12 +1030,18 @@ def _ringkas_mtf(mtf: dict) -> str:
     return (
         f"M1:{mtf.get('M1_trend')} | M5:{mtf.get('M5_trend')} | M15:{mtf.get('M15_trend')} | "
         f"H1:{mtf.get('H1_trend')} | H4:{mtf.get('H4_trend')} | D1:{mtf.get('D1_trend')} | "
-        f"W1:{mtf.get('W1_trend')} | MN1:{mtf.get('MN1_trend')} | ADX:{mtf.get('ADX_14')} | "
-        f"RSI:{mtf.get('RSI_H1_14')} | Conf:{mtf.get('confluence_score')}/100"
+        f"W1:{mtf.get('W1_trend')} | MN1:{mtf.get('MN1_trend')}\n"
+        f"  Skor Horizon -> Intraday:{mtf.get('intraday_score')}/100 ({mtf.get('intraday_bias')}) | "
+        f"Swing:{mtf.get('swing_score')}/100 ({mtf.get('swing_bias')}) | "
+        f"Hold:{mtf.get('hold_position_score')}/100 ({mtf.get('hold_position_bias')})"
     )
 
 
-def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
+def jalankan_analisa_lengkap(
+    pemicu: str = "Terjadwal 24/7",
+    mode_fokus: str = "ALL",
+    sesi_target: str = "",
+) -> str:
     with ThreadPoolExecutor(max_workers=9) as pool:
         f_makro = pool.submit(ambil_statistik_dan_makro)
         f_inst = pool.submit(ambil_data_institusi_dan_berita)
@@ -976,9 +1068,7 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
         if isinstance(twelvedata_quote, dict) and isinstance(twelvedata_quote.get("XAUUSD"), dict)
         else None
     )
-    xau_live_main = xau_live_td
-    if not xau_live_main:
-        xau_live_main = mtf_gold.get("last_close") if isinstance(mtf_gold, dict) else None
+    xau_live_main = xau_live_td or (mtf_gold.get("last_close") if isinstance(mtf_gold, dict) else None)
     if not xau_live_main:
         try:
             fast_px = yf.Ticker("GC=F").fast_info.get("lastPrice")
@@ -987,23 +1077,11 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
         except Exception:
             xau_live_main = None
 
-    btc_live = (
-        mtf_btc.get("last_close") or mtf_btc.get("close_terakhir")
-        if isinstance(mtf_btc, dict)
-        else None
-    )
-    if not btc_live or btc_live == "TIDAK_TERSEDIA":
-        btc_live = (
-            data_institusi.get("kripto_derivatif", {}).get("BTC_last")
-            if isinstance(data_institusi, dict)
-            else None
-        )
+    btc_live = mtf_btc.get("last_close") if isinstance(mtf_btc, dict) else None
     if not btc_live:
-        cmc_btc_px = (
-            cmc_data.get("BTC_USD", {}).get("price")
-            if isinstance(cmc_data, dict)
-            else None
-        )
+        btc_live = data_institusi.get("kripto_derivatif", {}).get("BTC_last")
+    if not btc_live:
+        cmc_btc_px = cmc_data.get("BTC_USD", {}).get("price") if isinstance(cmc_data, dict) else None
         btc_live = round(float(cmc_btc_px), 2) if cmc_btc_px else None
 
     live_prices_ctx = {
@@ -1024,6 +1102,8 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
         z_score_h1=mtf_gold.get("Z_score_H1_latest", 0.0),
     )
 
+    sesi_aktif = sesi_target.upper() if sesi_target else deteksi_sesi_trading()
+    skills_aktif = pilih_skills_konteks(mode_fokus=mode_fokus, sesi_target=sesi_aktif)
     macro_snap = json.dumps(data_makro.get("harga_terakhir", {}))
 
     if not GEMINI_API_KEY and not GROQ_API_KEY:
@@ -1032,227 +1112,185 @@ def jalankan_analisa_lengkap(pemicu: str = "Terjadwal 24/7") -> str:
             f"Live Prices: {live_prices_ctx}\n"
             f"Risk: {risk_status}\n"
             f"MTF Gold: {mtf_gold}\n"
-            f"Blockworks: {blockworks_intel}\n"
-            f"TwelveData: {twelvedata_quote}"
+            f"MTF BTC: {mtf_btc}"
         )
         log_id = simpan_log("XAUUSD/BTC", "WAIT", 0, spread_aktif, macro_snap, "NO_API_KEY", laporan[:400])
         kirim_telegram(laporan, log_id=log_id)
         return laporan
 
     client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+    SYSTEM_INSTRUCTION_QUANT = f"""Kamu adalah Dewan Juri 4-Agen Kuantitatif Institusional dengan penalaran tinggi.
+Gunakan playbook skill berikut dalam mengevaluasi setup:
+{skills_aktif}
+
+Prinsip wajib:
+1. Pisahkan dengan tegas evaluasi per horizon waktu:
+   - Sesi Aktif / Target ({sesi_aktif}: ASIA / LONDON / NEW_YORK)
+   - Intraday (M1, M5, M15, H1, H4)
+   - Swing (H4, D1, W1)
+   - Hold Position Berbulan-bulan sampai Bertahun-tahun (D1, W1, MN1 + Makro Real Yield, Net Liquidity, DXY, COT, Stablecoin)
+2. Jangan membatalkan tesis Hold Bulanan/Tahunan hanya karena M1/M5 berlawanan, dan sebaliknya jangan memaksakan entry Intraday hanya karena MN1 bullish jika M5-H1 masih bearish/choppy.
+3. DILARANG mengarang level harga atau berita yang tidak ada di data atau hasil pencarian.
+4. JANGAN pakai tanda bintang (* atau **) dalam teks."""
+
     prompt = f"""
-Kamu adalah Dewan Juri 4-Agen Kuantitatif Institusional. Analisa data riil berikut dalam Bahasa Indonesia dengan format SINGKAT, BERSIH, dan MUDAH DIBACA di Telegram.
-Pemicu: {pemicu} | Sesi: {deteksi_sesi_trading()} | Spread XAUUSD: {spread_aktif} pips
+Analisa data pasar berikut untuk XAUUSD dan BTCUSDT dalam Bahasa Indonesia yang singkat, padat, dan tajam untuk Telegram.
+Pemicu: {pemicu} | Mode Fokus: {mode_fokus} | Sesi Fokus: {sesi_aktif} | Spread XAUUSD: {spread_aktif} pips
 
-ATURAN HIGH PROBABILITY & SOP WAJIB:
-- Harga rujukan utama HANYA memakai LIVE_PRICES: {live_prices_ctx}.
-- DILARANG mengarang angka atau level harga yang tidak ada di data.
-- Jika XAUUSD_live atau BTCUSD_live "TIDAK_TERSEDIA", wajib skor < 75 dan bias "WAIT_NO_TRADE".
-- Syarat setup HIGH PROBABILITY (skor >= 75): minimal H1, H4, dan D1 selaras arah, regime bukan CHOPPY_SIDEWAYS (ADX >= 20), selaras dengan struktur mingguan/bulanan (W1/MN1) atau punya konfluensi kuat, serta mikro (M1-M15) mendukung entry. Jika bentrok atau sideways, wajib beri skor < 75 dan bias "WAIT_NO_TRADE".
-- Setiap field teks (macro_view, bull_case, bear_skeptic_veto, final_verdict) WAJIB ditulis singkat (maksimal 2 poin pendek dipisah newline "\\n", tiap poin maksimal 15 kata, JANGAN menumpuk banyak angka dalam satu kalimat panjang).
+Harga Rujukan Utama: {live_prices_ctx}
 
-Data:
-1. Makro & Risiko Ekor: {data_makro}
-2. MTF Lengkap (M1, M5, M15, H1, H4, D1, W1, MN1) & ADX/RSI/Confluence:
+Data Kuantitatif & Multi-Timeframe (M1-MN1):
+1. Makro & Risiko Ekor (FRED, Korelasi, GARCH, CVaR): {data_makro}
+2. MTF Lengkap & Rentang Sesi (Asia/London/NY):
    - Gold: {mtf_gold}
    - BTC: {mtf_btc}
-   - CoinMarketCap (Global & BTC): {cmc_data}
-3. Institusi, Derivatif & Stablecoin: {data_institusi}
+   - CoinMarketCap: {cmc_data}
+3. Institusi, Derivatif, Deribit Options & Stablecoin: {data_institusi}
 4. Blockworks & TwelveData: {blockworks_intel} | {twelvedata_quote}
-5. Kalender & Risk Engine: {kalender_news} | {risk_status}
+5. Kalender Berita & Risk Guardrail: {kalender_news} | {risk_status}
 
-Kembalikan HANYA JSON valid:
+Kembalikan HANYA JSON valid dengan struktur persis berikut:
 {{
-  "xau_score": integer (0-100),
+  "xau_score": integer (0-100, sesuaikan dengan mode fokus {mode_fokus}),
   "xau_bias": "BULLISH" | "BEARISH" | "WAIT_NO_TRADE",
-  "btc_score": integer (0-100),
+  "btc_score": integer (0-100, sesuaikan dengan mode fokus {mode_fokus}),
   "btc_bias": "BULLISH" | "BEARISH" | "WAIT_NO_TRADE",
-  "macro_view": "- poin 1 singkat\\n- poin 2 singkat",
-  "bull_case": "- poin 1 singkat\\n- poin 2 singkat",
-  "bear_skeptic_veto": "- poin 1 singkat\\n- poin 2 singkat",
-  "final_verdict": "- keputusan, invalidasi & batas risiko singkat"
+  "session_plan": "- rencana sesi ASIA / LONDON / NEW_YORK singkat (maks 20 kata)",
+  "intraday_setup": "- bias, pemicu M1-H1 & invalidasi intraday singkat (maks 20 kata)",
+  "swing_setup": "- bias, area H4-W1 & invalidasi swing singkat (maks 20 kata)",
+  "hold_position_plan": "- tesis makro D1-MN1 & zona akumulasi hold bulanan-tahunan (maks 22 kata)",
+  "bear_skeptic_veto": "- jebakan likuiditas / blind spot utama (maks 18 kata)",
+  "final_verdict": "- keputusan eksekusi, ukuran risiko & syarat batal (maks 20 kata)"
 }}
 """
 
-    SYSTEM_INSTRUCTION_QUANT = """Kamu adalah mitra analisis kuantitatif, makro, dan evaluasi setup trading yang kritis, objektif, dan tidak asal mengiyakan.
-Setiap kali menjawab atau menganalisis:
-1. Audit Sumber & Kesegaran Data: Pisahkan secara jelas mana angka/fakta yang benar-benar berasal dari data/API/MCP/konteks yang diberikan vs mana yang belum tersedia, bersifat historis/lag, atau sedang di luar sesi aktif. Jangan mengarang harga live, berita terbaru, atau angka yang tidak ada.
-2. Uji Asumsi & Cari Blind Spot: Bongkar asumsi utama dari tesis/setup pengguna, lalu cari celah kegagalan terkuat (counter-thesis / skeptic view), jebakan likuiditas (sweep/false breakout), kondisi pasar sideways/choppy, atau benturan korelasi antar aset.
-3. Skenario, Invalidasi & Risiko: Selalu sertakan titik invalidasi yang jelas sebelum target, perhitungkan biaya transaksi/spread/slippage, dan hormati batas risiko (risiko per setup, batas layer, kuota sesi, serta rem darurat saat rilis berita berdampak tinggi).
-4. Berani Menahan Eksekusi: Jika data kurang lengkap, konfluensi antar timeframe (M1-MN1) lemah/bentrok, atau profil risiko tidak seimbang, nyatakan sikap WAIT / NO TRADE secara tegas.
-5. Format Jelas & Terukur: Jawab lugas, terstruktur, dan fokus pada pengujian logika serta probabilitas."""
-
-    top_score = 0
-    bias_summary = "WAIT"
-    lolos_final = False
-    hasil_teks = ""
-
-    def _susun_laporan_json(verdict_dict: dict, label_mode: str = "") -> tuple[str, int, str, bool]:
+    def _susun_laporan_json(verdict_dict: dict, label_engine: str) -> tuple[str, int, str, bool]:
         x_sc = int(verdict_dict.get("xau_score", 0))
         b_sc = int(verdict_dict.get("btc_score", 0))
         top_s = max(x_sc, b_sc)
-        bias_sum = f"XAU:{verdict_dict.get('xau_bias')}({x_sc}) | BTC:{verdict_dict.get('btc_bias')}({b_sc})"
+        bias_sum = f"[{mode_fokus}] XAU:{verdict_dict.get('xau_bias')}({x_sc}) | BTC:{verdict_dict.get('btc_bias')}({b_sc})"
         lolos = bool(risk_status.get("approved")) and (top_s >= 75)
-        judul_mode = f" [{label_mode}]" if label_mode else ""
         teks_out = (
-            f"QUANT AGENT v2.5 — SIDANG 4 AGEN{judul_mode} ({pemicu})\n"
-            f"Sesi: {deteksi_sesi_trading()} | Spread XAU: {spread_aktif} pips\n"
-            f"• XAUUSD ({live_prices_ctx['XAUUSD_live']}): {verdict_dict.get('xau_bias')} (Skor: {x_sc}/100) | {mtf_gold.get('market_regime')}\n"
+            f"QUANT AGENT v2.6 [{label_engine}] — {pemicu}\n"
+            f"Fokus: {mode_fokus} | Sesi: {sesi_aktif} | Spread XAU: {spread_aktif} pips\n\n"
+            f"• XAUUSD ({live_prices_ctx['XAUUSD_live']}): {verdict_dict.get('xau_bias')} ({x_sc}/100) | {mtf_gold.get('market_regime')}\n"
             f"  {_ringkas_mtf(mtf_gold)}\n"
-            f"• BTCUSDT ({live_prices_ctx['BTCUSD_live']}): {verdict_dict.get('btc_bias')} (Skor: {b_sc}/100) | {mtf_btc.get('market_regime')}\n"
+            f"• BTCUSDT ({live_prices_ctx['BTCUSD_live']}): {verdict_dict.get('btc_bias')} ({b_sc}/100) | {mtf_btc.get('market_regime')}\n"
             f"  {_ringkas_mtf(mtf_btc)}\n\n"
-            f"1. Macro Analyst:\n{verdict_dict.get('macro_view')}\n\n"
-            f"2. Bull Case:\n{verdict_dict.get('bull_case')}\n\n"
-            f"3. Bear/Skeptic Veto:\n{verdict_dict.get('bear_skeptic_veto')}\n\n"
-            f"4. Risk Judge:\n{verdict_dict.get('final_verdict')}\n\n"
-            f"Status Guardrail: {'LOLOS HIGH-PROB (>=75)' if lolos else 'DITAHAN / WAIT'}"
+            f"1. Sesi (Asia / London / NY):\n{verdict_dict.get('session_plan')}\n\n"
+            f"2. Intraday (M1-H4):\n{verdict_dict.get('intraday_setup')}\n\n"
+            f"3. Swing (H4-W1):\n{verdict_dict.get('swing_setup')}\n\n"
+            f"4. Hold Position (Bulanan - Tahunan / D1-MN1):\n{verdict_dict.get('hold_position_plan')}\n\n"
+            f"5. Skeptic Veto & Blind Spot:\n{verdict_dict.get('bear_skeptic_veto')}\n\n"
+            f"6. Final Verdict & Guardrail:\n{verdict_dict.get('final_verdict')}\n"
+            f"Status Eksekusi: {'LOLOS HIGH-PROB (>=75)' if lolos else 'DITAHAN / WAIT'}"
         )
         return teks_out, top_s, bias_sum, lolos
 
-    try:
-        raw_json = ""
-        anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
-        if anthropic_key:
-            try:
-                import anthropic
-                claude_client = anthropic.Anthropic(api_key=anthropic_key)
-                claude_res = claude_client.messages.create(
-                    model="claude-opus-4-6",
-                    max_tokens=16000,
-                    system=SYSTEM_INSTRUCTION_QUANT,
-                    thinking={"type": "enabled", "budget_tokens": 12000},
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                for block in claude_res.content:
-                    if getattr(block, "type", "") == "text":
-                        raw_json = block.text.strip()
-                        break
-            except Exception as claude_err:
-                print("Fallback ke Gemini karena Claude error:", claude_err)
+    raw_json = ""
+    engine_dipakai = "GEMINI-4-HYDROGEN (HIGH)"
 
-        if not raw_json and client:
-            kandidat_gemini = [
-                (
-                    "gemini-2.5-pro",
-                    types.GenerateContentConfig(
-                        system_instruction=SYSTEM_INSTRUCTION_QUANT,
-                        response_mime_type="application/json",
-                        thinking_config=types.ThinkingConfig(thinking_budget=24576),
-                    ),
-                ),
-            ]
-            for nama_model, cfg_model in kandidat_gemini:
-                try:
-                    response = client.models.generate_content(
-                        model=nama_model,
-                        contents=prompt,
-                        config=cfg_model,
-                    )
-                    if getattr(response, "text", None) and response.text.strip():
-                        raw_json = response.text.strip()
-                        break
-                except Exception as gem_err:
-                    print(f"Model {nama_model} gagal ({gem_err}), lanjut...")
-
-        if not raw_json:
-            raise RuntimeError("Model utama belum mengembalikan respons.")
-
-        if "{" in raw_json and "}" in raw_json:
-            raw_json = raw_json[raw_json.find("{") : raw_json.rfind("}") + 1]
-        verdict = json.loads(raw_json)
-        hasil_teks, top_score, bias_summary, lolos_final = _susun_laporan_json(verdict)
-        log_id = simpan_log(
-            "XAUUSD/BTC",
-            bias_summary,
-            top_score,
-            spread_aktif,
-            macro_snap,
-            "PENDING_REVIEW" if lolos_final else "AUTO_WAIT",
-            hasil_teks[:400],
+    # 1. Prioritas Utama: Gemini 4 Hydrogen (thinking_level='high' + google_search)
+    if client:
+        raw_json = panggil_gemini_hydrogen_high(
+            client,
+            f"{SYSTEM_INSTRUCTION_QUANT}\n\n{prompt}",
+            use_google_search=True,
         )
-        kirim_telegram(hasil_teks, log_id=log_id if lolos_final else None)
-        return hasil_teks
-    except Exception:
-        groq_raw = panggil_groq_fallback(
+
+    # 2. Cadangan 1: Gemini 2.5 Pro (thinking_budget=24576)
+    if not raw_json and client:
+        engine_dipakai = "GEMINI-2.5-PRO (THINKING)"
+        raw_json = analisa_dengan_retry(
+            client,
+            ["gemini-2.5-pro"],
             prompt,
-            system_prompt=SYSTEM_INSTRUCTION_QUANT,
-        )
-        if groq_raw:
-            try:
-                bersih = groq_raw.strip()
-                if "{" in bersih and "}" in bersih:
-                    bersih = bersih[bersih.find("{") : bersih.rfind("}") + 1]
-                verdict = json.loads(bersih)
-                hasil_teks, top_score, bias_summary, lolos_final = _susun_laporan_json(verdict, "GROQ FALLBACK")
-                log_id = simpan_log(
-                    "XAUUSD/BTC",
-                    bias_summary,
-                    top_score,
-                    spread_aktif,
-                    macro_snap,
-                    "PENDING_REVIEW" if lolos_final else "AUTO_WAIT",
-                    hasil_teks[:400],
-                )
-                kirim_telegram(hasil_teks, log_id=log_id if lolos_final else None)
-                return hasil_teks
-            except Exception:
-                top_score = 0
-                bias_summary = "GROQ_TEXT"
-                lolos_final = False
-                hasil_teks = (
-                    f"QUANT AGENT v2.5 — SIDANG 4 AGEN [GROQ FALLBACK] ({pemicu})\n"
-                    f"Sesi: {deteksi_sesi_trading()} | Spread XAU: {spread_aktif} pips\n"
-                    f"• XAUUSD: {_ringkas_mtf(mtf_gold)}\n"
-                    f"• BTCUSDT: {_ringkas_mtf(mtf_btc)}\n\n"
-                    f"{groq_raw}"
-                )
-                log_id = simpan_log(
-                    "XAUUSD/BTC",
-                    bias_summary,
-                    top_score,
-                    spread_aktif,
-                    macro_snap,
-                    "AUTO_WAIT",
-                    hasil_teks[:400],
-                )
-                kirim_telegram(hasil_teks, log_id=None)
-                return hasil_teks
-
-        top_score = 0
-        bias_summary = "WAIT_NO_DATA"
-        lolos_final = False
-        hasil_teks = (
-            f"QUANT AGENT v2.5 — SIDANG 4 AGEN ({pemicu})\n"
-            f"Sesi: {deteksi_sesi_trading()} | Spread XAU: {spread_aktif} pips\n"
-            f"• XAUUSD ({live_prices_ctx['XAUUSD_live']}): {_ringkas_mtf(mtf_gold)}\n"
-            f"• BTCUSDT ({live_prices_ctx['BTCUSD_live']}): {_ringkas_mtf(mtf_btc)}\n\n"
-            f"Catatan: Model AI sedang sibuk/limit. Data MTF (M1-MN1) & risiko tetap terkumpul aman (WAIT_NO_TRADE)."
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION_QUANT,
+                response_mime_type="application/json",
+                thinking_config=types.ThinkingConfig(thinking_budget=24576),
+            ),
+            retries=1,
         )
 
-    log_id = simpan_log(
-        "XAUUSD/BTC",
-        bias_summary,
-        top_score,
-        spread_aktif,
-        macro_snap,
-        "AUTO_WAIT",
-        hasil_teks[:400],
+    # 3. Cadangan 2: Groq Llama 3.3 70B
+    if not raw_json and GROQ_API_KEY:
+        engine_dipakai = "GROQ-LLAMA-3.3-70B"
+        raw_json = panggil_groq_fallback(prompt, system_prompt=SYSTEM_INSTRUCTION_QUANT)
+
+    if raw_json:
+        try:
+            bersih = raw_json.strip()
+            if "{" in bersih and "}" in bersih:
+                bersih = bersih[bersih.find("{") : bersih.rfind("}") + 1]
+            verdict = json.loads(bersih)
+            hasil_teks, top_score, bias_summary, lolos_final = _susun_laporan_json(verdict, engine_dipakai)
+            log_id = simpan_log(
+                "XAUUSD/BTC",
+                bias_summary,
+                top_score,
+                spread_aktif,
+                macro_snap,
+                "PENDING_REVIEW" if lolos_final else "AUTO_WAIT",
+                hasil_teks[:400],
+            )
+            kirim_telegram(hasil_teks, log_id=log_id if lolos_final else None)
+            return hasil_teks
+        except Exception:
+            hasil_teks = (
+                f"QUANT AGENT v2.6 [{engine_dipakai}] — {pemicu}\n"
+                f"• XAUUSD: {_ringkas_mtf(mtf_gold)}\n"
+                f"• BTCUSDT: {_ringkas_mtf(mtf_btc)}\n\n"
+                f"{raw_json}"
+            )
+            simpan_log("XAUUSD/BTC", f"[{mode_fokus}] TEXT_OUT", 0, spread_aktif, macro_snap, "AUTO_WAIT", hasil_teks[:400])
+            kirim_telegram(hasil_teks, log_id=None)
+            return hasil_teks
+
+    hasil_teks = (
+        f"QUANT AGENT v2.6 [DATA MENTAH] — {pemicu}\n"
+        f"Sesi: {sesi_aktif} | Spread XAU: {spread_aktif} pips\n"
+        f"• XAUUSD ({live_prices_ctx['XAUUSD_live']}): {_ringkas_mtf(mtf_gold)}\n"
+        f"• BTCUSDT ({live_prices_ctx['BTCUSD_live']}): {_ringkas_mtf(mtf_btc)}\n\n"
+        f"Catatan: Model AI sedang sibuk/limit. Data MTF (M1-MN1) & risiko tetap aman (WAIT_NO_TRADE)."
     )
+    simpan_log("XAUUSD/BTC", "WAIT_NO_MODEL", 0, spread_aktif, macro_snap, "AUTO_WAIT", hasil_teks[:400])
     kirim_telegram(hasil_teks, log_id=None)
     return hasil_teks
 
 
 # ==============================================================================
-# 8. BACKGROUND WORKER: SCHEDULER 24/7, EVALUASI MINGGUAN & LISTENER TELEGRAM
+# 9. BACKGROUND WORKER: SCHEDULER 24/7 & LISTENER TELEGRAM INTERAKTIF
 # ==============================================================================
 def loop_scheduler_otomatis():
     time.sleep(AUTO_SCAN_INTERVAL_SEC)
     while True:
         try:
-            jalankan_analisa_lengkap(pemicu="Auto-Scan Cloud 24/7")
+            jalankan_analisa_lengkap(pemicu="Auto-Scan Cloud 24/7", mode_fokus="ALL")
         except Exception as e:
             print("Error scheduler:", e)
         time.sleep(AUTO_SCAN_INTERVAL_SEC)
+
+
+def _deteksi_fokus_dari_teks(teks_lower: str) -> tuple[str, str]:
+    sesi = ""
+    if "asia" in teks_lower:
+        sesi = "ASIA"
+    elif "london" in teks_lower:
+        sesi = "LONDON"
+    elif "new york" in teks_lower or "newyork" in teks_lower or " ny" in teks_lower or teks_lower.endswith("ny"):
+        sesi = "NEW_YORK"
+
+    if any(k in teks_lower for k in ["hold", "bulan", "tahun", "invest", "jangka panjang", "position"]):
+        return "HOLD", sesi
+    if "swing" in teks_lower:
+        return "SWING", sesi
+    if any(k in teks_lower for k in ["intraday", "scalp", "hari ini"]):
+        return "INTRADAY", sesi
+    if sesi:
+        return "SESSION", sesi
+    return "ALL", ""
 
 
 def loop_listener_telegram():
@@ -1261,8 +1299,8 @@ def loop_listener_telegram():
         return
     offset = 0
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-    print("Listener Telegram aktif polling...", flush=True)
-    kirim_telegram("Bot Quant Agent aktif & terhubung!")
+    print("Listener Telegram v2.6 aktif polling...", flush=True)
+    kirim_telegram("Bot Quant Agent v2.6 (Gemini 4 Hydrogen High + M1-MN1 + Multi-Horizon Skills) aktif!")
     while True:
         try:
             resp = requests.get(
@@ -1273,7 +1311,6 @@ def loop_listener_telegram():
             if not resp.get("ok"):
                 err_code = resp.get("error_code")
                 retry_after = int(resp.get("parameters", {}).get("retry_after", 10)) + 1
-                print(f"getUpdates gagal ({err_code}): {resp.get('description')} -> tidur {retry_after}s", flush=True)
                 time.sleep(retry_after if err_code == 429 else 5)
                 continue
 
@@ -1285,7 +1322,6 @@ def loop_listener_telegram():
                     cb_id = cb["id"]
                     data_cb = cb.get("data", "")
                     from_id = str(cb.get("from", {}).get("id", ""))
-                    print(f"Callback dari {from_id}: {data_cb}")
                     if from_id == str(TELEGRAM_CHAT_ID) and "_" in data_cb:
                         aksi, id_str = data_cb.split("_", 1)
                         log_id = int(id_str)
@@ -1312,25 +1348,32 @@ def loop_listener_telegram():
                 msg = item.get("message", {})
                 text = msg.get("text", "").strip().lower()
                 chat_id = str(msg.get("chat", {}).get("id", ""))
-                if text:
-                    print(f"Pesan masuk dari chat_id={chat_id} (target={TELEGRAM_CHAT_ID}): {text}")
 
                 if chat_id == str(TELEGRAM_CHAT_ID):
                     if text in ["/start", "/help"]:
                         kirim_telegram(
-                            "Quant Agent v2.5 (Institutional Multi-Asset 24/7) Aktif.\n"
+                            "Quant Agent v2.6 Aktif (Gemini 4 Hydrogen High + Skills).\n"
                             "Perintah tersedia:\n"
-                            "/cek - Jalankan sidang 4 agen (M1-MN1 High-Prob), Blockworks/TwelveData & MTF\n"
+                            "/cek - Analisa lengkap semua horizon (Sesi, Intraday, Swing, Hold)\n"
+                            "/cek asia | /cek london | /cek ny - Fokus likuiditas & struktur per sesi\n"
+                            "/cek intraday - Fokus eksekusi M1-H4\n"
+                            "/cek swing - Fokus ayunan H4-W1 & derivatif\n"
+                            "/cek hold - Fokus posisi bulanan-tahunan D1-MN1 & makro\n"
                             "/backtest - Uji statistik backtesting.py & 1.000x Monte Carlo\n"
-                            "/jurnal - Lihat jurnal audit SQLite & kuota sesi\n"
-                            "/evaluasi - Lihat laporan evaluasi akurasi mingguan"
+                            "/jurnal - Lihat jurnal audit SQLite & kuota sesi"
                         )
-                    elif text in ["/cek", "/analisa"]:
-                        kirim_telegram("AgentLang lagi cek data & analisa market ter update (M1-MN1), tunggu bentar...")
+                    elif text.startswith("/cek") or text.startswith("/analisa"):
+                        mode_fokus, sesi_target = _deteksi_fokus_dari_teks(text)
+                        label_cmd = f"{mode_fokus}" + (f" ({sesi_target})" if sesi_target else "")
+                        kirim_telegram(f"AgentLang lagi menjalankan penalaran tinggi [{label_cmd}] (M1-MN1), tunggu sebentar...")
 
-                        def _run_manual_analisa():
+                        def _run_manual_analisa(m_fokus=mode_fokus, s_target=sesi_target, lbl=label_cmd):
                             try:
-                                jalankan_analisa_lengkap(pemicu="Perintah Manual /cek dari HP")
+                                jalankan_analisa_lengkap(
+                                    pemicu=f"Perintah Manual /cek [{lbl}]",
+                                    mode_fokus=m_fokus,
+                                    sesi_target=s_target,
+                                )
                             except Exception as exc:
                                 kirim_telegram(f"Error saat menjalankan /cek: {exc}")
 
@@ -1345,28 +1388,30 @@ def loop_listener_telegram():
                     else:
                         pesan_asli = msg.get("text", "").strip()
                         if pesan_asli:
-                            kirim_telegram("Sedang meracik jawaban...")
+                            kirim_telegram("Sedang meracik jawaban dengan penalaran tinggi...")
                             try:
                                 snap_db = ambil_ringkasan_jurnal_dan_evaluasi_mingguan()
+                                mode_chat, sesi_chat = _deteksi_fokus_dari_teks(text)
+                                skill_chat = pilih_skills_konteks(mode_fokus=mode_chat, sesi_target=sesi_chat)
                                 prompt_chat = (
                                     f"Kamu adalah AgentLang, partner diskusi quant, makro, dan eksekusi trading di Telegram. "
-                                    f"Bicara seperti manusia yang lugas, tenang, dan analitis—hindari gaya bahasa robotik, klise, atau template kaku, "
-                                    f"dan JANGAN pakai tanda bintang (* atau **) karena Telegram menampilkan teks polos. "
-                                    f"Saat menjawab, utamakan critical thinking: uji asumsi user, soroti potensi jebakan atau blind spot (seperti bias konfirmasi, "
-                                    f"likuiditas palsu, risiko makro/berita, atau rasio risiko yang kurang masuk akal), dan beri perbandingan skenario jika relevan. "
-                                    f"Jika ada data yang tidak ada di konteks, katakan terus terang tanpa mengarang. "
-                                    f"Jika ditanya nama atau menyapa, perkenalkan diri secara wajar sebagai AgentLang.\n"
+                                    f"Bicara lugas, tenang, kritis, dan analitis—JANGAN pakai tanda bintang (* atau **) karena Telegram teks polos.\n"
+                                    f"Skill aktif sesuai konteks pesan:\n{skill_chat}\n\n"
                                     f"Konteks jurnal & kuota sesi terakhir:\n{snap_db}\n\n"
                                     f"Pesan user: {pesan_asli}"
                                 )
                                 balasan = ""
-                                if GROQ_API_KEY:
+                                if GEMINI_API_KEY:
+                                    client_chat = genai.Client(api_key=GEMINI_API_KEY)
+                                    balasan = panggil_gemini_hydrogen_high(
+                                        client_chat,
+                                        prompt_chat,
+                                        use_google_search=True,
+                                    )
+                                if not balasan and GROQ_API_KEY:
                                     balasan = panggil_groq_fallback(
                                         prompt_chat,
-                                        system_prompt=(
-                                            "Kamu adalah AgentLang, partner diskusi quant, makro, dan eksekusi trading di Telegram. "
-                                            "Jawab lugas, tenang, kritis, dan tanpa tanda bintang (* atau **)."
-                                        ),
+                                        system_prompt="Kamu adalah AgentLang, partner diskusi quant & trading. Jawab kritis, lugas, dan tanpa tanda bintang.",
                                     )
                                 if not balasan and GEMINI_API_KEY:
                                     client_chat = genai.Client(api_key=GEMINI_API_KEY)
@@ -1385,14 +1430,15 @@ def loop_listener_telegram():
 
 
 # ==============================================================================
-# 9. ENDPOINT WEB (HEALTH CHECK 24/7 & WEBHOOK TRADINGVIEW)
+# 10. ENDPOINT WEB (HEALTH CHECK 24/7 & WEBHOOK TRADINGVIEW)
 # ==============================================================================
 @app.route("/", methods=["GET"])
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({
         "status": "alive",
-        "version": "2.5",
+        "version": "2.6",
+        "primary_model": "models/gemini-4-hydrogen (thinking_level=high)",
         "session": deteksi_sesi_trading(),
         "utc": datetime.now(timezone.utc).isoformat(),
     })
@@ -1403,7 +1449,7 @@ def tradingview_webhook():
     payload = request.get_json(silent=True) or {"raw": request.data.decode("utf-8", errors="ignore")}
     threading.Thread(
         target=jalankan_analisa_lengkap,
-        args=(f"TradingView Alert: {payload}",),
+        args=(f"TradingView Alert: {payload}", "INTRADAY", deteksi_sesi_trading()),
         daemon=True,
     ).start()
     return jsonify({"received": True})
