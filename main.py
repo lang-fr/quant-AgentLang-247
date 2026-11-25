@@ -963,26 +963,33 @@ def ambil_data_institusi_dan_berita() -> dict:
 def ambil_intelijen_blockworks() -> dict:
     api_key = os.getenv("BLOCKWORKS_API_KEY", "").strip()
     if not api_key:
+        print("[Blockworks] NONAKTIF: BLOCKWORKS_API_KEY kosong di env.", flush=True)
         return {"status": "nonaktif_tanpa_key"}
 
     headers = {"x-blockworks-api-key": api_key, "Accept": "application/json"}
     kandidat_url = [
+        ("https://api.blockworks.com/v1/assets", {"limit": 5}),
+        ("https://api.blockworks.com/v1/projects", {"limit": 5}),
+        ("https://api.blockworks.com/v1/metrics", {"limit": 5}),
         ("https://api.blockworks.com/query/tabular/assets", {"pageSize": 5}),
-        ("https://api.blockworks.com/v1/assets", None),
     ]
 
+    log_gagal = []
     for url, params in kandidat_url:
         try:
             resp = requests.get(url, headers=headers, params=params, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
-                return {"status": "aktif", "ringkasan": str(data)[:350]}
-            if resp.status_code != 401:
-                return {"status": f"http_{resp.status_code}"}
+                ringkas = str(data)[:400]
+                print(f"[Blockworks] AKTIF dari {url}: {ringkas[:120]}", flush=True)
+                return {"status": "aktif", "endpoint": url, "ringkasan": ringkas}
+            log_gagal.append(f"{url.split('blockworks.com')[-1]}->{resp.status_code}:{resp.text[:80]}")
         except Exception as e:
-            return {"status": "error", "detail": str(e)}
+            log_gagal.append(f"{url.split('blockworks.com')[-1]}->ERR:{str(e)[:60]}")
 
-    return {"status": "http_401"}
+    detail_err = " | ".join(log_gagal)
+    print(f"[Blockworks] GAGAL: {detail_err}", flush=True)
+    return {"status": "gagal", "detail": detail_err[:300]}
 
 
 def ambil_data_coinmarketcap() -> dict:
