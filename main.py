@@ -29,6 +29,18 @@ from flask import Flask, request, jsonify
 from google import genai
 from google.genai import types
 from market_feeds import ambil_kalender_ff, ambil_makro_fred, ambil_orderflow_ccxt
+from smc_alpha import analisa_smc_matematis, cek_anti_korelasi_ganda
+from execution_engine import (
+    AUTO_EXECUTE_DEMO,
+    ambil_info_akun_mt5,
+    eksekusi_xau_metaapi_3tp,
+    eksekusi_btc_testnet_3tp,
+    kelola_auto_breakeven_mt5,
+)
+from outcome_verifier import (
+    verifikasi_hasil_sinyal_sebelumnya,
+    ambil_statistik_winrate_sesi,
+)
 
 # ==============================================================================
 # 1. LAPISAN 5: KEAMANAN KUNCI API (.env LOKAL & ENVIRONMENT VARIABLES CLOUD)
@@ -1708,7 +1720,14 @@ def tradingview_webhook():
 
 if __name__ == "__main__":
     init_db()
-    threading.Thread(target=loop_scheduler_otomatis, daemon=True).start()
-    threading.Thread(target=loop_listener_telegram, daemon=True).start()
-    port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port)
+    run_mode = os.getenv("RUN_MODE", "CLOUD_SERVER").upper()
+
+    if run_mode == "GITHUB_ACTIONS":
+        print("Menjalankan mode sekali scan (GitHub Actions)...", flush=True)
+        jalankan_analisa_lengkap(pemicu="GitHub Actions Cron", mode_fokus="ALL")
+        print("Scan selesai. Keluar bersih.", flush=True)
+    else:
+        threading.Thread(target=loop_scheduler_otomatis, daemon=True).start()
+        threading.Thread(target=loop_listener_telegram, daemon=True).start()
+        port = int(os.getenv("PORT", "8000"))
+        app.run(host="0.0.0.0", port=port)
