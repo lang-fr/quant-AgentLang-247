@@ -8,6 +8,11 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import yfinance as yf
+os.makedirs("/tmp/yf_cache", exist_ok=True)
+try:
+    yf.set_tz_cache_location("/tmp/yf_cache")
+except Exception:
+    pass
 import ccxt
 import feedparser
 import requests
