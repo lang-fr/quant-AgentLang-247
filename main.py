@@ -975,6 +975,10 @@ Setiap kali menjawab atau menganalisis:
 4. Berani Menahan Eksekusi: Jika data kurang lengkap, konfluensi lemah, atau profil risiko tidak seimbang, nyatakan sikap WAIT / NO TRADE secara tegas.
 5. Format Jelas & Terukur: Jawab lugas, terstruktur, dan fokus pada pengujian logika serta probabilitas."""
 
+    top_score = 0
+    bias_summary = "WAIT"
+    lolos_final = False
+    hasil_teks = ""
     try:
         raw_json = ""
         anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
