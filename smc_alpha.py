@@ -1,226 +1,336 @@
+import os
+import time
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 
-def _bersihkan_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
+
+# ==============================================================================
+# 1. DATA LOADER MULTI-SUMBER (OANDA/TV XAUUSD, HYPERLIQUID XYZ:GOLD, BINANCE BTC)
+# ==============================================================================
+def ambil_ohlcv_tv_atau_yf(ticker_yf: str, symbol_td: str, interval: str = "1h", period: str = "30d") -> pd.DataFrame:
+    """Mengambil candle OHLCV dengan fallback TwelveData -> Yahoo Finance."""
+    if TWELVEDATA_API_KEY:
+        try:
+            td_int = {"15m": "15min", "1h": "1h", "4h": "4h", "1d": "1day"}.get(interval, "1h")
+            url = (
+                f"https://api.twelvedata.com/time_series?symbol={symbol_td}&interval={td_int}"
+                f"&outputsize=180&apikey={TWELVEDATA_API_KEY}"
+            )
+            r = requests.get(url, timeout=10).json()
+            vals = r.get("values", [])
+            if vals:
+                df = pd.DataFrame(vals)
+                for col in ["open", "high", "low", "close"]:
+                    df[col] = df[col].astype(float)
+                df["volume"] = df["volume"].astype(float) if "volume" in df.columns else 1000.0
+                df = df.iloc[::-1].reset_index(drop=True)
+                df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}, inplace=True)
+                return df
+        except Exception:
+            pass
+
+    try:
+        df = yf.download(ticker_yf, period=period, interval=interval, progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.dropna(subset=["Open", "High", "Low", "Close"]).reset_index(drop=True)
+        if "Volume" not in df.columns:
+            df["Volume"] = 1000.0
+        return df
+    except Exception:
         return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
 
 
-def hitung_daily_ohlc_levels(df_d1: pd.DataFrame) -> dict:
-    """Menghitung Pivot, New High (NH), New Low (NL), dan bias harian mekanis."""
-    df = _bersihkan_df(df_d1)
-    if len(df) < 2:
+def ambil_ohlcv_hyperliquid_xyz_gold(interval: str = "1h", limit: int = 180) -> pd.DataFrame:
+    """Menarik candle live xyz:GOLD langsung dari Hyperliquid Info API."""
+    try:
+        ms_per_bar = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}.get(interval, 3_600_000)
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - (limit * ms_per_bar)
+        payload = {
+            "type": "candleSnapshot",
+            "req": {"coin": "xyz:GOLD", "interval": interval, "startTime": start_ms, "endTime": end_ms},
+        }
+        resp = requests.post("https://api.hyperliquid.xyz/info", json=payload, timeout=10).json()
+        if isinstance(resp, list) and len(resp) > 10:
+            rows = []
+            for c in resp:
+                rows.append({
+                    "Open": float(c["o"]),
+                    "High": float(c["h"]),
+                    "Low": float(c["l"]),
+                    "Close": float(c["c"]),
+                    "Volume": float(c.get("v", 100.0)),
+                })
+            return pd.DataFrame(rows)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def ambil_ohlcv_binance_btc(interval: str = "1h", limit: int = 180) -> pd.DataFrame:
+    """Menarik candle live BTCUSDT dari Binance Futures Public API."""
+    try:
+        url = f"https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval={interval}&limit={limit}"
+        resp = requests.get(url, timeout=10).json()
+        if isinstance(resp, list) and len(resp) > 10:
+            rows = []
+            for k in resp:
+                rows.append({
+                    "Open": float(k[1]),
+                    "High": float(k[2]),
+                    "Low": float(k[3]),
+                    "Close": float(k[4]),
+                    "Volume": float(k[5]),
+                })
+            return pd.DataFrame(rows)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+# ==============================================================================
+# 2. KALKULASI MATEMATIS: OHLC PIVOT/NH/NL, FVG, OB, OTE, SWEEP & MSS
+# ==============================================================================
+def hitung_atr(df: pd.DataFrame, period: int = 14) -> float:
+    if len(df) < period + 2:
+        return float((df["High"] - df["Low"]).mean()) if len(df) > 0 else 1.0
+    high_low = df["High"] - df["Low"]
+    high_close = (df["High"] - df["Close"].shift()).abs()
+    low_close = (df["Low"] - df["Close"].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return float(tr.rolling(period).mean().iloc[-1])
+
+
+def hitung_strategi_ohlc_harian(df_d1: pd.DataFrame) -> dict:
+    """Menghitung rumus kuantitatif OHLC (Pivot, Konstanta X, New High, New Low, dan Bias Harian)."""
+    if len(df_d1) < 2:
         return {"error": "Data D1 tidak cukup"}
 
-    kemarin = df.iloc[-2]
-    hari_ini = df.iloc[-1]
+    prev = df_d1.iloc[-2]
+    curr = df_d1.iloc[-1]
 
-    o_y, h_y, l_y, c_y = (
-        float(kemarin["Open"]),
-        float(kemarin["High"]),
-        float(kemarin["Low"]),
-        float(kemarin["Close"]),
-    )
-    o_t = float(hari_ini["Open"])
+    p_open, p_high, p_low, p_close = float(prev["Open"]), float(prev["High"]), float(prev["Low"]), float(prev["Close"])
+    c_open, c_close = float(curr["Open"]), float(curr["Close"])
 
-    pivot = (h_y + l_y + c_y) / 3.0
-    bias_harian = "BUY" if o_t > pivot else "SELL"
+    pivot = ((2.0 * p_close) + p_high + p_low) / 4.0
+    candle_kemarin = "BULL" if p_close > p_open else "BEAR"
 
-    # Rumus konstanta X berdasarkan sifat candle kemarin (BEAR vs BULL)
-    if o_y > c_y:
-        x = ((2.0 * l_y) + h_y + c_y) / 2.0
+    if candle_kemarin == "BULL":
+        x_val = ((2.0 * p_high) + p_low + p_close) / 2.0
     else:
-        x = ((2.0 * h_y) + l_y + c_y) / 2.0
+        x_val = ((2.0 * p_low) + p_high + p_close) / 2.0
 
-    nh = x - l_y  # Zona Resisten / Target Sell
-    nl = x - h_y  # Zona Support / Target Buy
+    nh_resisten = x_val - p_low
+    nl_support = x_val - p_high
+    bias_ohlc = "BUY" if c_open > pivot else "SELL"
 
     return {
-        "bias_ohlc": bias_harian,
-        "today_open": round(o_t, 2),
+        "prev_candle": candle_kemarin,
+        "prev_high": round(p_high, 2),
+        "prev_low": round(p_low, 2),
         "pivot": round(pivot, 2),
-        "NH_resisten": round(nh, 2),
-        "NL_support": round(nl, 2),
+        "NH_resisten": round(nh_resisten, 2),
+        "NL_support": round(nl_support, 2),
+        "today_open": round(c_open, 2),
+        "last_price": round(c_close, 2),
+        "bias_ohlc": bias_ohlc,
     }
 
 
-def deteksi_unmitigated_fvg(df: pd.DataFrame, tf_label: str = "M15", lookback: int = 60) -> dict:
-    """Mendeteksi celah Fair Value Gap (3-candle imbalance) yang belum tertutup (unmitigated)."""
-    data = _bersihkan_df(df).tail(lookback)
-    if len(data) < 5:
+def deteksi_fvg(df: pd.DataFrame) -> dict:
+    """Mendeteksi unmitigated Bullish & Bearish Fair Value Gap pada 15 candle terakhir."""
+    bull_fvg, bear_fvg = None, None
+    if len(df) < 15:
         return {"bullish_fvg": None, "bearish_fvg": None}
 
-    highs = data["High"].values
-    lows = data["Low"].values
+    last_close = float(df["Close"].iloc[-1])
+    for i in range(len(df) - 12, len(df) - 2):
+        c1_high, c1_low = float(df["High"].iloc[i]), float(df["Low"].iloc[i])
+        c3_high, c3_low = float(df["High"].iloc[i + 2]), float(df["Low"].iloc[i + 2])
 
-    bull_fvgs = []
-    bear_fvgs = []
+        if c3_low > c1_high and last_close >= c1_high:
+            bull_fvg = [round(c1_high, 2), round(c3_low, 2)]
+        if c3_high < c1_low and last_close <= c1_low:
+            bear_fvg = [round(c3_high, 2), round(c1_low, 2)]
 
-    for i in range(len(data) - 3):
-        # Bullish FVG: Low candle ke-3 > High candle ke-1
-        if lows[i + 2] > highs[i]:
-            bawah = float(highs[i])
-            atas = float(lows[i + 2])
-            # Cek apakah candle setelahnya sudah menutup seluruh celah (mitigated)
-            low_setelahnya = float(np.min(lows[i + 3 :])) if (i + 3) < len(data) else atas
-            if low_setelahnya > bawah:
-                bull_fvgs.append({
-                    "tf": tf_label,
-                    "top": round(atas, 2),
-                    "bottom": round(bawah, 2),
-                    "mid_ce": round((atas + bawah) / 2.0, 2),
-                })
-
-        # Bearish FVG: High candle ke-3 < Low candle ke-1
-        if highs[i + 2] < lows[i]:
-            atas = float(lows[i])
-            bawah = float(highs[i + 2])
-            high_setelahnya = float(np.max(highs[i + 3 :])) if (i + 3) < len(data) else bawah
-            if high_setelahnya < atas:
-                bear_fvgs.append({
-                    "tf": tf_label,
-                    "top": round(atas, 2),
-                    "bottom": round(bawah, 2),
-                    "mid_ce": round((atas + bawah) / 2.0, 2),
-                })
-
-    return {
-        "bullish_fvg": bull_fvgs[-1] if bull_fvgs else None,
-        "bearish_fvg": bear_fvgs[-1] if bear_fvgs else None,
-    }
+    return {"bullish_fvg": bull_fvg, "bearish_fvg": bear_fvg}
 
 
-def deteksi_order_block(df: pd.DataFrame, tf_label: str = "H1", lookback: int = 60) -> dict:
-    """Mendeteksi Unmitigated Order Block sebelum pergerakan impulsif (displacement)."""
-    data = _bersihkan_df(df).tail(lookback)
-    if len(data) < 25:
+def deteksi_order_block(df: pd.DataFrame) -> dict:
+    """Mendeteksi Order Block terakhir sebelum pergerakan impulsif bervolume di atas rata-rata."""
+    bull_ob, bear_ob = None, None
+    if len(df) < 25:
         return {"bullish_ob": None, "bearish_ob": None}
 
-    opens = data["Open"].values
-    highs = data["High"].values
-    lows = data["Low"].values
-    closes = data["Close"].values
-    bodies = np.abs(closes - opens)
-    avg_body = float(np.mean(bodies)) if np.mean(bodies) > 0 else 1.0
+    vol_ma = df["Volume"].rolling(20).mean()
+    for i in range(len(df) - 18, len(df) - 2):
+        c0 = df.iloc[i]
+        c1 = df.iloc[i + 1]
+        v_avg = float(vol_ma.iloc[i + 1]) if not np.isnan(vol_ma.iloc[i + 1]) else 0.0
 
-    bull_obs = []
-    bear_obs = []
+        # Bullish OB: candle merah terakhir sebelum candle hijau impulsif
+        if float(c0["Close"]) < float(c0["Open"]) and float(c1["Close"]) > float(c0["High"]):
+            if v_avg == 0 or float(c1["Volume"]) >= v_avg:
+                bull_ob = [round(float(c0["Low"]), 2), round(float(c0["High"]), 2)]
 
-    for i in range(1, len(data) - 2):
-        # Bullish OB: candle bearish diikuti candle bullish impulsif (> 1.6x rata-rata body)
-        if closes[i] < opens[i] and closes[i + 1] > opens[i + 1] and bodies[i + 1] > (1.6 * avg_body):
-            ob_high = float(highs[i])
-            ob_low = float(lows[i])
-            min_setelahnya = float(np.min(lows[i + 2 :]))
-            if min_setelahnya > ob_low:
-                bull_obs.append({
-                    "tf": tf_label,
-                    "high": round(ob_high, 2),
-                    "low": round(ob_low, 2),
-                })
+        # Bearish OB: candle hijau terakhir sebelum candle merah impulsif
+        if float(c0["Close"]) > float(c0["Open"]) and float(c1["Close"]) < float(c0["Low"]):
+            if v_avg == 0 or float(c1["Volume"]) >= v_avg:
+                bear_ob = [round(float(c0["Low"]), 2), round(float(c0["High"]), 2)]
 
-        # Bearish OB: candle bullish diikuti candle bearish impulsif (> 1.6x rata-rata body)
-        if closes[i] > opens[i] and closes[i + 1] < opens[i + 1] and bodies[i + 1] > (1.6 * avg_body):
-            ob_high = float(highs[i])
-            ob_low = float(lows[i])
-            max_setelahnya = float(np.max(highs[i + 2 :]))
-            if max_setelahnya < ob_high:
-                bear_obs.append({
-                    "tf": tf_label,
-                    "high": round(ob_high, 2),
-                    "low": round(ob_low, 2),
-                })
+    return {"bullish_ob": bull_ob, "bearish_ob": bear_ob}
+
+
+def deteksi_liquidity_sweep_dan_mss(df_h1: pd.DataFrame, prev_day_high: float, prev_day_low: float) -> dict:
+    """
+    Mendeteksi Liquidity Sweep (penembusan palsu PDH/PDL < 0.5% ATR lalu close balik)
+    serta Market Structure Shift (MSS / CHoCH) pada H1.
+    """
+    hasil = {"sweep_signal": "NONE", "mss_signal": "NONE", "htf_trend": "RANGING"}
+    if len(df_h1) < 30:
+        return hasil
+
+    atr = hitung_atr(df_h1, 14)
+    toleransi_sweep = max(atr * 0.6, float(df_h1["Close"].iloc[-1]) * 0.005)
+    recent = df_h1.iloc[-5:]
+
+    # 1. Cek Liquidity Sweep pada Previous Day High / Low
+    for idx in range(len(recent) - 1):
+        bar = recent.iloc[idx]
+        next_bar = recent.iloc[idx + 1]
+        # Bearish Sweep: sumbu menembus PDH tipis lalu ditutup kembali di bawah PDH
+        if float(bar["High"]) > prev_day_high and (float(bar["High"]) - prev_day_high) <= toleransi_sweep:
+            if float(bar["Close"]) < prev_day_high or float(next_bar["Close"]) < prev_day_high:
+                hasil["sweep_signal"] = "BEARISH_LIQUIDITY_SWEEP"
+        # Bullish Sweep: sumbu menembus PDL tipis lalu ditutup kembali di atas PDL
+        if float(bar["Low"]) < prev_day_low and (prev_day_low - float(bar["Low"])) <= toleransi_sweep:
+            if float(bar["Close"]) > prev_day_low or float(next_bar["Close"]) > prev_day_low:
+                hasil["sweep_signal"] = "BULLISH_LIQUIDITY_SWEEP"
+
+    # 2. Cek Market Structure Shift (MSS) & Struktur Tren H1/H4
+    swing_high_prev = float(df_h1["High"].iloc[-20:-4].max())
+    swing_low_prev = float(df_h1["Low"].iloc[-20:-4].min())
+    last_close = float(df_h1["Close"].iloc[-1])
+    ema_50 = float(df_h1["Close"].ewm(span=50).mean().iloc[-1])
+
+    if last_close > swing_high_prev:
+        hasil["mss_signal"] = "BULLISH_MSS"
+    elif last_close < swing_low_prev:
+        hasil["mss_signal"] = "BEARISH_MSS"
+
+    if last_close > ema_50 and last_close > (swing_high_prev + swing_low_prev) / 2.0:
+        hasil["htf_trend"] = "BULLISH"
+    elif last_close < ema_50 and last_close < (swing_high_prev + swing_low_prev) / 2.0:
+        hasil["htf_trend"] = "BEARISH"
+
+    return hasil
+
+
+def hitung_fibonacci_ote(df_h1: pd.DataFrame) -> dict:
+    """Menghitung zona Fibonacci Optimal Trade Entry (0.618 - 0.786) dari swing 48 jam terakhir."""
+    if len(df_h1) < 20:
+        return {"price_position": "UNKNOWN"}
+
+    window = df_h1.iloc[-48:]
+    sh = float(window["High"].max())
+    sl = float(window["Low"].min())
+    last_c = float(df_h1["Close"].iloc[-1])
+    rng = max(sh - sl, 1e-6)
+
+    buy_ote_top = round(sh - (0.618 * rng), 2)
+    buy_ote_bot = round(sh - (0.786 * rng), 2)
+    sell_ote_bot = round(sl + (0.618 * rng), 2)
+    sell_ote_top = round(sl + (0.786 * rng), 2)
+    eq = (sh + sl) / 2.0
+
+    if buy_ote_bot <= last_c <= buy_ote_top:
+        pos = "IN_BUY_OTE_DISCOUNT"
+    elif sell_ote_bot <= last_c <= sell_ote_top:
+        pos = "IN_SELL_OTE_PREMIUM"
+    elif last_c < eq:
+        pos = "DISCOUNT_ZONE"
+    else:
+        pos = "PREMIUM_ZONE"
 
     return {
-        "bullish_ob": bull_obs[-1] if bull_obs else None,
-        "bearish_ob": bear_obs[-1] if bear_obs else None,
+        "swing_high": round(sh, 2),
+        "swing_low": round(sl, 2),
+        "buy_ote_zone": [buy_ote_bot, buy_ote_top],
+        "sell_ote_zone": [sell_ote_bot, sell_ote_top],
+        "price_position": pos,
     }
 
 
-def hitung_fibonacci_ote(df_h1: pd.DataFrame, lookback: int = 48) -> dict:
-    """Menghitung rentang Dealing Range H1, Equilibrium (0.5), dan zona OTE (0.618 - 0.786)."""
-    data = _bersihkan_df(df_h1).tail(lookback)
-    if len(data) < 10:
-        return {"error": "Data H1 tidak cukup untuk OTE"}
-
-    swing_high = float(data["High"].max())
-    swing_low = float(data["Low"].min())
-    last_close = float(data["Close"].iloc[-1])
-    rentang = swing_high - swing_low
-    if rentang <= 0:
-        return {"error": "Rentang harga nol"}
-
-    eq_50 = swing_low + (0.50 * rentang)
-    # Zona diskon untuk skenario BUY (retracement dari High ke Low)
-    buy_ote_618 = swing_high - (0.618 * rentang)
-    buy_ote_705 = swing_high - (0.705 * rentang)
-    buy_ote_786 = swing_high - (0.786 * rentang)
-
-    # Zona premium untuk skenario SELL (retracement dari Low ke High)
-    sell_ote_618 = swing_low + (0.618 * rentang)
-    sell_ote_705 = swing_low + (0.705 * rentang)
-    sell_ote_786 = swing_low + (0.786 * rentang)
-
-    if last_close <= buy_ote_618 and last_close >= buy_ote_786:
-        posisi = "IN_BUY_OTE_DISCOUNT"
-    elif last_close >= sell_ote_618 and last_close <= sell_ote_786:
-        posisi = "IN_SELL_OTE_PREMIUM"
-    elif last_close < eq_50:
-        posisi = "DISCOUNT_ZONE"
+def analisa_smc_matematis(aset: str) -> dict:
+    """Orkestrasi analisa teknikal multi-timeframe untuk XAUUSD, XYZ:GOLD, dan BTCUSDT."""
+    sym = aset.upper()
+    if sym == "XAUUSD":
+        df_d1 = ambil_ohlcv_tv_atau_yf("GC=F", "XAU/USD", interval="1d", period="60d")
+        df_h1 = ambil_ohlcv_tv_atau_yf("GC=F", "XAU/USD", interval="1h", period="30d")
+        df_m15 = ambil_ohlcv_tv_atau_yf("GC=F", "XAU/USD", interval="15m", period="7d")
+        sumber = "OANDA_TV_XAUUSD"
+    elif sym == "XYZ:GOLD":
+        df_d1 = ambil_ohlcv_hyperliquid_xyz_gold("1d", 60)
+        df_h1 = ambil_ohlcv_hyperliquid_xyz_gold("1h", 180)
+        df_m15 = ambil_ohlcv_hyperliquid_xyz_gold("15m", 180)
+        if df_h1.empty:
+            df_d1 = ambil_ohlcv_tv_atau_yf("GC=F", "XAU/USD", interval="1d", period="60d")
+            df_h1 = ambil_ohlcv_tv_atau_yf("GC=F", "XAU/USD", interval="1h", period="30d")
+            df_m15 = ambil_ohlcv_tv_atau_yf("GC=F", "XAU/USD", interval="15m", period="7d")
+        sumber = "HYPERLIQUID_XYZ_GOLD"
     else:
-        posisi = "PREMIUM_ZONE"
+        df_d1 = ambil_ohlcv_binance_btc("1d", 60)
+        df_h1 = ambil_ohlcv_binance_btc("1h", 180)
+        df_m15 = ambil_ohlcv_binance_btc("15m", 180)
+        sumber = "BINANCE_BTCUSDT"
+
+    if df_d1.empty or df_h1.empty:
+        return {"error": f"Data OHLCV kosong untuk {aset}"}
+
+    ohlc = hitung_strategi_ohlc_harian(df_d1)
+    if "error" in ohlc:
+        return ohlc
+
+    sweep_mss = deteksi_liquidity_sweep_dan_mss(df_h1, ohlc["prev_high"], ohlc["prev_low"])
 
     return {
-        "swing_high": round(swing_high, 2),
-        "swing_low": round(swing_low, 2),
-        "equilibrium_50": round(eq_50, 2),
-        "buy_ote_zone": [round(buy_ote_786, 2), round(buy_ote_618, 2)],
-        "buy_sweet_spot_705": round(buy_ote_705, 2),
-        "sell_ote_zone": [round(sell_ote_618, 2), round(sell_ote_786, 2)],
-        "sell_sweet_spot_705": round(sell_ote_705, 2),
-        "price_position": posisi,
+        "asset": sym,
+        "data_source": sumber,
+        "daily_ohlc": ohlc,
+        "fvg_m15": deteksi_fvg(df_m15 if not df_m15.empty else df_h1),
+        "fvg_h1": deteksi_fvg(df_h1),
+        "order_block_h1": deteksi_order_block(df_h1),
+        "sweep_and_mss": sweep_mss,
+        "fibonacci_ote_h1": hitung_fibonacci_ote(df_h1),
     }
 
 
 def cek_anti_korelasi_ganda(threshold: float = 0.80) -> dict:
-    """Memeriksa korelasi 30 hari XAUUSD vs BTCUSDT untuk mencegah eksposur ganda."""
+    """Menghitung korelasi 30 hari antara Emas dan Bitcoin untuk mencegah eksposur risiko ganda."""
     try:
-        g = _bersihkan_df(yf.download("GC=F", period="60d", interval="1d", progress=False))["Close"]
-        b = _bersihkan_df(yf.download("BTC-USD", period="60d", interval="1d", progress=False))["Close"]
-        df_join = pd.DataFrame({"XAU": g, "BTC": b}).dropna().tail(30)
-        if len(df_join) < 15:
-            return {"corr_30d": 0.0, "double_exposure_blocked": False}
+        df_g = yf.download("GC=F", period="45d", interval="1d", progress=False)
+        df_b = yf.download("BTC-USD", period="45d", interval="1d", progress=False)
+        if isinstance(df_g.columns, pd.MultiIndex):
+            df_g.columns = df_g.columns.get_level_values(0)
+        if isinstance(df_b.columns, pd.MultiIndex):
+            df_b.columns = df_b.columns.get_level_values(0)
 
-        ret = np.log(df_join / df_join.shift(1)).dropna()
-        corr_val = round(float(ret["XAU"].corr(ret["BTC"])), 3)
-        return {
-            "corr_30d": corr_val,
-            "double_exposure_blocked": abs(corr_val) >= threshold,
-            "rule": "Pilih 1 aset skor tertinggi saja jika |corr| >= 0.80" if abs(corr_val) >= threshold else "Aman eksekusi independen",
-        }
-    except Exception as e:
-        return {"corr_30d": 0.0, "double_exposure_blocked": False, "error": str(e)}
+        gabung = pd.DataFrame({
+            "gold": df_g["Close"].pct_change(),
+            "btc": df_b["Close"].pct_change(),
+        }).dropna().tail(30)
 
-
-def analisa_smc_matematis(ticker_yf: str, aset_label: str) -> dict:
-    """Paket lengkap koordinat SMC/ICT + OHLC + OTE untuk satu instrumen."""
-    try:
-        df_m15 = _bersihkan_df(yf.download(ticker_yf, period="5d", interval="15m", progress=False))
-        df_h1 = _bersihkan_df(yf.download(ticker_yf, period="30d", interval="1h", progress=False))
-        df_d1 = _bersihkan_df(yf.download(ticker_yf, period="10d", interval="1d", progress=False))
-
-        return {
-            "asset": aset_label,
-            "daily_ohlc": hitung_daily_ohlc_levels(df_d1),
-            "fvg_m15": deteksi_unmitigated_fvg(df_m15, "M15", lookback=60),
-            "fvg_h1": deteksi_unmitigated_fvg(df_h1, "H1", lookback=48),
-            "order_block_h1": deteksi_order_block(df_h1, "H1", lookback=48),
-            "fibonacci_ote_h1": hitung_fibonacci_ote(df_h1, lookback=48),
-        }
-    except Exception as e:
-        return {"asset": aset_label, "error": str(e)}
+        if len(gabung) >= 15:
+            corr = float(gabung["gold"].corr(gabung["btc"]))
+            return {
+                "corr_30d": round(corr, 3),
+                "double_exposure_blocked": abs(corr) >= threshold,
+            }
+    except Exception:
+        pass
+    return {"corr_30d": 0.0, "double_exposure_blocked": False}
