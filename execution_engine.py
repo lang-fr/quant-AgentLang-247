@@ -1,83 +1,146 @@
 import os
-import ccxt
+import time
+import hmac
+import hashlib
+from urllib.parse import urlencode
+import requests
+
+# Muat .env otomatis jika dijalankan di Terminal Lokal
+if os.path.exists(".env"):
+    with open(".env", "r", encoding="utf-8") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
 BINANCE_SECRET = os.getenv("BINANCE_SECRET", "").strip()
-BINANCE_DEMO_MODE = os.getenv("BINANCE_DEMO_MODE", "true").lower() == "true"
-AUTO_EXECUTE_BINANCE = os.getenv("AUTO_EXECUTE_BINANCE", "true").lower() == "true"
+
+# Endpoint resmi Binance Futures Demo Trading (demo.binance.com)
+BINANCE_DEMO_BASE_URLS = [
+    "https://demo-fapi.binance.com",
+    "https://testnet.binancefuture.com",
+]
 
 
-def _klien_binance_futures():
-    """Inisialisasi klien Binance USDⓈ-M Futures (Demo Trading atau Live)."""
+def _sign_request(params: dict, secret: str) -> str:
+    query = urlencode(params)
+    signature = hmac.new(
+        secret.encode("utf-8"),
+        query.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{query}&signature={signature}"
+
+
+def _binance_demo_request(method: str, path: str, params: dict | None = None, signed: bool = True) -> dict:
     if not BINANCE_API_KEY or not BINANCE_SECRET:
-        return None
+        return {"error": "BINANCE_API_KEY atau BINANCE_SECRET kosong di .env"}
 
-    ex = ccxt.binanceusdm({
-        "apiKey": BINANCE_API_KEY,
-        "secret": BINANCE_SECRET,
-        "enableRateLimit": True,
-        "options": {
-            "defaultType": "future",
-            "adjustForTimeDifference": True,
-        },
-    })
+    params = dict(params or {})
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+    last_err = ""
 
-    if BINANCE_DEMO_MODE:
-        if hasattr(ex, "enable_demo_trading"):
-            ex.enable_demo_trading(True)
-        else:
-            ex.set_sandbox_mode(True)
+    for base_url in BINANCE_DEMO_BASE_URLS:
+        try:
+            req_params = dict(params)
+            if signed:
+                req_params["timestamp"] = int(time.time() * 1000)
+                req_params["recvWindow"] = 10000
+                query_str = _sign_request(req_params, BINANCE_SECRET)
+                url = f"{base_url}{path}?{query_str}"
+                resp = requests.request(method, url, headers=headers, timeout=12)
+            else:
+                url = f"{base_url}{path}"
+                resp = requests.request(method, url, headers=headers, params=req_params, timeout=12)
 
-    return ex
+            data = resp.json()
+            if resp.status_code == 200:
+                if isinstance(data, dict):
+                    data["_base_url"] = base_url
+                return data
+            last_err = f"{base_url} HTTP {resp.status_code}: {data}"
+        except Exception as e:
+            last_err = f"{base_url} Error: {str(e)[:80]}"
+
+    return {"error": last_err}
 
 
-def _pilih_simbol_digital_gold(ex) -> str:
-    """Memilih kontrak emas digital di Binance Futures (XAU/USDT atau fallback PAXG/USDT)."""
-    try:
-        markets = ex.load_markets()
-        for kandidat in ("XAU/USDT:USDT", "XAU/USDT", "PAXG/USDT:USDT", "PAXG/USDT"):
-            if kandidat in markets:
-                return kandidat
-    except Exception:
-        pass
-    return "PAXG/USDT:USDT"
+def _cek_spread_futures(symbol: str, default_spread: float) -> float:
+    for base_url in BINANCE_DEMO_BASE_URLS:
+        try:
+            r = requests.get(f"{base_url}/fapi/v1/ticker/bookTicker", params={"symbol": symbol}, timeout=6)
+            if r.status_code == 200:
+                d = r.json()
+                bid = float(d.get("bidPrice", 0))
+                ask = float(d.get("askPrice", 0))
+                if bid > 0 and ask >= bid:
+                    return round(ask - bid, 4)
+        except Exception:
+            continue
+    return default_spread
+
+
+def _pilih_simbol_emas_binance() -> str:
+    for sym in ("XAUUSDT", "PAXGUSDT"):
+        for base_url in BINANCE_DEMO_BASE_URLS:
+            try:
+                r = requests.get(f"{base_url}/fapi/v1/ticker/price", params={"symbol": sym}, timeout=5)
+                if r.status_code == 200 and float(r.json().get("price", 0)) > 0:
+                    return sym
+            except Exception:
+                continue
+    return "PAXGUSDT"
 
 
 def ambil_info_akun_dan_spread() -> dict:
-    """Menarik saldo USDT aktual dan spread real-time Binance Demo untuk Digital Gold & BTC."""
-    ex = _klien_binance_futures()
-    if ex is None:
+    spread_btc = _cek_spread_futures("BTCUSDT", 1.0)
+    gold_sym = _pilih_simbol_emas_binance()
+    spread_gold = _cek_spread_futures(gold_sym, 0.25)
+
+    acc = _binance_demo_request("GET", "/fapi/v2/account", signed=True)
+    if "error" in acc:
+        print(f"[Binance Demo Warning] Gagal tarik saldo: {acc['error']}")
         return {
-            "status": "nonaktif",
-            "mode": "DEMO" if BINANCE_DEMO_MODE else "LIVE",
+            "connected": False,
+            "error": acc["error"],
             "usdt_total": 1000.0,
-            "spread_digital_gold": 0.25,
-            "spread_btc": 1.00,
-        }
-
-    try:
-        bal = ex.fetch_balance()
-        usdt_total = float(bal.get("USDT", {}).get("total", 1000.0))
-        usdt_free = float(bal.get("USDT", {}).get("free", usdt_total))
-
-        sym_gold = _pilih_simbol_digital_gold(ex)
-        ob_gold = ex.fetch_order_book(sym_gold, limit=5)
-        spread_gold = round(ob_gold["asks"][0][0] - ob_gold["bids"][0][0], 3) if ob_gold["asks"] and ob_gold["bids"] else 0.25
-
-        ob_btc = ex.fetch_order_book("BTC/USDT:USDT", limit=5)
-        spread_btc = round(ob_btc["asks"][0][0] - ob_btc["bids"][0][0], 2) if ob_btc["asks"] and ob_btc["bids"] else 1.00
-
-        return {
-            "status": "aktif",
-            "mode": "DEMO" if BINANCE_DEMO_MODE else "LIVE",
-            "usdt_total": round(usdt_total, 2),
-            "usdt_free": round(usdt_free, 2),
-            "binance_gold_symbol": sym_gold,
             "spread_digital_gold": spread_gold,
             "spread_btc": spread_btc,
         }
-    except Exception as e:
-        return {"status": "error", "detail": str(e), "usdt_total": 1000.0}
+
+    # Ambil Total Margin Balance (USDT + USDC + BTC dalam nilai USD)
+    margin_balance = float(acc.get("totalMarginBalance", 0.0))
+    wallet_balance = float(acc.get("totalWalletBalance", 0.0))
+    saldo_aktif = margin_balance if margin_balance > 0 else wallet_balance
+
+    return {
+        "connected": True,
+        "endpoint": acc.get("_base_url", "https://demo-fapi.binance.com"),
+        "usdt_total": round(saldo_aktif, 2),
+        "spread_digital_gold": spread_gold,
+        "spread_btc": spread_btc,
+    }
+
+
+def _aturan_presisi_simbol(symbol: str) -> tuple[int, int, float]:
+    for base_url in BINANCE_DEMO_BASE_URLS:
+        try:
+            r = requests.get(f"{base_url}/fapi/v1/exchangeInfo", timeout=8)
+            if r.status_code == 200:
+                for s in r.json().get("symbols", []):
+                    if s.get("symbol") == symbol:
+                        qty_prec = int(s.get("quantityPrecision", 3))
+                        price_prec = int(s.get("pricePrecision", 2))
+                        min_qty = 0.001
+                        for f in s.get("filters", []):
+                            if f.get("filterType") == "LOT_SIZE":
+                                min_qty = float(f.get("minQty", 0.001))
+                        return qty_prec, price_prec, min_qty
+        except Exception:
+            continue
+    return 3, 2, 0.001
 
 
 def proses_eksekusi_sinyal(
@@ -92,169 +155,125 @@ def proses_eksekusi_sinyal(
     layers: int = 1,
     leverage: int = 1,
 ) -> dict:
-    """
-    Routing eksekusi:
-    - 'XAUUSD' -> MANUAL_CFD_ONLY (kirim sinyal manual ke Telegram, tidak masuk order otomatis)
-    - 'XYZ:GOLD' / 'BTCUSDT' -> AUTO_EXECUTE di Binance Demo Futures
-    """
-    aset_up = aset.upper().strip()
-
-    # 1. Jalur Broker CFD (Manual Only)
-    if aset_up == "XAUUSD":
-        jarak_sl = abs(entry_price - sl_price)
-        lot_cfd = max(0.01, round(risk_usd / (jarak_sl * 100.0), 2)) if jarak_sl > 0 else 0.01
+    # XAUUSD murni tetap dikirim sebagai sinyal lot CFD manual untuk MT5/Exness
+    if aset.upper() == "XAUUSD":
+        sl_dist = max(abs(entry_price - sl_price), 1.0)
+        # 1 lot standar XAUUSD = $100 per $1 pergerakan harga
+        lot_cfd = max(0.01, round(risk_usd / (sl_dist * 100.0), 2))
         return {
-            "executed": False,
             "execution_type": "MANUAL_CFD_SIGNAL",
-            "symbol": "OANDA:XAUUSD",
-            "side": arah.upper(),
+            "asset": "XAUUSD",
+            "direction": arah,
             "suggested_lot_cfd": lot_cfd,
             "entry": entry_price,
             "sl": sl_price,
             "tp1": tp1,
             "tp2": tp2,
             "tp3": tp3,
-            "note": "Eksekusi manual di broker CFD sesuai chart OANDA/TradingView.",
         }
 
-    # 2. Jalur Binance Demo (Otomatis untuk XYZ:GOLD & BTCUSDT)
-    if not AUTO_EXECUTE_BINANCE:
-        return {"executed": False, "execution_type": "DISABLED", "reason": "AUTO_EXECUTE_BINANCE=false"}
+    exec_symbol = "BTCUSDT" if aset.upper() == "BTCUSDT" else _pilih_simbol_emas_binance()
+    qty_prec, price_prec, min_qty = _aturan_presisi_simbol(exec_symbol)
 
-    ex = _klien_binance_futures()
-    if ex is None:
-        return {"executed": False, "execution_type": "ERROR", "reason": "BINANCE_API_KEY / SECRET belum diisi"}
+    # Set leverage awal (1x sesuai SOP keamanan)
+    _binance_demo_request("POST", "/fapi/v1/leverage", {"symbol": exec_symbol, "leverage": max(1, int(leverage))}, signed=True)
 
-    side_entry = "buy" if arah.upper() == "BUY" else "sell"
-    side_exit = "sell" if side_entry == "buy" else "buy"
-    jarak_sl = abs(entry_price - sl_price)
-    if jarak_sl <= 0:
-        return {"executed": False, "execution_type": "ERROR", "reason": "Jarak SL tidak valid"}
+    sl_dist = max(abs(entry_price - sl_price), entry_price * 0.002)
+    total_qty = risk_usd / sl_dist
+    per_layer_qty = max(min_qty, round(total_qty / max(1, layers), qty_prec))
 
-    if aset_up in ("XYZ:GOLD", "XYZGOLD", "GOLD_DIGITAL", "PAXGUSDT"):
-        sym = _pilih_simbol_digital_gold(ex)
-    else:
-        sym = "BTC/USDT:USDT"
+    side_entry = "BUY" if arah.upper() == "BUY" else "SELL"
+    side_exit = "SELL" if side_entry == "BUY" else "BUY"
+    orders_sent = []
 
-    try:
-        ex.load_markets()
-        ex.set_leverage(max(1, min(5, leverage)), sym)
-    except Exception:
-        pass
+    for i in range(max(1, layers)):
+        res_order = _binance_demo_request(
+            "POST",
+            "/fapi/v1/order",
+            {
+                "symbol": exec_symbol,
+                "side": side_entry,
+                "type": "MARKET",
+                "quantity": per_layer_qty,
+            },
+            signed=True,
+        )
+        orders_sent.append({"layer": i + 1, "response": res_order})
 
-    # Sesuaikan harga entry jika simbol Binance memakai PAXG/USDT dengan selisih kecil dari xyz:GOLD
-    ticker = ex.fetch_ticker(sym)
-    harga_binance_now = float(ticker.get("last") or entry_price)
-    offset_harga = harga_binance_now - entry_price
+    # Pasang Hard Stop Loss & Take Profit 1 otomatis di server Binance Demo
+    sl_round = round(sl_price, price_prec)
+    tp1_round = round(tp1, price_prec)
 
-    total_qty_raw = risk_usd / jarak_sl
-    bobot_tp = [
-        ("TP1_40%", tp1 + offset_harga, 0.40),
-        ("TP2_40%", tp2 + offset_harga, 0.40),
-        ("TP3_RUNNER_20%", tp3 + offset_harga, 0.20),
-    ]
-    hasil = []
-    jml_layer = max(1, min(3, layers))
-
-    for layer_idx in range(jml_layer):
-        rasio_geser = 0.0 if layer_idx == 0 else (0.30 if layer_idx == 1 else 0.60)
-        harga_layer = (entry_price + offset_harga) - (rasio_geser * (entry_price - sl_price))
-        qty_layer_raw = total_qty_raw / jml_layer
-
-        try:
-            qty_layer = float(ex.amount_to_precision(sym, qty_layer_raw))
-            if qty_layer <= 0:
-                continue
-
-            if layer_idx == 0:
-                ord_in = ex.create_order(sym, "market", side_entry, qty_layer)
-            else:
-                px_lim = float(ex.price_to_precision(sym, harga_layer))
-                ord_in = ex.create_order(sym, "limit", side_entry, qty_layer, px_lim)
-
-            px_sl = float(ex.price_to_precision(sym, sl_price + offset_harga))
-            ex.create_order(
-                sym,
-                "STOP_MARKET",
-                side_exit,
-                qty_layer,
-                params={"stopPrice": px_sl, "reduceOnly": True},
-            )
-
-            for lbl, px_tp_raw, porsi in bobot_tp:
-                q_tp = float(ex.amount_to_precision(sym, qty_layer * porsi))
-                if q_tp <= 0:
-                    continue
-                px_tp = float(ex.price_to_precision(sym, px_tp_raw))
-                ex.create_order(
-                    sym,
-                    "TAKE_PROFIT_MARKET",
-                    side_exit,
-                    q_tp,
-                    params={"stopPrice": px_tp, "reduceOnly": True},
-                )
-
-            hasil.append({"symbol": sym, "layer": layer_idx + 1, "qty": qty_layer, "order_id": ord_in.get("id")})
-        except Exception as e:
-            hasil.append({"symbol": sym, "layer": layer_idx + 1, "error": str(e)})
+    res_sl = _binance_demo_request(
+        "POST",
+        "/fapi/v1/order",
+        {
+            "symbol": exec_symbol,
+            "side": side_exit,
+            "type": "STOP_MARKET",
+            "stopPrice": sl_round,
+            "closePosition": "true",
+        },
+        signed=True,
+    )
+    res_tp = _binance_demo_request(
+        "POST",
+        "/fapi/v1/order",
+        {
+            "symbol": exec_symbol,
+            "side": side_exit,
+            "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": tp1_round,
+            "closePosition": "true",
+        },
+        signed=True,
+    )
 
     return {
-        "executed": True,
         "execution_type": "BINANCE_DEMO_AUTO",
-        "mode": "DEMO" if BINANCE_DEMO_MODE else "LIVE",
-        "source_signal": aset_up,
-        "executed_symbol": sym,
-        "orders": hasil,
+        "executed_symbol": exec_symbol,
+        "direction": side_entry,
+        "qty_per_layer": per_layer_qty,
+        "orders": orders_sent,
+        "sl_order": res_sl,
+        "tp1_order": res_tp,
     }
-def kelola_auto_breakeven_binance() -> list:
-    """Memeriksa posisi aktif di Binance Demo; jika profit >= 50% jarak TP1, geser SL ke Breakeven."""
-    ex = _klien_binance_futures()
-    if ex is None:
-        return []
 
-    aksi_be = []
-    try:
-        positions = ex.fetch_positions()
-        for pos in positions:
-            contracts = float(pos.get("contracts") or 0)
-            if contracts <= 0:
-                continue
 
-            sym = pos.get("symbol")
-            side = pos.get("side", "").lower()
-            entry_px = float(pos.get("entryPrice") or 0)
-            mark_px = float(pos.get("markPrice") or 0)
-            if entry_px <= 0 or mark_px <= 0:
-                continue
+def kelola_auto_breakeven_binance() -> list[str]:
+    actions = []
+    pos_data = _binance_demo_request("GET", "/fapi/v2/positionRisk", signed=True)
+    if not isinstance(pos_data, list):
+        return actions
 
-            open_orders = ex.fetch_open_orders(sym)
-            sl_orders = [o for o in open_orders if o.get("type", "").upper() == "STOP_MARKET"]
-            tp_orders = [o for o in open_orders if o.get("type", "").upper() == "TAKE_PROFIT_MARKET"]
-            if not sl_orders or not tp_orders:
-                continue
+    for p in pos_data:
+        amt = float(p.get("positionAmt", 0.0))
+        if amt == 0.0:
+            continue
+        sym = p.get("symbol", "")
+        entry = float(p.get("entryPrice", 0.0))
+        mark = float(p.get("markPrice", 0.0))
+        if entry <= 0 or mark <= 0:
+            continue
 
-            sl_order = sl_orders[0]
-            sl_now = float(sl_order.get("stopPrice") or 0)
-            tp_prices = [float(o.get("stopPrice") or 0) for o in tp_orders if float(o.get("stopPrice") or 0) > 0]
-            if not tp_prices:
-                continue
-
-            if side == "long" and sl_now < entry_px:
-                tp1_px = min(tp_prices)
-                if mark_px >= entry_px + 0.50 * (tp1_px - entry_px):
-                    be_px = float(ex.price_to_precision(sym, entry_px * 1.0005))
-                    ex.cancel_order(sl_order["id"], sym)
-                    ex.create_order(sym, "STOP_MARKET", "sell", contracts, params={"stopPrice": be_px, "reduceOnly": True})
-                    aksi_be.append(f"{sym} LONG SL -> BE ({be_px})")
-
-            elif side == "short" and sl_now > entry_px:
-                tp1_px = max(tp_prices)
-                if mark_px <= entry_px - 0.50 * (entry_px - tp1_px):
-                    be_px = float(ex.price_to_precision(sym, entry_px * 0.9995))
-                    ex.cancel_order(sl_order["id"], sym)
-                    ex.create_order(sym, "STOP_MARKET", "buy", contracts, params={"stopPrice": be_px, "reduceOnly": True})
-                    aksi_be.append(f"{sym} SHORT SL -> BE ({be_px})")
-    except Exception:
-        pass
-
-    return aksi_be
+        profit_pct = ((mark - entry) / entry * 100.0) if amt > 0 else ((entry - mark) / entry * 100.0)
+        # Jika posisi sudah profit >= 0.8%, geser SL ke titik impas (Breakeven)
+        if profit_pct >= 0.8:
+            _, price_prec, _ = _aturan_presisi_simbol(sym)
+            be_price = round(entry * (1.0005 if amt > 0 else 0.9995), price_prec)
+            side_exit = "SELL" if amt > 0 else "BUY"
+            res = _binance_demo_request(
+                "POST",
+                "/fapi/v1/order",
+                {
+                    "symbol": sym,
+                    "side": side_exit,
+                    "type": "STOP_MARKET",
+                    "stopPrice": be_price,
+                    "closePosition": "true",
+                },
+                signed=True,
+            )
+            if "orderId" in res:
+                actions.append(f"{sym} SL -> BE ({be_price})")
+    return actions
