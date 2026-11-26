@@ -12,3 +12,4 @@ feedparser
 requests
 flask
 metaapi-cloud-sdk
+git+https://github.com/rongardF/tvdatafeed.git
