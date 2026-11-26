@@ -1,272 +1,250 @@
 import os
 from datetime import datetime, timezone, timedelta
 import requests
-import pandas as pd
 import yfinance as yf
 
 FRED_API_KEY = os.getenv("FRED_API_KEY", "").strip()
 CMC_API_KEY = os.getenv("CMC_API_KEY", "").strip()
-FCS_API_KEY = os.getenv("FCS_API_KEY", "").strip()
-
-WIB = timezone(timedelta(hours=7))
 
 
 # ==============================================================================
-# 1. MAKRO & INTERMARKET (DXY, US10Y, S&P500, NASDAQ, VIX, SILVER, USOIL, FRED)
+# 1. DATA MAKRO INTERMARKET (YAHOO FINANCE + FRED US02Y & REAL YIELD)
 # ==============================================================================
+def _ambil_fred_series(series_id: str) -> dict:
+    if not FRED_API_KEY:
+        return {"last": 0.0, "chg_pct": 0.0, "source": "BELUM_DISET"}
+    try:
+        url = (
+            f"https://api.stlouisfed.org/fred/series/observations"
+            f"?series_id={series_id}&api_key={FRED_API_KEY}&file_type=json&sort_order=desc&limit=5"
+        )
+        r = requests.get(url, timeout=10).json()
+        obs = [o for o in r.get("observations", []) if o.get("value") not in (".", None, "")]
+        if len(obs) >= 2:
+            last_v = float(obs[0]["value"])
+            prev_v = float(obs[1]["value"])
+            chg = ((last_v - prev_v) / abs(prev_v) * 100.0) if prev_v != 0 else 0.0
+            return {"last": round(last_v, 3), "chg_pct": round(chg, 2), "source": "FRED_API"}
+    except Exception:
+        pass
+    return {"last": 0.0, "chg_pct": 0.0, "source": "ERROR"}
+
+
 def ambil_data_makro() -> dict:
-    """Menarik DXY, US10Y, S&P500, NASDAQ, VIX, Silver, dan USOIL (WTI) secara real-time."""
     tickers = {
         "DXY": "DX-Y.NYB",
         "US10Y": "^TNX",
-        "SP500": "^GSPC",
-        "NASDAQ": "^IXIC",
-        "VIX": "^VIX",
-        "SILVER": "SI=F",
         "USOIL": "CL=F",
+        "SILVER": "SI=F",
+        "VIX": "^VIX",
+        "NASDAQ": "^IXIC",
+        "SP500": "^GSPC",
     }
     hasil = {}
     for nama, kode in tickers.items():
         try:
-            df = yf.download(kode, period="5d", interval="1d", progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df = df.dropna(subset=["Close"])
-            if len(df) >= 2:
-                prev_c = float(df["Close"].iloc[-2])
-                last_c = float(df["Close"].iloc[-1])
-                chg_pct = ((last_c - prev_c) / prev_c) * 100.0
-                hasil[nama] = {"last": round(last_c, 3), "chg_pct": round(chg_pct, 2)}
-            elif len(df) == 1:
-                hasil[nama] = {"last": round(float(df["Close"].iloc[-1]), 3), "chg_pct": 0.0}
+            hist = yf.Ticker(kode).history(period="5d", interval="1d")
+            if len(hist) >= 2:
+                last_px = float(hist["Close"].iloc[-1])
+                prev_px = float(hist["Close"].iloc[-2])
+                chg_pct = ((last_px - prev_px) / prev_px * 100.0) if prev_px != 0 else 0.0
+                hasil[nama] = {"last": round(last_px, 3), "chg_pct": round(chg_pct, 2)}
+            elif len(hist) == 1:
+                hasil[nama] = {"last": round(float(hist["Close"].iloc[-1]), 3), "chg_pct": 0.0}
             else:
                 hasil[nama] = {"last": 0.0, "chg_pct": 0.0}
         except Exception:
             hasil[nama] = {"last": 0.0, "chg_pct": 0.0}
 
-    # Spread Yield Obligasi AS 10Y - 2Y (T10Y2Y) dari FRED API
-    if FRED_API_KEY:
-        try:
-            url = (
-                f"https://api.stlouisfed.org/fred/series/observations"
-                f"?series_id=T10Y2Y&api_key={FRED_API_KEY}&file_type=json&sort_order=desc&limit=1"
-            )
-            r = requests.get(url, timeout=8).json()
-            obs = r.get("observations", [])
-            if obs and obs[0].get("value") != ".":
-                hasil["FRED_T10Y2Y"] = float(obs[0]["value"])
-        except Exception:
-            pass
-
+    # Tambahan data resmi Federal Reserve (FRED): US02Y & 10Y Real Yield
+    hasil["US02Y"] = _ambil_fred_series("DGS2")
+    hasil["REAL_YIELD_10Y"] = _ambil_fred_series("DFII10")
     return hasil
 
 
 # ==============================================================================
-# 2. FILTER KALENDER EKONOMI (RED FOLDER NEWS BLACKOUT +/- 60 MENIT)
+# 2. DERIVATIF BTC (OKX PUBLIC ORDERFLOW), CFTC COT & LIKUIDITAS KRIPTO
 # ==============================================================================
-def cek_kalender_ekonomi_high_impact(window_menit: int = 60) -> dict:
-    """
-    Mendeteksi jadwal berita ekonomi High-Impact (NFP, CPI, FOMC, PCE, Rate Decision)
-    dalam jendela +/- 60 menit untuk mencegah entry saat volatilitas liar.
-    """
-    now_utc = datetime.now(timezone.utc)
-    event_aktif = []
+def _ambil_btc_orderflow_okx() -> dict:
+    """Menarik OI Change % dan Taker Buy/Sell Ratio BTC dari OKX Public API (bebas geoblock US)."""
+    oi_chg_pct = 0.0
+    taker_ratio = 1.0
+    sumber = "DEFAULT"
 
-    # Jalur 1: FCS API Economic Calendar (jika FCS_API_KEY diisi)
-    if FCS_API_KEY:
+    try:
+        # 1. Open Interest & Volume 1H
+        url_oi = "https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-volume?ccy=BTC&period=1H"
+        r_oi = requests.get(url_oi, timeout=10).json()
+        data_oi = r_oi.get("data", [])
+        if len(data_oi) >= 5:
+            oi_now = float(data_oi[0][1])
+            oi_4h_ago = float(data_oi[4][1])
+            if oi_4h_ago > 0:
+                oi_chg_pct = round(((oi_now - oi_4h_ago) / oi_4h_ago) * 100.0, 2)
+                sumber = "OKX_PUBLIC_API"
+    except Exception:
+        pass
+
+    try:
+        # 2. Taker Buy/Sell Volume 1H
+        url_tk = "https://www.okx.com/api/v5/rubik/stat/taker-volume?ccy=BTC&instType=CONTRACTS&period=1H"
+        r_tk = requests.get(url_tk, timeout=10).json()
+        data_tk = r_tk.get("data", [])
+        if data_tk:
+            sell_vol = float(data_tk[0][1])
+            buy_vol = float(data_tk[0][2])
+            if sell_vol > 0:
+                taker_ratio = round(buy_vol / sell_vol, 3)
+                sumber = "OKX_PUBLIC_API"
+    except Exception:
+        pass
+
+    if taker_ratio >= 1.08 and oi_chg_pct > 0:
+        bias = "AGGRESSIVE_BUY_BUILDUP"
+    elif taker_ratio <= 0.92 and oi_chg_pct > 0:
+        bias = "AGGRESSIVE_SELL_BUILDUP"
+    elif taker_ratio > 1.03:
+        bias = "MODERATE_BUY_FLOW"
+    elif taker_ratio < 0.97:
+        bias = "MODERATE_SELL_FLOW"
+    else:
+        bias = "NEUTRAL"
+
+    return {
+        "orderflow_bias": bias,
+        "oi_change_pct": oi_chg_pct,
+        "taker_buy_sell_ratio": taker_ratio,
+        "source": sumber,
+    }
+
+
+def _ambil_cftc_gold_cot() -> dict:
+    try:
+        url = (
+            "https://publicreporting.cftc.gov/resource/72hh-3qpy.json"
+            "?$where=cftc_contract_market_code='088691'"
+            "&$order=report_date_as_yyyy_mm_dd DESC&$limit=2"
+        )
+        rows = requests.get(url, timeout=12).json()
+        if rows:
+            latest = rows[0]
+            long_mm = int(float(latest.get("m_money_positions_long_all", 0)))
+            short_mm = int(float(latest.get("m_money_positions_short_all", 0)))
+            net_now = long_mm - short_mm
+
+            net_prev = net_now
+            if len(rows) >= 2:
+                prev = rows[1]
+                net_prev = int(float(prev.get("m_money_positions_long_all", 0))) - int(
+                    float(prev.get("m_money_positions_short_all", 0))
+                )
+
+            if net_now > 0 and net_now >= net_prev:
+                bias = "BULLISH_ACCUMULATION"
+            elif net_now > 0:
+                bias = "BULLISH_TRIMMING"
+            elif net_now < 0 and net_now <= net_prev:
+                bias = "BEARISH_EXPANSION"
+            else:
+                bias = "BEARISH_COVERING"
+
+            return {
+                "gold_cot_bias": bias,
+                "gold_managed_money_net": net_now,
+                "report_date": latest.get("report_date_as_yyyy_mm_dd", ""),
+            }
+    except Exception:
+        pass
+    return {"gold_cot_bias": "NEUTRAL", "gold_managed_money_net": 0, "report_date": ""}
+
+
+def _ambil_crypto_liquidity_dan_fng() -> dict:
+    btc_d, usdt_d, total3_b = 0.0, 0.0, 0.0
+    fng_val, fng_label = 50, "Neutral"
+
+    try:
+        g = requests.get("https://api.coingecko.com/api/v3/global", timeout=10).json().get("data", {})
+        mcap_pct = g.get("market_cap_percentage", {})
+        total_mcap = float(g.get("total_market_cap", {}).get("usd", 0.0))
+        btc_d = round(float(mcap_pct.get("btc", 0.0)), 2)
+        eth_d = float(mcap_pct.get("eth", 0.0))
+        usdt_d = round(float(mcap_pct.get("usdt", 0.0)), 2)
+        if total_mcap > 0:
+            total3_usd = total_mcap * max(0.0, (100.0 - btc_d - eth_d) / 100.0)
+            total3_b = round(total3_usd / 1e9, 2)
+    except Exception:
+        pass
+
+    # Crypto Fear & Greed (CoinMarketCap API -> cadangan Alternative.me)
+    fng_ok = False
+    if CMC_API_KEY:
         try:
-            tgl = now_utc.strftime("%Y-%m-%d")
-            url = f"https://fcsapi.com/api-v3/forex/economy_cal?symbol=USD&from={tgl}&to={tgl}&access_key={FCS_API_KEY}"
-            resp = requests.get(url, timeout=8).json()
-            for item in resp.get("response", []):
-                imp = str(item.get("importance", "")).lower()
-                if imp in ("high", "3"):
-                    dt_str = item.get("date", "")
-                    try:
-                        ev_dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                        selisih_menit = abs((ev_dt - now_utc).total_seconds()) / 60.0
-                        if selisih_menit <= window_menit:
-                            event_aktif.append(f"{item.get('title')} ({int(selisih_menit)}m)")
-                    except Exception:
-                        continue
+            r_cmc = requests.get(
+                "https://pro-api.coinmarketcap.com/v3/fear-and-greed/latest",
+                headers={"X-CMC_PRO_API_KEY": CMC_API_KEY},
+                timeout=8,
+            ).json()
+            d_cmc = r_cmc.get("data", {})
+            if "value" in d_cmc:
+                fng_val = int(d_cmc["value"])
+                fng_label = d_cmc.get("value_classification", "Neutral")
+                fng_ok = True
         except Exception:
             pass
 
-    # Jalur 2: Public ForexFactory JSON Mirror (Gratis tanpa API key)
-    if not event_aktif:
+    if not fng_ok:
         try:
-            ff = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=8).json()
-            if isinstance(ff, list):
-                for ev in ff:
-                    if str(ev.get("country", "")).upper() == "USD" and str(ev.get("impact", "")).lower() == "high":
-                        date_iso = ev.get("date", "")
-                        try:
-                            ev_dt = datetime.fromisoformat(date_iso).astimezone(timezone.utc)
-                            selisih_menit = abs((ev_dt - now_utc).total_seconds()) / 60.0
-                            if selisih_menit <= window_menit:
-                                event_aktif.append(f"{ev.get('title')} ({int(selisih_menit)}m)")
-                        except Exception:
-                            continue
+            r_alt = requests.get("https://api.alternative.me/fng/?limit=1", timeout=8).json()
+            d_alt = r_alt.get("data", [{}])[0]
+            if "value" in d_alt:
+                fng_val = int(d_alt["value"])
+                fng_label = d_alt.get("value_classification", "Neutral")
         except Exception:
             pass
 
     return {
-        "news_blackout": len(event_aktif) > 0,
-        "high_impact_events": event_aktif,
-        "window_minutes": window_menit,
+        "btc_dominance": btc_d,
+        "usdt_dominance": usdt_d,
+        "total3_usd_b": total3_b,
+        "fear_greed_index": fng_val,
+        "fear_greed_label": fng_label,
     }
-
-
-# ==============================================================================
-# 3. ORDERFLOW DERIVATIF PUBLIK BINANCE (GRATIS TANPA API KEY)
-# ==============================================================================
-def ambil_orderflow_binance_publik(symbol: str = "BTCUSDT") -> dict:
-    """
-    Menarik Open Interest, Top Trader Long/Short Ratio, dan Taker Buy/Sell Volume
-    langsung dari endpoint publik Binance Futures.
-    """
-    base = "https://fapi.binance.com/futures/data"
-    hasil = {
-        "symbol": symbol,
-        "oi_change_pct": 0.0,
-        "top_trader_ls_ratio": 1.0,
-        "taker_buy_sell_ratio": 1.0,
-        "orderflow_bias": "NEUTRAL",
-    }
-    try:
-        r_oi = requests.get(f"{base}/openInterestHist?symbol={symbol}&period=1h&limit=2", timeout=8).json()
-        if isinstance(r_oi, list) and len(r_oi) >= 2:
-            oi_prev = float(r_oi[-2]["sumOpenInterestValue"])
-            oi_curr = float(r_oi[-1]["sumOpenInterestValue"])
-            if oi_prev > 0:
-                hasil["oi_change_pct"] = round(((oi_curr - oi_prev) / oi_prev) * 100.0, 2)
-    except Exception:
-        pass
-
-    try:
-        r_ls = requests.get(f"{base}/topLongShortPositionRatio?symbol={symbol}&period=1h&limit=1", timeout=8).json()
-        if isinstance(r_ls, list) and len(r_ls) >= 1:
-            hasil["top_trader_ls_ratio"] = round(float(r_ls[-1]["longShortRatio"]), 3)
-    except Exception:
-        pass
-
-    try:
-        r_tk = requests.get(f"{base}/takerlongshortRatio?symbol={symbol}&period=1h&limit=1", timeout=8).json()
-        if isinstance(r_tk, list) and len(r_tk) >= 1:
-            hasil["taker_buy_sell_ratio"] = round(float(r_tk[-1]["buySellRatio"]), 3)
-    except Exception:
-        pass
-
-    # Klasifikasi tekanan Orderflow
-    taker = hasil["taker_buy_sell_ratio"]
-    oi_chg = hasil["oi_change_pct"]
-    if taker >= 1.12 and oi_chg > 0:
-        hasil["orderflow_bias"] = "STRONG_BUY_FLOW"
-    elif taker <= 0.88 and oi_chg > 0:
-        hasil["orderflow_bias"] = "STRONG_SELL_FLOW"
-    elif taker >= 1.05:
-        hasil["orderflow_bias"] = "BUY_LEAN"
-    elif taker <= 0.95:
-        hasil["orderflow_bias"] = "SELL_LEAN"
-
-    return hasil
-
-
-# ==============================================================================
-# 4. LAPORAN POSISI INSTITUSI CFTC COT REPORT (GRATIS TANPA API KEY)
-# ==============================================================================
-def ambil_laporan_cot_cftc() -> dict:
-    """
-    Menarik data CFTC Commitments of Traders (Disaggregated Futures) untuk Emas COMEX (088691)
-    guna membaca arah posisi bersih Hedge Fund / Managed Money mingguan.
-    """
-    cot = {"gold_managed_money_net": 0, "gold_cot_bias": "NEUTRAL", "report_date": "N/A"}
-    try:
-        url = (
-            "https://publicreporting.cftc.gov/resource/72hh-3qpy.json"
-            "?cftc_contract_market_code=088691&$order=report_date_as_yyyy_mm_dd DESC&$limit=2"
-        )
-        rows = requests.get(url, timeout=10).json()
-        if isinstance(rows, list) and len(rows) >= 1:
-            latest = rows[0]
-            mm_long = float(latest.get("m_money_positions_long_all", 0))
-            mm_short = float(latest.get("m_money_positions_short_all", 0))
-            net_curr = int(mm_long - mm_short)
-            cot["gold_managed_money_net"] = net_curr
-            cot["report_date"] = str(latest.get("report_date_as_yyyy_mm_dd", ""))[:10]
-
-            if len(rows) >= 2:
-                prev = rows[1]
-                net_prev = int(float(prev.get("m_money_positions_long_all", 0)) - float(prev.get("m_money_positions_short_all", 0)))
-                if net_curr > 0 and net_curr >= net_prev:
-                    cot["gold_cot_bias"] = "BULLISH_ACCUMULATION"
-                elif net_curr > 0 and net_curr < net_prev:
-                    cot["gold_cot_bias"] = "BULLISH_TRIMMING"
-                else:
-                    cot["gold_cot_bias"] = "BEARISH_DISTRIBUTION"
-    except Exception:
-        pass
-    return cot
-
-
-# ==============================================================================
-# 5. SENTIMEN, LIKUIDITAS KRIPTO LUAS (BTC.D, USDT.D, TOTAL3) & HYPERLIQUID
-# ==============================================================================
-def ambil_likuiditas_kripto_global() -> dict:
-    """Mengambil BTC Dominance, USDT Dominance, dan estimasi TOTAL3 (Altcoin Cap)."""
-    liq = {"btc_dominance": 0.0, "usdt_dominance": 0.0, "total3_usd_b": 0.0}
-    try:
-        cg = requests.get("https://api.coingecko.com/api/v3/global", timeout=8).json().get("data", {})
-        mcap_pct = cg.get("market_cap_percentage", {})
-        total_mcap = float(cg.get("total_market_cap", {}).get("usd", 0.0))
-        btc_d = float(mcap_pct.get("btc", 0.0))
-        eth_d = float(mcap_pct.get("eth", 0.0))
-        usdt_d = float(mcap_pct.get("usdt", 0.0))
-
-        liq["btc_dominance"] = round(btc_d, 2)
-        liq["usdt_dominance"] = round(usdt_d, 2)
-        if total_mcap > 0:
-            total3 = total_mcap * max(0.0, (100.0 - btc_d - eth_d)) / 100.0
-            liq["total3_usd_b"] = round(total3 / 1e9, 2)
-    except Exception:
-        pass
-    return liq
 
 
 def ambil_metrik_derivatif_dan_sentimen() -> dict:
-    """Menggabungkan Fear & Greed, Funding/OI Hyperliquid xyz:GOLD, Binance Orderflow, COT, dan Kripto Global."""
-    info = {
-        "fear_greed_value": 50,
-        "fear_greed_label": "Neutral",
-        "xyz_gold_funding": 0.0,
-        "xyz_gold_oi": 0.0,
+    return {
+        "btc_orderflow": _ambil_btc_orderflow_okx(),
+        "cftc_cot": _ambil_cftc_gold_cot(),
+        "crypto_liquidity": _ambil_crypto_liquidity_dan_fng(),
     }
-    try:
-        fg = requests.get("https://api.alternative.me/fng/?limit=1", timeout=8).json()
-        data_fg = fg.get("data", [{}])[0]
-        info["fear_greed_value"] = int(data_fg.get("value", 50))
-        info["fear_greed_label"] = data_fg.get("value_classification", "Neutral")
-    except Exception:
-        pass
 
-    try:
-        hl = requests.post(
-            "https://api.hyperliquid.xyz/info",
-            json={"type": "metaAndAssetCtxs", "dex": "xyz"},
-            timeout=8,
-        ).json()
-        if isinstance(hl, list) and len(hl) >= 2:
-            universe = hl[0].get("universe", [])
-            ctxs = hl[1]
-            for idx, meta in enumerate(universe):
-                if meta.get("name") == "xyz:GOLD" and idx < len(ctxs):
-                    info["xyz_gold_funding"] = round(float(ctxs[idx].get("funding", 0.0)) * 100.0, 5)
-                    info["xyz_gold_oi"] = round(float(ctxs[idx].get("openInterest", 0.0)), 2)
-                    break
-    except Exception:
-        pass
 
-    info["btc_orderflow"] = ambil_orderflow_binance_publik("BTCUSDT")
-    info["cftc_cot"] = ambil_laporan_cot_cftc()
-    info["crypto_liquidity"] = ambil_likuiditas_kripto_global()
-    return info
+# ==============================================================================
+# 3. KALENDER EKONOMI HIGH IMPACT (FOREXFACTORY JSON FEED)
+# ==============================================================================
+def cek_kalender_ekonomi_high_impact(window_menit: int = 60) -> dict:
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        events = requests.get(url, timeout=10).json()
+        now_utc = datetime.now(timezone.utc)
+        high_events = []
+
+        for ev in events:
+            if ev.get("impact") != "High":
+                continue
+            if ev.get("country") not in ("USD", "EUR", "GBP", "JPY"):
+                continue
+            dt_str = ev.get("date", "")
+            if not dt_str:
+                continue
+            ev_dt = datetime.fromisoformat(dt_str).astimezone(timezone.utc)
+            selisih_menit = abs((ev_dt - now_utc).total_seconds()) / 60.0
+            if selisih_menit <= window_menit:
+                high_events.append(f"{ev.get('country')} - {ev.get('title')}")
+
+        return {
+            "news_blackout": len(high_events) > 0,
+            "high_impact_events": high_events,
+        }
+    except Exception:
+        return {"news_blackout": False, "high_impact_events": []}
