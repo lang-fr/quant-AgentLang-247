@@ -3,7 +3,7 @@ name: Run Quant Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */4 * * *' # Jalan setiap 4 jam (selaras pergantian sesi Asia, London, NY)
+    - cron: '0 */4 * * *'
 
 permissions:
   contents: write
@@ -20,7 +20,8 @@ jobs:
       - run: pip install -r requirements.txt
       - env:
           RUN_MODE: GITHUB_ACTIONS
-          AUTO_EXECUTE_DEMO: "false"
+          BINANCE_DEMO_MODE: "true"
+          AUTO_EXECUTE_BINANCE: "true"
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
@@ -29,10 +30,9 @@ jobs:
           BLOCKWORKS_API_KEY: ${{ secrets.BLOCKWORKS_API_KEY }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           CMC_API_KEY: ${{ secrets.CMC_API_KEY }}
-          METAAPI_TOKEN: ${{ secrets.METAAPI_TOKEN }}
-          METAAPI_ACCOUNT_ID: ${{ secrets.METAAPI_ACCOUNT_ID }}
-          BINANCE_TESTNET_API_KEY: ${{ secrets.BINANCE_TESTNET_API_KEY }}
-          BINANCE_TESTNET_SECRET: ${{ secrets.BINANCE_TESTNET_SECRET }}
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
         run: python main.py
       - name: Simpan Database Audit SQLite ke Repo
         if: always()
