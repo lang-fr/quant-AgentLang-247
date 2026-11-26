@@ -33,7 +33,10 @@ jobs:
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
           BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
           OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
-        run: python main.py
+      - name: Jalankan Verifier dan AI Quant Bot
+        run: |
+          python outcome_verifier.py
+          python main.py
       - name: Simpan Database Audit SQLite ke Repo
         if: always()
         run: |
