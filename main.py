@@ -1358,6 +1358,15 @@ def jalankan_analisa_lengkap(
     skills_aktif = pilih_skills_konteks(mode_fokus=mode_fokus, sesi_target=sesi_aktif)
     macro_snap = json.dumps(data_makro.get("harga_terakhir", {}))
 
+    # Jalankan verifikasi TP/SL sinyal lama, Auto-BE MT5, dan hitung koordinat SMC + Anti-Korelasi
+    update_outcome = verifikasi_hasil_sinyal_sebelumnya()
+    update_be = kelola_auto_breakeven_mt5()
+    winrate_empiris = ambil_statistik_winrate_sesi()
+    info_akun_mt5 = ambil_info_akun_mt5()
+    korelasi_ganda = cek_anti_korelasi_ganda(threshold=0.80)
+    smc_xau = analisa_smc_matematis("GC=F", "XAUUSD")
+    smc_btc = analisa_smc_matematis("BTC-USD", "BTCUSDT")
+    
     ringkas_data_untuk_ai = {
         "harga_live": live_prices_ctx,
         "sesi_dan_spread": {"sesi": sesi_aktif, "mode_fokus": mode_fokus, "spread_xau_pips": spread_aktif},
