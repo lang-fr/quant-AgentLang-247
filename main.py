@@ -2,7 +2,9 @@ import os
 import sys
 import time
 import json
+import threading
 import sqlite3
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
 import requests
 
@@ -27,7 +29,28 @@ EST = timezone(timedelta(hours=-5))
 
 
 # ==============================================================================
-# 1. DATABASE AUDIT SQLITE, STATE TELEGRAM & RISK GATEKEEPER
+# 1. HEALTH CHECK SERVER (UNTUK KOYEB / CLOUD 24/7 WORKER)
+# ==============================================================================
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"AgentLang 24/7 Realtime Bot OK")
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+    port = int(os.getenv("PORT", "8080"))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+
+# ==============================================================================
+# 2. DATABASE AUDIT SQLITE, MEMORI CHAT & RISK GATEKEEPER
 # ==============================================================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -68,6 +91,14 @@ def init_db():
             value TEXT
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS chat_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT,
+            message TEXT,
+            timestamp_wib TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -96,6 +127,36 @@ def set_bot_state(key: str, value: str):
         conn.close()
     except Exception:
         pass
+
+
+def simpan_riwayat_chat(role: str, message: str):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        now_str = datetime.now(WIB).strftime("%H:%M WIB")
+        cur.execute(
+            "INSERT INTO chat_history (role, message, timestamp_wib) VALUES (?, ?, ?)",
+            (role, message[:1500], now_str),
+        )
+        cur.execute("DELETE FROM chat_history WHERE id NOT IN (SELECT id FROM chat_history ORDER BY id DESC LIMIT 12)")
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def ambil_riwayat_chat() -> str:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT role, message, timestamp_wib FROM chat_history ORDER BY id DESC LIMIT 6")
+        rows = list(reversed(cur.fetchall()))
+        conn.close()
+        if not rows:
+            return "Belum ada riwayat chat sebelumnya."
+        return "\n".join(f"[{r[2]}] {r[0]}: {r[1]}" for r in rows)
+    except Exception:
+        return "Belum ada riwayat chat sebelumnya."
 
 
 def hitung_dynamic_half_kelly_risk(session_name: str, total_score: int, regime: str = "TRENDING") -> float:
@@ -222,7 +283,9 @@ def simpan_log_audit(record: dict):
 
 
 # ==============================================================================
-# 2. MULTI-LLM ENGINE (AUTO-DISCOVERY MODEL AKTIF CLAUDE, GEMINI & GROQ)
+# 3. ROUTING MODEL AI:
+#    - ANALISA SETUP 3-AGEN : CLAUDE -> GEMINI 4 HYDROGEN / PRO -> GROQ
+#    - CHAT NGOBROL BIASA   : GEMINI FLASH-LITE / FLASH (CEPAT & HEMAT)
 # ==============================================================================
 def _ekstrak_json_bersih(teks: str) -> dict:
     teks = teks.strip()
@@ -280,51 +343,63 @@ def _panggil_claude(prompt: str, max_tokens: int = 2048) -> tuple[str, str, str]
     return "", "", f"Claude ({err_terakhir})"
 
 
-def _daftar_model_gemini_aktif() -> list[str]:
-    kandidat = [
-        "gemini-3.8-flash",
-        "gemini-3.5-flash-lite",
-        "gemini-3.5-flash",
-        "gemini-3-flash",
-        "gemini-2.5-flash",
-    ]
+def _daftar_model_gemini_terurut(untuk_analisa_berat: bool = True) -> list[str]:
+    if untuk_analisa_berat:
+        prioritas = [
+            "gemini-4-hydrogen",
+            "gemini-2.5-pro",
+            "gemini-3.5-pro",
+            "gemini-2.5-flash",
+            "gemini-3.5-flash-lite",
+        ]
+    else:
+        prioritas = [
+            "gemini-3.5-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+        ]
+
     try:
         r = requests.get(
             f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}",
-            timeout=10,
+            timeout=8,
         )
         if r.status_code == 200:
+            tersedia = []
             for m in r.json().get("models", []):
                 if "generateContent" in m.get("supportedGenerationMethods", []):
                     nama = m.get("name", "").replace("models/", "")
-                    if nama and "embedding" not in nama and "imagen" not in nama and nama not in kandidat:
-                        kandidat.append(nama)
+                    if nama and "embedding" not in nama and "imagen" not in nama:
+                        tersedia.append(nama)
+            hasil = [p for p in prioritas if p in tersedia]
+            for t in tersedia:
+                if t not in hasil:
+                    hasil.append(t)
+            if hasil:
+                return hasil
     except Exception:
         pass
-    return kandidat
+    return prioritas
 
 
-def _panggil_gemini_chat(prompt: str, mode_json: bool = False, mode_biasa: bool = True) -> tuple[str, str, str]:
+def _panggil_gemini(prompt: str, untuk_analisa_berat: bool = False) -> tuple[str, str, str]:
     if not GEMINI_API_KEY:
         return "", "", "GEMINI_API_KEY kosong"
     err_terakhir = ""
-    for model_gem in _daftar_model_gemini_aktif():
+    for model_gem in _daftar_model_gemini_terurut(untuk_analisa_berat=untuk_analisa_berat):
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_gem}:generateContent"
             headers = {
                 "x-goog-api-key": GEMINI_API_KEY,
                 "Content-Type": "application/json",
             }
-            gen_cfg = {
-                "temperature": 0.35 if mode_biasa else 0.15,
-                "maxOutputTokens": 2048 if mode_biasa else 4096,
-            }
-            if mode_json:
-                gen_cfg["responseMimeType"] = "application/json"
-
             payload = {
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": gen_cfg,
+                "generationConfig": {
+                    "temperature": 0.15 if untuk_analisa_berat else 0.45,
+                    "maxOutputTokens": 4096 if untuk_analisa_berat else 1500,
+                },
             }
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 200:
@@ -333,11 +408,11 @@ def _panggil_gemini_chat(prompt: str, mode_json: bool = False, mode_biasa: bool 
                     p.get("text", "") for p in parts if not p.get("thought", False)
                 ).strip()
                 if teks_hasil:
-                    label = f"{model_gem} (Chat)" if mode_biasa else f"{model_gem} (Analisa)"
-                    return teks_hasil, label, ""
+                    tag = "Analisa Setup" if untuk_analisa_berat else "Chat Biasa"
+                    return teks_hasil, f"Gemini {model_gem} ({tag})", ""
             else:
                 err_terakhir = f"HTTP {resp.status_code}"
-                if resp.status_code in (400, 401, 403):
+                if resp.status_code in (401, 403):
                     break
         except Exception as e:
             err_terakhir = str(e)[:70]
@@ -345,34 +420,11 @@ def _panggil_gemini_chat(prompt: str, mode_json: bool = False, mode_biasa: bool 
     return "", "", f"Gemini ({err_terakhir})"
 
 
-def _daftar_model_groq_aktif() -> list[str]:
-    kandidat = [
-        "meta-llama/llama-4-scout-17b-16e-instruct",
-        "meta-llama/llama-4-maverick-17b-128e-instruct",
-        "openai/gpt-oss-120b",
-        "moonshotai/kimi-k2-instruct",
-    ]
-    try:
-        r = requests.get(
-            "https://api.groq.com/openai/v1/models",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            timeout=10,
-        )
-        if r.status_code == 200:
-            for m in r.json().get("data", []):
-                mid = m.get("id", "")
-                if mid and "whisper" not in mid and "guard" not in mid and "tts" not in mid and mid not in kandidat:
-                    kandidat.append(mid)
-    except Exception:
-        pass
-    return kandidat
-
-
 def _panggil_groq(prompt: str, mode_json: bool = False) -> tuple[str, str, str]:
     if not GROQ_API_KEY:
         return "", "", "GROQ_API_KEY kosong"
     err_terakhir = ""
-    for model_groq in _daftar_model_groq_aktif():
+    for model_groq in ("openai/gpt-oss-120b", "meta-llama/llama-4-scout-17b-16e-instruct"):
         try:
             url = "https://api.groq.com/openai/v1/chat/completions"
             headers = {
@@ -382,7 +434,7 @@ def _panggil_groq(prompt: str, mode_json: bool = False) -> tuple[str, str, str]:
             payload = {
                 "model": model_groq,
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.25 if not mode_json else 0.15,
+                "temperature": 0.15 if mode_json else 0.4,
             }
             if mode_json:
                 payload["response_format"] = {"type": "json_object"}
@@ -393,53 +445,69 @@ def _panggil_groq(prompt: str, mode_json: bool = False) -> tuple[str, str, str]:
                     return txt, f"Groq {model_groq}", ""
             else:
                 err_terakhir = f"HTTP {resp.status_code}"
-                if resp.status_code == 401:
-                    break
         except Exception as e:
             err_terakhir = str(e)[:70]
             continue
     return "", "", f"Groq ({err_terakhir})"
 
 
-def panggil_llm_teks(prompt: str, mode_json: bool = False) -> tuple[str, str, str]:
+def panggil_ai_analisa_setup(prompt: str) -> tuple[str, str, str]:
+    """Khusus Analisa Setup 3-Agen: Claude -> Gemini 4 Hydrogen / Pro -> Groq."""
     errors = []
-    if mode_json:
-        urutan = (
-            lambda: _panggil_claude(prompt, max_tokens=2048),
-            lambda: _panggil_gemini_chat(prompt, mode_json=True, mode_biasa=False),
-            lambda: _panggil_groq(prompt, mode_json=True),
-        )
-    else:
-        urutan = (
-            lambda: _panggil_gemini_chat(prompt, mode_json=False, mode_biasa=True),
-            lambda: _panggil_claude(prompt, max_tokens=1500),
-            lambda: _panggil_groq(prompt, mode_json=False),
-        )
-
-    for fn in urutan:
+    for fn in (
+        lambda: _panggil_claude(prompt, max_tokens=2048),
+        lambda: _panggil_gemini(prompt, untuk_analisa_berat=True),
+        lambda: _panggil_groq(prompt, mode_json=True),
+    ):
         txt, model_name, err = fn()
         if txt:
             return txt, model_name, ""
         if err:
             errors.append(err)
-
     return "", "Fallback Deterministik", " | ".join(errors)
 
 
+def panggil_ai_chat_biasa(prompt: str) -> tuple[str, str, str]:
+    """Khusus Ngobrol Biasa di Telegram: Gemini Flash-Lite / Flash (ringan & cepat)."""
+    errors = []
+    for fn in (
+        lambda: _panggil_gemini(prompt, untuk_analisa_berat=False),
+        lambda: _panggil_groq(prompt, mode_json=False),
+        lambda: _panggil_claude(prompt, max_tokens=1200),
+    ):
+        txt, model_name, err = fn()
+        if txt:
+            return txt, model_name, ""
+        if err:
+            errors.append(err)
+    return "", "Offline", " | ".join(errors)
+
+
+# ==============================================================================
+# 4. BLOCKWORKS TABULAR ASSETS API (SESUAI PAKET CREDITS AKUNMU)
+# ==============================================================================
 def ambil_riset_blockworks() -> str:
     if not BLOCKWORKS_API_KEY:
         return "BELUM DITARIK"
     try:
-        headers = {"Authorization": f"Bearer {BLOCKWORKS_API_KEY}"}
-        r = requests.get("https://api.blockworks.com/v1/research?limit=2", headers=headers, timeout=8)
+        headers = {
+            "x-api-key": BLOCKWORKS_API_KEY,
+            "Content-Type": "application/json",
+        }
+        # Sesuai endpoint aktif di dashboard Blockworks: Tabular - Assets (query-engine)
+        url = "https://api.blockworks.com/v1/assets/metrics?assets=BTC,ETH,SOL&limit=3"
+        r = requests.get(url, headers=headers, timeout=10)
         if r.status_code == 200:
-            items = r.json().get("data", [])
-            if items:
-                judul = [it.get("title", "") for it in items if it.get("title")]
-                return " | ".join(judul)[:220]
+            data = r.json()
+            return f"Blockworks Tabular Assets OK ({str(data)[:160]}) [Blockworks API]"
+        # Cadangan endpoint query-engine tabular
+        url_q = "https://api.blockworks.com/v1/query-engine/tabular/assets"
+        r2 = requests.post(url_q, headers=headers, json={"assets": ["BTC", "ETH"]}, timeout=10)
+        if r2.status_code == 200:
+            return f"Blockworks Query-Engine OK ({str(r2.json())[:160]}) [Blockworks API]"
+        return f"API Aktif (Endpoint HTTP {r.status_code} - siap via MCP/Query)"
     except Exception:
-        pass
-    return "API Aktif (Tidak ada rilis baru)"
+        return "API Aktif (Standby)"
 
 
 def evaluasi_critical_thinking_3_agen(
@@ -467,7 +535,7 @@ Analisa data live pasar di bawah ini secara kritis, objektif, dan tanpa mengaran
 
 {json.dumps(konteks)}
 
-Balas HANYA dalam JSON valid dengan struktur persis berikut:
+Balas HANYA dalam JSON valid (tanpa teks tambahan di luar JSON) dengan struktur persis berikut:
 {{
   "gold_bias": "BUY" atau "SELL" atau "NEUTRAL",
   "gold_sentiment_score": angka bulat 0 sampai 20,
@@ -483,7 +551,7 @@ Balas HANYA dalam JSON valid dengan struktur persis berikut:
   "ringkasan_risk_judge": "Keputusan akhir Risk Judge (eksekusi atau tahan) beserta alasan utamanya"
 }}
 """
-    txt, model_dipakai, err_llm = panggil_llm_teks(prompt, mode_json=True)
+    txt, model_dipakai, err_llm = panggil_ai_analisa_setup(prompt)
     if txt:
         try:
             hasil_llm = _ekstrak_json_bersih(txt)
@@ -515,7 +583,7 @@ Balas HANYA dalam JSON valid dengan struktur persis berikut:
 
 
 # ==============================================================================
-# 3. MESIN PEMBOBOTAN SKOR KONFLUENSI (0 - 100 POIN) + REGIME FILTER
+# 5. MESIN PEMBOBOTAN SKOR KONFLUENSI (0 - 100 POIN) + REGIME FILTER
 # ==============================================================================
 def hitung_skor_konfluensi(
     aset: str,
@@ -725,7 +793,7 @@ def hitung_skor_konfluensi(
 
 
 # ==============================================================================
-# 4. TELEGRAM INTERAKTIF (BISA DIAJAK CHAT BIASA & TANYA ANALISA REALTIME)
+# 6. TELEGRAM INTERAKTIF (CHAT NGOBROL BIASA + FULL SCAN REALTIME)
 # ==============================================================================
 def kirim_telegram(pesan: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -793,44 +861,50 @@ def balas_chat_telegram_interaktif(ringkasan_data_live: str = "", poll_timeout: 
         if not pesan_user_list:
             return
 
-        # Jika user mengetik /scan atau /analisa, langsung jalankan analisa lengkap!
-        if any(p.lower() in ("/scan", "/analisa", "scan sekarang") for p in pesan_user_list):
-            kirim_telegram("Siap, menjalankan full scan 3-Agen & SMC sekarang...")
+        if any(p.lower() in ("/scan", "/analisa", "scan sekarang", "analisa sekarang") for p in pesan_user_list):
+            kirim_telegram("Siap bro, menjalankan full scan 3-Agen & SMC sekarang...")
             jalankan_analisa_lengkap(cek_chat_lagi=False)
             return
 
-        gabungan_chat = "\n".join(f"- {p}" for p in pesan_user_list[-3:])
+        gabungan_chat = "\n".join(pesan_user_list[-3:])
+        simpan_riwayat_chat("User", gabungan_chat)
+
         konteks_laporan = ringkasan_data_live or get_bot_state("last_market_report", "")
+        riwayat_sebelumnya = ambil_riwayat_chat()
         harga_cepat = _ambil_snapshot_harga_cepat()
         waktu_skrg = datetime.now(WIB).strftime("%Y-%m-%d %H:%M WIB")
 
         prompt_chat = f"""
-Kamu adalah AI Quant Trading Assistant (AgentLang) di Telegram.
-Gaya bicara: santai tapi tajam, natural seperti rekan diskusi trading profesional.
+Kamu adalah AgentLang, partner diskusi & asisten AI Quant pribadi di Telegram.
+Gaya bicara: santai, nyambung, lugas, cerdas seperti rekan diskusi trading profesional (boleh pakai 'bro' atau gaya bahasa user).
 
 WAKTU SEKARANG: {waktu_skrg}
 SNAPSHOT LIVE CEPAT: {harga_cepat}
-LAPORAN ANALISA TERAKHIR SISTEM:
-{konteks_laporan[:3200] if konteks_laporan else "[Belum ada laporan siklus terakhir]"}
+RIWAYAT OBROLAN TERAKHIR:
+{riwayat_sebelumnya}
 
-PESAN DARI USER:
+LAPORAN ANALISA MARKET TERAKHIR:
+{konteks_laporan[:3000] if konteks_laporan else "[Belum ada laporan siklus terakhir]"}
+
+PESAN BARU DARI USER:
 {gabungan_chat}
 
 ATURAN JAWABAN:
-1. Jika user menyapa, curhat, atau tanya biasa/konsep/status bot, jawab langsung dengan santai, jelas, dan enak diajak ngobrol.
-2. Jika user menanyakan arah market / setup entry (seperti XAUUSD, BTCUSDT, DXY), sertakan:
+1. Jika user menyapa ('bro', 'halo', 'tes'), curhat, atau tanya hal umum/konsep trading/cara kerja bot, jawab secara natural, ramah, dan langsung nyambung seperti chat biasa.
+2. Jika user menanyakan analisa market / arah pair (XAUUSD, BTCUSDT, DXY, dll), sertakan:
    - Arah Bias (BULLISH / BEARISH / WAIT)
    - Reason Utama (struktur SMC/FVG/OB, ADX regime, orderflow, makro) + Bukti Sumber Data spesifik (jangan mengarang angka!)
    - Skenario Entry, SL, TP, dan Syarat Invalidasi.
-3. Jangan pakai simbol markdown (*, _, #) supaya teks bersih di Telegram.
+3. Jangan pakai simbol markdown (*, _, #) supaya tampilan chat Telegram bersih.
 """
-        jawaban, model_chat, err_chat = panggil_llm_teks(prompt_chat, mode_json=False)
+        jawaban, model_chat, err_chat = panggil_ai_chat_biasa(prompt_chat)
         if jawaban:
+            simpan_riwayat_chat("AgentLang", jawaban)
             kirim_telegram(f"AgentLang ({model_chat}):\n\n{jawaban}")
         else:
             kirim_telegram(
                 f"AgentLang (Mode Cadangan):\n"
-                f"Pesan diterima, tapi semua API AI gagal ({err_chat}).\n"
+                f"Pesan masuk, tapi koneksi chat AI lagi kendala ({err_chat}).\n"
                 f"Data live: {harga_cepat}"
             )
     except Exception as e:
@@ -843,9 +917,10 @@ def jalankan_mode_chat_saja():
 
 
 def jalankan_bot_realtime_247():
-    """Mode server 24/7: balas chat Telegram < 2 detik + analisa penuh tiap 4 jam."""
+    """Mode server 24/7 (Koyeb / PC): balas chat Telegram < 2 detik + analisa penuh tiap 4 jam."""
     init_db()
-    kirim_telegram("AgentLang 24/7 Realtime Mode AKTIF. Silakan chat kapan saja (ketik /scan untuk analisa penuh).")
+    start_health_server()
+    kirim_telegram("AgentLang 24/7 Realtime Mode AKTIF. Sekarang bisa diajak chat kapan saja (ketik /scan untuk analisa full 3-Agen).")
     last_full_scan = 0.0
     while True:
         try:
@@ -980,7 +1055,7 @@ def jalankan_analisa_lengkap(cek_chat_lagi: bool = True):
     lines = [
         f"QUANT AI CONFLUENCE & 3-AGENT REPORT",
         f"Waktu: {kz['wib_str']} | Sesi: {kz['session']} ({kz['killzone_label']})",
-        f"AI Analisa: {llm_view.get('model_used', 'Claude/Multi-LLM')} | Binance Demo: ${equity:,.2f} (DD: {risk_gate['dd_pct']}%)",
+        f"AI Analisa: {llm_view.get('model_used', 'Claude/Gemini')} | Binance Demo: ${equity:,.2f} (DD: {risk_gate['dd_pct']}%)",
         f"Kalender Ekonomi: {news_status}",
         f"----------------------------------------",
         f"1. MAKRO, ORDERFLOW & CFTC COT",
