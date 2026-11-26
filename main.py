@@ -321,7 +321,21 @@ def hitung_skor_konfluensi(
     spread_usd: float,
 ) -> dict:
     if "error" in smc_data or "error" in smc_data.get("daily_ohlc", {}):
-        return {"asset": aset, "total_score": 0, "valid_setup": False, "reason": "Data chart tidak lengkap"}
+        return {
+            "asset": aset,
+            "data_source": smc_data.get("data_source", "ERROR"),
+            "direction": "NEUTRAL",
+            "total_score": 0,
+            "breakdown": {"macro": 0, "sentiment": 0, "ohlc_ote": 0, "smc_kz": 0},
+            "sweep_mss": "NONE/NONE",
+            "valid_setup": False,
+            "blocked_reason": smc_data.get("error", "Data chart tidak lengkap"),
+            "entry": 0.0,
+            "sl": 0.0,
+            "tp1": 0.0,
+            "tp2": 0.0,
+            "tp3": 0.0,
+        }
 
     ohlc = smc_data["daily_ohlc"]
     ote = smc_data.get("fibonacci_ote_h1", {})
