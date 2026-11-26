@@ -488,26 +488,29 @@ def panggil_ai_chat_biasa(prompt: str) -> tuple[str, str, str]:
 # ==============================================================================
 def ambil_riset_blockworks() -> str:
     if not BLOCKWORKS_API_KEY:
-        return "BELUM DITARIK"
+        return "BELUM DITARIK (BLOCKWORKS_API_KEY kosong di .env)"
     try:
-        headers = {
-            "x-api-key": BLOCKWORKS_API_KEY,
-            "Content-Type": "application/json",
+        headers_baru = {
+            "X-Blockworks-API-Key": BLOCKWORKS_API_KEY,
+            "Accept": "application/json",
         }
-        # Sesuai endpoint aktif di dashboard Blockworks: Tabular - Assets (query-engine)
-        url = "https://api.blockworks.com/v1/assets/metrics?assets=BTC,ETH,SOL&limit=3"
-        r = requests.get(url, headers=headers, timeout=10)
+        url_tabular = "https://api.blockworks.com/query/tabular/assets?limit=3"
+        r = requests.get(url_tabular, headers=headers_baru, timeout=10)
         if r.status_code == 200:
-            data = r.json()
-            return f"Blockworks Tabular Assets OK ({str(data)[:160]}) [Blockworks API]"
-        # Cadangan endpoint query-engine tabular
-        url_q = "https://api.blockworks.com/v1/query-engine/tabular/assets"
-        r2 = requests.post(url_q, headers=headers, json={"assets": ["BTC", "ETH"]}, timeout=10)
-        if r2.status_code == 200:
-            return f"Blockworks Query-Engine OK ({str(r2.json())[:160]}) [Blockworks API]"
-        return f"API Aktif (Endpoint HTTP {r.status_code} - siap via MCP/Query)"
-    except Exception:
-        return "API Aktif (Standby)"
+            return f"Blockworks Tabular OK ({str(r.json())[:160]}) [Blockworks Data API]"
+
+        # Cadangan endpoint Legacy jika key berasal dari akun Blockworks Research lama
+        r_legacy = requests.get(
+            "https://api.blockworks.com/v1/assets/metrics?assets=BTC,ETH,SOL&limit=3",
+            headers={"x-api-key": BLOCKWORKS_API_KEY},
+            timeout=10,
+        )
+        if r_legacy.status_code == 200:
+            return f"Blockworks Legacy OK ({str(r_legacy.json())[:160]}) [Blockworks API]"
+
+        return f"Blockworks HTTP {r.status_code}: {r.text[:90]}"
+    except Exception as e:
+        return f"Blockworks Error: {str(e)[:80]}"
 
 
 def evaluasi_critical_thinking_3_agen(
