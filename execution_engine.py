@@ -206,3 +206,55 @@ def proses_eksekusi_sinyal(
         "executed_symbol": sym,
         "orders": hasil,
     }
+def kelola_auto_breakeven_binance() -> list:
+    """Memeriksa posisi aktif di Binance Demo; jika profit >= 50% jarak TP1, geser SL ke Breakeven."""
+    ex = _klien_binance_futures()
+    if ex is None:
+        return []
+
+    aksi_be = []
+    try:
+        positions = ex.fetch_positions()
+        for pos in positions:
+            contracts = float(pos.get("contracts") or 0)
+            if contracts <= 0:
+                continue
+
+            sym = pos.get("symbol")
+            side = pos.get("side", "").lower()
+            entry_px = float(pos.get("entryPrice") or 0)
+            mark_px = float(pos.get("markPrice") or 0)
+            if entry_px <= 0 or mark_px <= 0:
+                continue
+
+            open_orders = ex.fetch_open_orders(sym)
+            sl_orders = [o for o in open_orders if o.get("type", "").upper() == "STOP_MARKET"]
+            tp_orders = [o for o in open_orders if o.get("type", "").upper() == "TAKE_PROFIT_MARKET"]
+            if not sl_orders or not tp_orders:
+                continue
+
+            sl_order = sl_orders[0]
+            sl_now = float(sl_order.get("stopPrice") or 0)
+            tp_prices = [float(o.get("stopPrice") or 0) for o in tp_orders if float(o.get("stopPrice") or 0) > 0]
+            if not tp_prices:
+                continue
+
+            if side == "long" and sl_now < entry_px:
+                tp1_px = min(tp_prices)
+                if mark_px >= entry_px + 0.50 * (tp1_px - entry_px):
+                    be_px = float(ex.price_to_precision(sym, entry_px * 1.0005))
+                    ex.cancel_order(sl_order["id"], sym)
+                    ex.create_order(sym, "STOP_MARKET", "sell", contracts, params={"stopPrice": be_px, "reduceOnly": True})
+                    aksi_be.append(f"{sym} LONG SL -> BE ({be_px})")
+
+            elif side == "short" and sl_now > entry_px:
+                tp1_px = max(tp_prices)
+                if mark_px <= entry_px - 0.50 * (entry_px - tp1_px):
+                    be_px = float(ex.price_to_precision(sym, entry_px * 0.9995))
+                    ex.cancel_order(sl_order["id"], sym)
+                    ex.create_order(sym, "STOP_MARKET", "buy", contracts, params={"stopPrice": be_px, "reduceOnly": True})
+                    aksi_be.append(f"{sym} SHORT SL -> BE ({be_px})")
+    except Exception:
+        pass
+
+    return aksi_be
