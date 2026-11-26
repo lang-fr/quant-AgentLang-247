@@ -1,22 +1,9 @@
 import os
+import sys
 import json
 import sqlite3
 from datetime import datetime, timezone, timedelta
 import requests
-
-from market_feeds import (
-    ambil_data_makro,
-    ambil_metrik_derivatif_dan_sentimen,
-    cek_kalender_ekonomi_high_impact,
-)
-from smc_alpha import analisa_smc_matematis, cek_anti_korelasi_ganda
-from execution_engine import ambil_info_akun_dan_spread, proses_eksekusi_sinyal
-
-try:
-    from execution_engine import kelola_auto_breakeven_binance
-except ImportError:
-    def kelola_auto_breakeven_binance():
-        return []
 
 # ==============================================================================
 # KONFIGURASI ENVIRONMENT & KONSTANTA RISIKO
@@ -84,7 +71,7 @@ def init_db():
     conn.close()
 
 
-def get_bot_state(key: str, default: str = "0") -> str:
+def get_bot_state(key: str, default: str = "") -> str:
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
@@ -111,7 +98,6 @@ def set_bot_state(key: str, value: str):
 
 
 def hitung_dynamic_half_kelly_risk(session_name: str, total_score: int, regime: str = "TRENDING") -> float:
-    # Jika pasar RANGING (ADX < 20), turunkan risiko ke 0.5% sesuai SOP institusional
     if regime == "RANGING":
         return 0.005
 
@@ -235,7 +221,7 @@ def simpan_log_audit(record: dict):
 
 
 # ==============================================================================
-# 2. MULTI-LLM ENGINE: CLAUDE (ANALISA) & GEMINI 4 HYDROGEN (CHAT) + GROQ
+# 2. MULTI-LLM ENGINE: CLAUDE (ANALISA) & GEMINI 2.5 FLASH (CHAT) + GROQ
 # ==============================================================================
 def _ekstrak_json_bersih(teks: str) -> dict:
     teks = teks.strip()
@@ -252,10 +238,17 @@ def _ekstrak_json_bersih(teks: str) -> dict:
     return json.loads(teks)
 
 
-def _panggil_claude(prompt: str, max_tokens: int = 2048) -> tuple[str, str]:
+def _panggil_claude(prompt: str, max_tokens: int = 2048) -> tuple[str, str, str]:
     if not ANTHROPIC_API_KEY:
-        return "", ""
-    for model_claude in ("claude-sonnet-4-5", "claude-3-5-sonnet-latest"):
+        return "", "", "ANTHROPIC_API_KEY kosong"
+    err_terakhir = ""
+    for model_claude in (
+        "claude-sonnet-4-5-20250929",
+        "claude-sonnet-4-5",
+        "claude-3-7-sonnet-20250219",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-haiku-20241022",
+    ):
         try:
             url = "https://api.anthropic.com/v1/messages"
             headers = {
@@ -273,51 +266,57 @@ def _panggil_claude(prompt: str, max_tokens: int = 2048) -> tuple[str, str]:
             if resp.status_code == 200:
                 txt = resp.json()["content"][0]["text"].strip()
                 if txt:
-                    return txt, f"Anthropic {model_claude}"
-        except Exception:
+                    return txt, f"Anthropic {model_claude}", ""
+            else:
+                err_terakhir = f"HTTP {resp.status_code}"
+        except Exception as e:
+            err_terakhir = str(e)[:80]
             continue
-    return "", ""
+    return "", "", f"Claude gagal ({err_terakhir})"
 
 
-def _panggil_gemini_hydrogen(prompt: str, mode_json: bool = False, mode_biasa: bool = True) -> tuple[str, str]:
+def _panggil_gemini_chat(prompt: str, mode_json: bool = False, mode_biasa: bool = True) -> tuple[str, str, str]:
     if not GEMINI_API_KEY:
-        return "", ""
-    try:
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent"
-        headers = {
-            "x-goog-api-key": GEMINI_API_KEY,
-            "Content-Type": "application/json",
-        }
-        gen_cfg = {
-            "temperature": 0.2 if mode_biasa else 0.15,
-            "maxOutputTokens": 4096 if mode_biasa else 16384,
-        }
-        if not mode_biasa:
-            gen_cfg["thinkingConfig"] = {"thinkingLevel": "HIGH"}
-        if mode_json:
-            gen_cfg["responseMimeType"] = "application/json"
+        return "", "", "GEMINI_API_KEY kosong"
+    err_terakhir = ""
+    for model_gem in ("gemini-2.5-flash", "gemini-2.0-flash"):
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_gem}:generateContent"
+            headers = {
+                "x-goog-api-key": GEMINI_API_KEY,
+                "Content-Type": "application/json",
+            }
+            gen_cfg = {
+                "temperature": 0.35 if mode_biasa else 0.15,
+                "maxOutputTokens": 2048 if mode_biasa else 4096,
+            }
+            if mode_json:
+                gen_cfg["responseMimeType"] = "application/json"
 
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": gen_cfg,
-        }
-        resp = requests.post(url, headers=headers, json=payload, timeout=35)
-        if resp.status_code == 200:
-            parts = resp.json()["candidates"][0]["content"]["parts"]
-            teks_hasil = "".join(
-                p.get("text", "") for p in parts if not p.get("thought", False)
-            ).strip()
-            if teks_hasil:
-                label = "Gemini 4 Hydrogen (Chat)" if mode_biasa else "Gemini 4 Hydrogen (Failover Analisa)"
-                return teks_hasil, label
-    except Exception:
-        pass
-    return "", ""
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": gen_cfg,
+            }
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
+            if resp.status_code == 200:
+                parts = resp.json()["candidates"][0]["content"]["parts"]
+                teks_hasil = "".join(
+                    p.get("text", "") for p in parts if not p.get("thought", False)
+                ).strip()
+                if teks_hasil:
+                    label = f"{model_gem} (Chat)" if mode_biasa else f"{model_gem} (Analisa)"
+                    return teks_hasil, label, ""
+            else:
+                err_terakhir = f"HTTP {resp.status_code}"
+        except Exception as e:
+            err_terakhir = str(e)[:80]
+            continue
+    return "", "", f"Gemini gagal ({err_terakhir})"
 
 
-def _panggil_groq(prompt: str, mode_json: bool = False) -> tuple[str, str]:
+def _panggil_groq(prompt: str, mode_json: bool = False) -> tuple[str, str, str]:
     if not GROQ_API_KEY:
-        return "", ""
+        return "", "", "GROQ_API_KEY kosong"
     try:
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {
@@ -327,7 +326,7 @@ def _panggil_groq(prompt: str, mode_json: bool = False) -> tuple[str, str]:
         payload = {
             "model": "llama-3.3-70b-versatile",
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.15,
+            "temperature": 0.25 if not mode_json else 0.15,
         }
         if mode_json:
             payload["response_format"] = {"type": "json_object"}
@@ -335,37 +334,40 @@ def _panggil_groq(prompt: str, mode_json: bool = False) -> tuple[str, str]:
         if resp.status_code == 200:
             txt = resp.json()["choices"][0]["message"]["content"].strip()
             if txt:
-                return txt, "Groq Llama-3.3-70B"
-    except Exception:
-        pass
-    return "", ""
+                return txt, "Groq Llama-3.3-70B", ""
+        return "", "", f"Groq gagal (HTTP {resp.status_code})"
+    except Exception as e:
+        return "", "", f"Groq gagal ({str(e)[:80]})"
 
 
-def panggil_llm_teks(prompt: str, mode_json: bool = False) -> tuple[str, str]:
+def panggil_llm_teks(prompt: str, mode_json: bool = False) -> tuple[str, str, str]:
     """
-    - mode_json=True (ANALISA 3-AGEN): Claude -> Gemini 4 Hydrogen -> Groq
-    - mode_json=False (CHATBOT TELEGRAM): Gemini 4 Hydrogen (model biasa) -> Claude -> Groq
+    - mode_json=True (ANALISA 3-AGEN): Claude -> Gemini 2.5 Flash -> Groq
+    - mode_json=False (CHATBOT TELEGRAM): Gemini 2.5 Flash -> Claude -> Groq
+    Mengembalikan: (teks_jawaban, nama_model, catatan_error_jika_semua_gagal)
     """
+    errors = []
     if mode_json:
-        for fn in (
+        urutan = (
             lambda: _panggil_claude(prompt, max_tokens=2048),
-            lambda: _panggil_gemini_hydrogen(prompt, mode_json=True, mode_biasa=False),
+            lambda: _panggil_gemini_chat(prompt, mode_json=True, mode_biasa=False),
             lambda: _panggil_groq(prompt, mode_json=True),
-        ):
-            txt, model_name = fn()
-            if txt:
-                return txt, model_name
+        )
     else:
-        for fn in (
-            lambda: _panggil_gemini_hydrogen(prompt, mode_json=False, mode_biasa=True),
+        urutan = (
+            lambda: _panggil_gemini_chat(prompt, mode_json=False, mode_biasa=True),
             lambda: _panggil_claude(prompt, max_tokens=1500),
             lambda: _panggil_groq(prompt, mode_json=False),
-        ):
-            txt, model_name = fn()
-            if txt:
-                return txt, model_name
+        )
 
-    return "", "Fallback Deterministik"
+    for fn in urutan:
+        txt, model_name, err = fn()
+        if txt:
+            return txt, model_name, ""
+        if err:
+            errors.append(err)
+
+    return "", "Fallback Deterministik", " | ".join(errors)
 
 
 def ambil_riset_blockworks() -> str:
@@ -414,18 +416,18 @@ Balas HANYA dalam JSON valid dengan struktur persis berikut:
   "gold_bias": "BUY" atau "SELL" atau "NEUTRAL",
   "gold_sentiment_score": angka bulat 0 sampai 20,
   "gold_veto": true atau false,
-  "gold_reason": "Alasan utama arah Emas (struktur SMC/FVG/OB/Asian Sweep, ADX regime, DXY/US10Y, CFTC COT) + sebutkan sumber API-nya dalam 2 kalimat padat",
+  "gold_reason": "Alasan utama arah Emas (struktur SMC/FVG/OB/Asian Sweep, ADX regime, DXY/US10Y/US02Y, CFTC COT) + sebutkan sumber API-nya dalam 2 kalimat padat",
   "gold_invalidation": "Syarat harga/makro yang membatalkan setup Emas dalam 1 kalimat",
   "btc_bias": "BUY" atau "SELL" atau "NEUTRAL",
   "btc_sentiment_score": angka bulat 0 sampai 20,
   "btc_veto": true atau false,
-  "btc_reason": "Alasan utama arah BTCUSDT (struktur SMC/FVG/Asian Sweep, ADX regime, Binance Orderflow OI/Taker, BTC.D/USDT.D, NASDAQ) + sebutkan sumber API-nya dalam 2 kalimat padat",
+  "btc_reason": "Alasan utama arah BTCUSDT (struktur SMC/FVG/Asian Sweep, ADX regime, OKX Orderflow OI/Taker, BTC.D/USDT.D, NASDAQ) + sebutkan sumber API-nya dalam 2 kalimat padat",
   "btc_invalidation": "Syarat harga/makro yang membatalkan setup BTCUSDT dalam 1 kalimat",
   "kritik_devils_advocate": "Kritik terkuat Agen Skeptis terhadap risiko jebakan likuiditas / divergensi makro sesi ini",
   "ringkasan_risk_judge": "Keputusan akhir Risk Judge (eksekusi atau tahan) beserta alasan utamanya"
 }}
 """
-    txt, model_dipakai = panggil_llm_teks(prompt, mode_json=True)
+    txt, model_dipakai, err_llm = panggil_llm_teks(prompt, mode_json=True)
     if txt:
         try:
             hasil_llm = _ekstrak_json_bersih(txt)
@@ -440,7 +442,7 @@ Balas HANYA dalam JSON valid dengan struktur persis berikut:
     cot_bias = derivatif.get("cftc_cot", {}).get("gold_cot_bias", "NEUTRAL")
     bias_fallback = "SELL" if dxy_chg > 0 else "BUY"
     return {
-        "model_used": "Fallback Deterministik",
+        "model_used": f"Fallback Deterministik ({err_llm})",
         "gold_bias": bias_fallback,
         "gold_sentiment_score": 12,
         "gold_veto": False,
@@ -449,7 +451,7 @@ Balas HANYA dalam JSON valid dengan struktur persis berikut:
         "btc_bias": bias_fallback,
         "btc_sentiment_score": 12,
         "btc_veto": False,
-        "btc_reason": f"Mengikuti korelasi DXY {dxy_chg:+.2f}% serta dominasi BTC.D/USDT.D (Sumber: CoinGecko Global API & Binance Public Orderflow).",
+        "btc_reason": f"Mengikuti korelasi DXY {dxy_chg:+.2f}% serta dominasi BTC.D/USDT.D (Sumber: CoinGecko Global API & OKX Public Orderflow).",
         "btc_invalidation": "Batal jika Taker Buy/Sell Ratio dan Open Interest berbalik berlawanan dari struktur H1.",
         "kritik_devils_advocate": "Waspadai false breakout (liquidity sweep) di batas sesi London-NY sebelum konfirmasi MSS.",
         "ringkasan_risk_judge": f"Konsensus mengikuti arus DXY ({dxy_chg:+.2f}%) sambil menunggu skor konfluensi >= {MIN_CONFLUENCE_SCORE}.",
@@ -609,11 +611,9 @@ def hitung_skor_konfluensi(
     elif aset.upper() != "XAUUSD":
         skor_smc_kz += 2
 
-    # Penalti Filter Rezim Pasar: Jika RANGING (ADX < 20), kurangi 10 poin agar tidak terjebak whipsaw
     penalti_regime = 10 if regime_info.get("regime") == "RANGING" else 0
     total_skor = max(0, (skor_makro + skor_sentimen + skor_ohlc_ote + skor_smc_kz) - penalti_regime)
 
-    # Kalkulasi Entry, Hard Stop-Loss, dan 3 Target Profit (1.5R, 2.5R, 4.0R)
     jarak_sl_dasar = max(rentang_harian * 0.25, last_px * (0.0025 if is_gold else 0.006))
     if arah == "BUY":
         sl_px = round(min(nl_px - (jarak_sl_dasar * 0.2), last_px - jarak_sl_dasar), 2)
@@ -673,7 +673,7 @@ def hitung_skor_konfluensi(
 
 
 # ==============================================================================
-# 4. TELEGRAM INTERAKTIF (GEMINI 4 HYDROGEN CHAT) & NOTIFIKASI LAPORAN
+# 4. TELEGRAM INTERAKTIF (BISA DIAJAK CHAT BIASA & TANYA ANALISA)
 # ==============================================================================
 def kirim_telegram(pesan: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -692,12 +692,33 @@ def kirim_telegram(pesan: str):
         print(f"Gagal kirim Telegram: {e}")
 
 
-def balas_chat_telegram_interaktif(ringkasan_data_live: str):
-    """Membaca pesan terbaru dari user di Telegram dan membalasnya via Gemini 4 Hydrogen (model biasa)."""
+def _ambil_snapshot_harga_cepat() -> str:
+    """Mengambil harga cepat DXY, BTCUSDT, dan Emas tanpa library berat untuk mode chat."""
+    ringkas = []
+    try:
+        r_btc = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr?symbol=BTCUSDT", timeout=6).json()
+        if "lastPrice" in r_btc:
+            ringkas.append(f"BTCUSDT Live: ${float(r_btc['lastPrice']):,.2f} ({float(r_btc['priceChangePercent']):+.2f}%) [Binance Vision]")
+    except Exception:
+        pass
+    try:
+        r_fg = requests.get("https://api.alternative.me/fng/?limit=1", timeout=6).json()
+        d_fg = r_fg.get("data", [{}])[0]
+        if "value" in d_fg:
+            ringkas.append(f"Crypto Fear & Greed: {d_fg['value']} ({d_fg['value_classification']}) [Alternative.me]")
+    except Exception:
+        pass
+    return " | ".join(ringkas) if ringkas else "Gunakan laporan audit terakhir di bawah."
+
+
+def balas_chat_telegram_interaktif(ringkasan_data_live: str = ""):
+    """Membaca semua chat masuk terbaru dari user di Telegram dan membalasnya secara natural & analitis."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
-    last_offset = int(get_bot_state("tg_last_update_id", "0"))
+    raw_offset = get_bot_state("tg_last_update_id", "0")
+    last_offset = int(raw_offset) if raw_offset.isdigit() else 0
+
     try:
         url_get = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={last_offset + 1}&timeout=3"
         resp = requests.get(url_get, timeout=10).json()
@@ -705,66 +726,96 @@ def balas_chat_telegram_interaktif(ringkasan_data_live: str):
         if not updates:
             return
 
-        pesan_terakhir = None
+        pesan_user_list = []
         max_uid = last_offset
         for upd in updates:
             uid = upd.get("update_id", 0)
             if uid > max_uid:
                 max_uid = uid
             msg = upd.get("message", {})
-            if str(msg.get("chat", {}).get("id")) == str(TELEGRAM_CHAT_ID) and msg.get("text"):
-                pesan_terakhir = msg["text"]
+            chat_id_msg = str(msg.get("chat", {}).get("id", ""))
+            teks_msg = msg.get("text", "").strip()
+            if chat_id_msg == str(TELEGRAM_CHAT_ID) and teks_msg:
+                pesan_user_list.append(teks_msg)
 
         set_bot_state("tg_last_update_id", str(max_uid))
 
-        if not pesan_terakhir:
+        if not pesan_user_list:
             return
 
+        gabungan_chat = "\n".join(f"- {p}" for p in pesan_user_list[-3:])
+        konteks_laporan = ringkasan_data_live or get_bot_state("last_market_report", "")
+        harga_cepat = _ambil_snapshot_harga_cepat()
+        waktu_skrg = datetime.now(WIB).strftime("%Y-%m-%d %H:%M WIB")
+
         prompt_chat = f"""
-Kamu adalah Chief Quantitative Strategist & Institutional SMC/Orderflow Analyst untuk sistem AgentLang.
-Jawab pertanyaan user di Telegram secara lugas, kritis, dan analitis berdasarkan DATA LIVE AKTUAL berikut:
+Kamu adalah AI Quant Trading Assistant (AgentLang) untuk CEO-mu di Telegram.
+Gaya bicara: santai tapi tajam, lugas, seperti partner trading profesional yang enak diajak ngobrol biasa maupun diskusi teknikal/makro.
 
-{ringkasan_data_live}
+WAKTU SEKARANG: {waktu_skrg}
+SNAPSHOT LIVE CEPAT: {harga_cepat}
+LAPORAN ANALISA TERAKHIR SISTEM:
+{konteks_laporan[:3200] if konteks_laporan else "[Belum ada laporan siklus terakhir]"}
 
-PERTANYAAN USER: "{pesan_terakhir}"
+PESAN DARI USER:
+{gabungan_chat}
 
-ATURAN WAJIB:
-1. Sebutkan arah bias (BULLISH / BEARISH / WAIT) secara tegas.
-2. Wajib sertakan REASON UTAMA (struktur harga/SMC/FVG/OB/Asian Sweep, ADX regime, orderflow/OI/funding, makro DXY/US10Y, kalender ekonomi).
-3. Wajib cantumkan BUKTI SUMBER DATA spesifik dari data di atas (atau beri label [PERLU DATA LIVE / BELUM DITARIK] jika datanya kosong—jangan mengarang angka).
-4. Sertakan SKENARIO & INVALIDASI (area pantau entry, SL, TP1-TP3, batas risiko/layer, dan syarat yang membatalkan setup).
-5. Jangan gunakan karakter markdown rumit (* atau _) agar tidak error di parser Telegram.
+ATURAN JAWABAN:
+1. Jika user menyapa atau bertanya hal umum/konsep trading/status bot, jawab langsung dengan ramah, jelas, dan to the point.
+2. Jika user menanyakan analisa pasar / setup entry (seperti XAUUSD, BTCUSDT, DXY, dll), WAJIB sertakan:
+   - Arah Bias (BULLISH / BEARISH / WAIT)
+   - Reason Utama (struktur SMC/FVG/OB, ADX regime, orderflow, makro DXY/US10Y)
+   - Bukti Sumber Data spesifik (sebutkan sumber API-nya atau tulis [PERLU DATA LIVE] jika belum ditarik—jangan mengarang angka!)
+   - Skenario Entry, SL, TP, dan Syarat Invalidasi.
+3. Jangan pakai simbol markdown (*, _, #) supaya teks rapi di Telegram.
 """
-        jawaban, model_chat = panggil_llm_teks(prompt_chat, mode_json=False)
+        jawaban, model_chat, err_chat = panggil_llm_teks(prompt_chat, mode_json=False)
         if jawaban:
+            kirim_telegram(f"AgentLang ({model_chat}):\n\n{jawaban}")
+        else:
             kirim_telegram(
-                f"RESPON CHAT AGENTLANG ({model_chat})\n"
-                f"Pertanyaan: {pesan_terakhir}\n"
-                f"----------------------------------------\n"
-                f"{jawaban}"
+                f"AgentLang (Mode Cadangan):\n"
+                f"Pesan kamu sudah diterima, tapi koneksi AI sedang bermasalah ({err_chat}).\n"
+                f"Data live saat ini: {harga_cepat}\n"
+                f"Cek kembali GEMINI_API_KEY / ANTHROPIC_API_KEY di GitHub Secrets."
             )
     except Exception as e:
         print(f"Telegram chat listener warning: {e}")
 
 
+def jalankan_mode_chat_saja():
+    """Mode cepat khusus membalas chat Telegram tanpa menunggu siklus analisa 4 jam."""
+    init_db()
+    balas_chat_telegram_interaktif()
+
+
 def jalankan_analisa_lengkap():
+    from market_feeds import (
+        ambil_data_makro,
+        ambil_metrik_derivatif_dan_sentimen,
+        cek_kalender_ekonomi_high_impact,
+    )
+    from smc_alpha import analisa_smc_matematis, cek_anti_korelasi_ganda
+    from execution_engine import ambil_info_akun_dan_spread, proses_eksekusi_sinyal
+
+    try:
+        from execution_engine import kelola_auto_breakeven_binance
+    except ImportError:
+        def kelola_auto_breakeven_binance():
+            return []
+
     init_db()
     kz = deteksi_sesi_dan_killzone()
 
-    # 1. Kelola Auto-Breakeven posisi aktif di Binance Demo
     be_actions = kelola_auto_breakeven_binance()
-
-    # 2. Tarik Info Akun, Ekuitas, dan Spread Binance Demo
     akun = ambil_info_akun_dan_spread()
     equity = float(akun.get("usdt_total", 1000.0))
     spread_gold = float(akun.get("spread_digital_gold", 0.25))
     spread_btc = float(akun.get("spread_btc", 1.00))
 
-    # 3. Cek Risk Gatekeeper & Filter Kalender Ekonomi Red Folder
     risk_gate = cek_batas_risiko_harian(equity, kz["date_wib"], kz["session"])
     kalender = cek_kalender_ekonomi_high_impact(window_menit=60)
 
-    # 4. Tarik Data Multi-Pilar: Makro, Derivatif/COT/Orderflow, Blockworks, dan Teknikal
     makro = ambil_data_makro()
     derivatif = ambil_metrik_derivatif_dan_sentimen()
     bw_info = ambil_riset_blockworks()
@@ -773,19 +824,16 @@ def jalankan_analisa_lengkap():
     smc_btc = analisa_smc_matematis("BTCUSDT")
     korelasi = cek_anti_korelasi_ganda(threshold=0.80)
 
-    # 5. Debat Critical Thinking 3-Agen (Claude -> Gemini 4 Hydrogen -> Groq)
     llm_view = evaluasi_critical_thinking_3_agen(
         makro, derivatif, kalender, smc_xau, smc_xyz, smc_btc, bw_info
     )
 
-    # 6. Hitung Skor Konfluensi (0 - 100) untuk Ketiga Instrumen
     hasil_skor = [
         hitung_skor_konfluensi("XAUUSD", smc_xau, makro, derivatif, llm_view, kz, 0.25),
         hitung_skor_konfluensi("XYZ:GOLD", smc_xyz, makro, derivatif, llm_view, kz, spread_gold),
         hitung_skor_konfluensi("BTCUSDT", smc_btc, makro, derivatif, llm_view, kz, spread_btc),
     ]
 
-    # 7. Filter Anti-Korelasi Ganda (|corr| >= 0.80 -> ambil hanya 1 skor tertinggi)
     kandidat_lolos = [h for h in hasil_skor if h["valid_setup"]]
     if korelasi.get("double_exposure_blocked") and len(kandidat_lolos) > 1:
         kandidat_lolos.sort(key=lambda x: x["total_score"], reverse=True)
@@ -795,7 +843,6 @@ def jalankan_analisa_lengkap():
                 h["valid_setup"] = False
                 h["blocked_reason"] = f"Ditahan filter Anti-Korelasi ({korelasi.get('corr_30d')})"
 
-    # 8. Proses Routing Eksekusi & Audit Logging
     laporan_eksekusi = []
     for h in hasil_skor:
         status_aksi = "NO_TRADE"
@@ -849,10 +896,11 @@ def jalankan_analisa_lengkap():
             "notes": catatan,
         })
 
-    # 9. Susun Laporan Executive Summary Lengkap dengan Reason & Sumber API
     btc_of = derivatif.get("btc_orderflow", {})
     cot = derivatif.get("cftc_cot", {})
     liq = derivatif.get("crypto_liquidity", {})
+    us02y = makro.get("US02Y", {})
+    ry10y = makro.get("REAL_YIELD_10Y", {})
     news_status = (
         f"BLACKOUT ({', '.join(kalender['high_impact_events'])})"
         if kalender.get("news_blackout")
@@ -867,9 +915,10 @@ def jalankan_analisa_lengkap():
         f"----------------------------------------",
         f"1. MAKRO, ORDERFLOW & CFTC COT",
         f"- DXY: {makro.get('DXY', {}).get('last')} ({makro.get('DXY', {}).get('chg_pct'):+.2f}%) | US10Y: {makro.get('US10Y', {}).get('last')} | USOIL: {makro.get('USOIL', {}).get('last')} [Yahoo Finance]",
-        f"- BTC Orderflow: {btc_of.get('orderflow_bias')} (OI {btc_of.get('oi_change_pct'):+.2f}%, Taker {btc_of.get('taker_buy_sell_ratio')}) [Binance Public API]",
+        f"- US02Y: {us02y.get('last', 0.0)}% | Real Yield 10Y: {ry10y.get('last', 0.0)}% [FRED API]",
+        f"- BTC Orderflow: {btc_of.get('orderflow_bias')} (OI {btc_of.get('oi_change_pct'):+.2f}%, Taker {btc_of.get('taker_buy_sell_ratio')}) [{btc_of.get('source', 'OKX')}]",
         f"- CFTC Gold COT: {cot.get('gold_cot_bias')} (Net {cot.get('gold_managed_money_net'):,}) [CFTC Socrata API]",
-        f"- Likuiditas Kripto: BTC.D {liq.get('btc_dominance')}% | USDT.D {liq.get('usdt_dominance')}% | TOTAL3 ${liq.get('total3_usd_b')}B [CoinGecko API]",
+        f"- Likuiditas & Sentimen: BTC.D {liq.get('btc_dominance')}% | USDT.D {liq.get('usdt_dominance')}% | TOTAL3 ${liq.get('total3_usd_b')}B | Fear&Greed {liq.get('fear_greed_index')} ({liq.get('fear_greed_label')})",
         f"- Blockworks Intel: {bw_info}",
         f"----------------------------------------",
         f"2. SIDANG CRITICAL THINKING (3-AGEN)",
@@ -912,11 +961,15 @@ def jalankan_analisa_lengkap():
                 )
 
     laporan_teks = "\n".join(lines)
+    set_bot_state("last_market_report", laporan_teks)
     kirim_telegram(laporan_teks)
 
-    # 10. Cek pesan chat baru user di Telegram dan balas via Gemini 4 Hydrogen (model biasa)
+    # Cek dan balas chat user yang masuk di Telegram
     balas_chat_telegram_interaktif(laporan_teks)
 
 
 if __name__ == "__main__":
-    jalankan_analisa_lengkap()
+    if "--chat-only" in sys.argv:
+        jalankan_mode_chat_saja()
+    else:
+        jalankan_analisa_lengkap()
