@@ -302,7 +302,7 @@ class InstitutionalSMCAlphaEngine:
             "setups": setups,
         }
     def refine_setups_with_flagship_ai(self, symbol: str, raw_bundle: dict, intel: dict, ai_router) -> tuple[dict, str]:
-        intra = raw_bundle["setups"]["INTRADAY (M15-M30-H1-H4)"]
+        intra = raw_bundle["setups"]["INTRADAY (M30-H1-H4)"]
         swing = raw_bundle["setups"]["SWING (1D-1W)"]
         hold = raw_bundle["setups"]["HOLD POSITION (1M BULANAN)"]
 
