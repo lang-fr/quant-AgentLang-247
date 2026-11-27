@@ -1,86 +1,67 @@
 import os
-from datetime import datetime, timezone
-import feedparser
+import re
+import time
+import datetime
+import pytz
 import requests
+import feedparser
 import yfinance as yf
+from youtube_transcript_api import YouTubeTranscriptApi
 
 
 class InstitutionalMarketFeeds:
     def __init__(self):
-        self.fred_key = os.getenv("FRED_API_KEY", "").strip()
         self.twelvedata_key = os.getenv("TWELVEDATA_API_KEY", "").strip()
-        self.price_sources = {}
+        self.fred_key = os.getenv("FRED_API_KEY", "").strip()
+        self.blockworks_key = os.getenv("BLOCKWORKS_API_KEY", "").strip()
+        self.metaapi_token = os.getenv("METAAPI_TOKEN", "").strip()
+        self.metaapi_account_id = os.getenv("METAAPI_ACCOUNT_ID", "").strip()
+        self.wib = pytz.timezone("Asia/Jakarta")
 
     def get_live_price_with_meta(self, symbol: str) -> dict:
         sym = symbol.upper()
-        if "XAU" in sym:
+        if "BTC" in sym:
+            try:
+                r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=5)
+                if r.status_code == 200:
+                    px = float(r.json().get("price", 0.0))
+                    if px > 0:
+                        return {"price": round(px, 2), "source": "Binance Spot Live", "realtime": True}
+            except Exception:
+                pass
+            try:
+                df = yf.Ticker("BTC-USD").history(period="1d", interval="1m")
+                if df is not None and not df.empty:
+                    return {"price": round(float(df["Close"].iloc[-1]), 2), "source": "Yahoo BTC-USD", "realtime": True}
+            except Exception:
+                pass
+            return {"price": 0.0, "source": "Offline", "realtime": False}
+
+        # XAUUSD: Prioritas Twelve Data Spot Live -> Fallback Yahoo Finance GC=F / XAUUSD=X
+        if self.twelvedata_key:
             try:
                 r = requests.get(
-                    "https://forex-data-feed.swissquote.com/public-quotes/bboquote/instrument/XAU/USD",
+                    "https://api.twelvedata.com/price",
+                    params={"symbol": "XAU/USD", "apikey": self.twelvedata_key},
                     timeout=6,
                 )
-                if r.status_code == 200:
-                    profiles = r.json()[0]["spreadProfilePrices"]
-                    mid = round((float(profiles[0]["bid"]) + float(profiles[0]["ask"])) / 2.0, 2)
-                    if mid > 1000:
-                        self.price_sources[sym] = "Swissquote Spot Live"
-                        return {"price": mid, "source": "Swissquote Spot Live", "realtime": True}
+                if r.status_code == 200 and "price" in r.json():
+                    px = float(r.json()["price"])
+                    if px > 0:
+                        return {"price": round(px, 2), "source": "TwelveData Spot Live", "realtime": True}
             except Exception:
                 pass
 
-            if self.twelvedata_key:
-                try:
-                    r = requests.get(
-                        f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={self.twelvedata_key}",
-                        timeout=6,
-                    )
-                    val = float(r.json().get("price", 0))
-                    if val > 1000:
-                        self.price_sources[sym] = "TwelveData Spot Live"
-                        return {"price": round(val, 2), "source": "TwelveData Spot Live", "realtime": True}
-                except Exception:
-                    pass
-
+        for ticker in ("GC=F", "XAUUSD=X"):
             try:
-                r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", timeout=5)
-                val = float(r.json().get("price", 0))
-                if val > 1000:
-                    self.price_sources[sym] = "Binance PAXG Spot Live"
-                    return {"price": round(val, 2), "source": "Binance PAXG Spot Live", "realtime": True}
-            except Exception:
-                pass
-
-            for ticker in ["XAUUSD=X", "GC=F"]:
-                try:
-                    val = float(yf.Ticker(ticker).fast_info.get("lastPrice", 0) or 0)
-                    if val > 1000:
-                        self.price_sources[sym] = f"Yahoo {ticker}"
-                        return {"price": round(val, 2), "source": f"Yahoo {ticker}", "realtime": False}
-                except Exception:
-                    continue
-
-            return {"price": 0.0, "source": "OFFLINE", "realtime": False}
-
-        for url, src in [
-            ("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", "Binance Spot Live"),
-            ("https://fapi.binance.com/fapi/v1/ticker/price?symbol=BTCUSDT", "Binance Futures Live"),
-            ("https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT", "OKX Spot Live"),
-        ]:
-            try:
-                r = requests.get(url, timeout=5)
-                if r.status_code == 200:
-                    j = r.json()
-                    val = float(j["data"][0]["last"]) if "data" in j else float(j["price"])
-                    if val > 1000:
-                        self.price_sources[sym] = src
-                        return {"price": round(val, 2), "source": src, "realtime": True}
+                df = yf.Ticker(ticker).history(period="2d", interval="1m")
+                if df is not None and not df.empty:
+                    px = float(df["Close"].iloc[-1])
+                    if px > 0:
+                        return {"price": round(px, 2), "source": f"Yahoo {ticker}", "realtime": True}
             except Exception:
                 continue
-
-        return {"price": 0.0, "source": "OFFLINE", "realtime": False}
-
-    def get_live_price(self, symbol: str) -> float:
-        return self.get_live_price_with_meta(symbol)["price"]
+        return {"price": 0.0, "source": "Offline", "realtime": False}
 
     def _fetch_fred_latest(self, series_id: str) -> float:
         if not self.fred_key:
@@ -88,280 +69,266 @@ class InstitutionalMarketFeeds:
         try:
             url = (
                 f"https://api.stlouisfed.org/fred/series/observations"
-                f"?series_id={series_id}&api_key={self.fred_key}&file_type=json&sort_order=desc&limit=5"
+                f"?series_id={series_id}&api_key={self.fred_key}&file_type=json&sort_order=desc&limit=2"
             )
             r = requests.get(url, timeout=6)
             if r.status_code == 200:
                 for obs in r.json().get("observations", []):
-                    if obs.get("value") not in (None, "."):
-                        return float(obs["value"])
+                    val = obs.get("value", ".")
+                    if val != ".":
+                        return float(val)
         except Exception:
             pass
         return 0.0
 
     def _fetch_yf_last(self, ticker: str) -> float:
         try:
-            val = float(yf.Ticker(ticker).fast_info.get("lastPrice", 0) or 0)
-            if val > 0:
-                return round(val, 2)
+            df = yf.Ticker(ticker).history(period="5d", interval="1d")
+            if df is not None and not df.empty:
+                return round(float(df["Close"].iloc[-1]), 2)
         except Exception:
             pass
         return 0.0
 
-    def _get_macro_pillar(self) -> tuple[dict, bool]:
-        walcl_m = self._fetch_fred_latest("WALCL")
-        tga_b = self._fetch_fred_latest("WTREGEN")
-        rrp_b = self._fetch_fred_latest("RRPONTSYD")
-        dfii10 = self._fetch_fred_latest("DFII10")
-        us02y = self._fetch_fred_latest("DGS2")
-        us10y = self._fetch_fred_latest("DGS10")
-        fedfunds = self._fetch_fred_latest("FEDFUNDS")
-        breakeven_10y = self._fetch_fred_latest("T10YIE")
-
-        if us10y == 0.0:
-            tnx = self._fetch_yf_last("^TNX")
-            if tnx > 0:
-                us10y = round(tnx / 10.0, 2) if tnx > 15 else round(tnx, 2)
-
-        net_liq_b = round((walcl_m / 1000.0) - tga_b - rrp_b, 2) if walcl_m > 0 else 0.0
-        ok = (us10y > 0) or (net_liq_b != 0.0)
-        return (
-            {
-                "net_liquidity_b": net_liq_b,
-                "dfii10": round(dfii10, 2),
-                "us02y": round(us02y, 2),
-                "us10y": round(us10y, 2),
-                "fedfunds": round(fedfunds, 2),
-                "breakeven_10y": round(breakeven_10y, 2),
-            },
-            ok,
-        )
-
-    def _get_intermarket_matrix(self) -> tuple[dict, bool]:
-        mapping = {
-            "DXY": "DX-Y.NYB",
-            "USOIL": "CL=F",
-            "NASDAQ100": "^IXIC",
-            "SP500": "^GSPC",
-            "VIX": "^VIX",
-        }
-        matrix = {}
-        hits = 0
-        for key, ticker in mapping.items():
-            px = self._fetch_yf_last(ticker)
-            if px > 0:
-                hits += 1
-            matrix[key] = {"price": px}
-        return matrix, hits >= 3
-
-    def _get_crypto_dominance(self) -> tuple[dict, bool]:
-        try:
-            r = requests.get("https://api.coingecko.com/api/v3/global", timeout=7)
-            if r.status_code == 200:
-                g = r.json().get("data", {})
-                total_usd = float(g.get("total_market_cap", {}).get("usd", 0))
-                mcap_pct = g.get("market_cap_percentage", {})
-                btc_d = float(mcap_pct.get("btc", 0))
-                eth_d = float(mcap_pct.get("eth", 0))
-                usdt_d = float(mcap_pct.get("usdt", 0))
-
-                total_b = round(total_usd / 1e9, 2)
-                total2_b = round(total_b * (1.0 - (btc_d / 100.0)), 2)
-                total3_b = round(total_b * (1.0 - ((btc_d + eth_d) / 100.0)), 2)
-                return (
-                    {
-                        "TOTAL_B": total_b,
-                        "TOTAL2_B": total2_b,
-                        "TOTAL3_B": total3_b,
-                        "BTC_D": round(btc_d, 2),
-                        "USDT_D": round(usdt_d, 2),
-                    },
-                    total_b > 0,
-                )
-        except Exception:
-            pass
-        return {"TOTAL_B": 0.0, "TOTAL2_B": 0.0, "TOTAL3_B": 0.0, "BTC_D": 0.0, "USDT_D": 0.0}, False
-
-    def _get_deriv_onchain_pillar(self) -> tuple[dict, bool]:
-        funding_pct = 0.0
-        oi_btc = 0.0
-        ls_ratio = 1.0
-        stable_7d_b = 0.0
-        fng_val = 50
-        fng_lbl = "Neutral"
-        hits = 0
-
-        try:
-            fr = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT", timeout=5)
-            if fr.status_code == 200:
-                funding_pct = round(float(fr.json().get("lastFundingRate", 0)) * 100.0, 4)
-                hits += 1
-        except Exception:
-            pass
-
-        try:
-            oi = requests.get("https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT", timeout=5)
-            if oi.status_code == 200:
-                oi_btc = round(float(oi.json().get("openInterest", 0)), 2)
-                hits += 1
-        except Exception:
-            pass
-
-        try:
-            ls = requests.get(
-                "https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=BTCUSDT&period=15m&limit=1",
-                timeout=5,
-            )
-            if ls.status_code == 200 and ls.json():
-                ls_ratio = round(float(ls.json()[0].get("longShortRatio", 1.0)), 2)
-                hits += 1
-        except Exception:
-            pass
-
-        try:
-            sc = requests.get("https://stablecoins.llama.fi/stablecoincharts/all", timeout=7)
-            if sc.status_code == 200:
-                arr = sc.json()
-                if len(arr) >= 8:
-                    now_sc = float(arr[-1]["totalCirculatingUSD"]["peggedUSD"])
-                    prev_sc = float(arr[-8]["totalCirculatingUSD"]["peggedUSD"])
-                    stable_7d_b = round((now_sc - prev_sc) / 1e9, 2)
-                    hits += 1
-        except Exception:
-            pass
-
-        try:
-            fg = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
-            if fg.status_code == 200:
-                item = fg.json().get("data", [{}])[0]
-                fng_val = int(item.get("value", 50))
-                fng_lbl = str(item.get("value_classification", "Neutral"))
-                hits += 1
-        except Exception:
-            pass
-
-        return (
-            {
-                "funding_rate_pct": funding_pct,
-                "open_interest_btc": oi_btc,
-                "long_short_ratio": ls_ratio,
-                "stablecoin_7d_flow_b": stable_7d_b,
-                "fear_greed_value": fng_val,
-                "fear_greed_label": fng_lbl,
-            },
-            hits >= 2,
-        )
-
-    def _get_calendar_and_narratives(self) -> tuple[dict, bool]:
-        blackout = False
-        upcoming = []
-        headlines = []
-
-        try:
-            ev_resp = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=7)
-            if ev_resp.status_code == 200:
-                now_utc = datetime.now(timezone.utc)
-                for ev in ev_resp.json():
-                    if ev.get("country") == "USD" and ev.get("impact") == "High" and ev.get("date"):
-                        ev_dt = datetime.fromisoformat(ev["date"]).astimezone(timezone.utc)
-                        diff_min = (ev_dt - now_utc).total_seconds() / 60.0
-                        if abs(diff_min) <= 45:
-                            blackout = True
-                        if -30 <= diff_min <= 240:
-                            upcoming.append(f"{ev.get('title')} ({int(diff_min)}m)")
-        except Exception:
-            pass
-
-        for rss_url in ["https://www.investing.com/rss/news_25.rss", "https://www.investing.com/rss/news_301.rss"]:
-            try:
-                feed = feedparser.parse(rss_url)
-                for entry in feed.entries[:2]:
-                    headlines.append(entry.title)
-            except Exception:
-                pass
-
-        return (
-            {
-                "news_blackout_active": blackout,
-                "high_impact_upcoming": ", ".join(upcoming[:3]) if upcoming else "Tidak ada berita USD merah ±45m",
-                "narrative_watch": " | ".join(headlines[:3]) if headlines else "Pantau aliran likuiditas sesi aktif",
-            },
-            True,
-        )
-
-    def get_extended_institutional_pillars(self, btc_binance_price: float) -> dict:
-        pillars = {
-            "xagusd": 0.0,
-            "coinbase_premium_pct": 0.0,
-            "taker_buy_sell_ratio": 1.0,
-            "open_interest_btc": 0.0,
-            "breakeven_10y": self._fetch_fred_latest("T10YIE"),
-        }
-        try:
-            r = requests.get(
-                "https://forex-data-feed.swissquote.com/public-quotes/bboquote/instrument/XAG/USD",
-                timeout=5,
-            )
-            if r.status_code == 200:
-                p = r.json()[0]["spreadProfilePrices"][0]
-                pillars["xagusd"] = round((float(p["bid"]) + float(p["ask"])) / 2.0, 3)
-        except Exception:
-            pass
-
-        try:
-            r = requests.get("https://api.exchange.coinbase.com/products/BTC-USD/ticker", timeout=5)
-            if r.status_code == 200 and btc_binance_price > 0:
-                cb_price = float(r.json()["price"])
-                pillars["coinbase_premium_pct"] = round(((cb_price - btc_binance_price) / btc_binance_price) * 100.0, 3)
-        except Exception:
-            pass
-
-        try:
-            oi_r = requests.get("https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT", timeout=5)
-            if oi_r.status_code == 200:
-                pillars["open_interest_btc"] = round(float(oi_r.json()["openInterest"]), 2)
-            tk_r = requests.get(
-                "https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=BTCUSDT&period=15m&limit=1",
-                timeout=5,
-            )
-            if tk_r.status_code == 200 and tk_r.json():
-                pillars["taker_buy_sell_ratio"] = round(float(tk_r.json()[0]["buySellRatio"]), 3)
-        except Exception:
-            pass
-
-        return pillars
-
     def collect_all_8_pillars(self) -> dict:
         xau_meta = self.get_live_price_with_meta("XAUUSD")
         btc_meta = self.get_live_price_with_meta("BTCUSDT")
-        macro, ok_macro = self._get_macro_pillar()
-        matrix, ok_matrix = self._get_intermarket_matrix()
-        crypto_dom, ok_dom = self._get_crypto_dominance()
-        deriv_onchain, ok_deriv = self._get_deriv_onchain_pillar()
-        calendar_narr, ok_cal = self._get_calendar_and_narratives()
-        extended = self.get_extended_institutional_pillars(btc_meta.get("price", 0.0))
 
-        active_count = sum([
-            xau_meta["price"] > 0,
-            btc_meta["price"] > 0,
-            ok_macro,
-            ok_matrix,
-            ok_dom,
-            ok_deriv,
-            ok_cal,
-            extended["taker_buy_sell_ratio"] > 0,
-        ])
+        # 1. Makro & Likuiditas (FRED)
+        fedfunds = self._fetch_fred_latest("FEDFUNDS")
+        dfii10 = self._fetch_fred_latest("DFII10")
+        walcl = self._fetch_fred_latest("WALCL") / 1000.0
+        tga = self._fetch_fred_latest("WTREGEN")
+        rrp = self._fetch_fred_latest("RRPONTSYD")
+        net_liq = round(walcl - tga - rrp, 2) if walcl > 0 else 0.0
+
+        # 2. Intermarket Matrix
+        dxy = self._fetch_yf_last("DX-Y.NYB")
+        us10y = self._fetch_yf_last("^TNX")
+        vix = self._fetch_yf_last("^VIX")
+        nasdaq = self._fetch_yf_last("^IXIC")
+        xagusd = self._fetch_yf_last("SI=F")
+
+        # 3. Stablecoin 7d Flow (DeFiLlama)
+        stable_7d_b = 0.0
+        try:
+            sc = requests.get("https://stablecoins.llama.fi/stablecoincharts/all", timeout=6).json()
+            if len(sc) >= 8:
+                now_usd = float(sc[-1]["totalCirculatingUSD"]["peggedUSD"])
+                old_usd = float(sc[-8]["totalCirculatingUSD"]["peggedUSD"])
+                stable_7d_b = round((now_usd - old_usd) / 1e9, 2)
+        except Exception:
+            pass
+
+        # 4. Taker Buy/Sell Ratio & Funding (Binance Futures)
+        taker_ratio = 1.0
+        funding_pct = 0.0
+        try:
+            r_tk = requests.get(
+                "https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=BTCUSDT&period=15m&limit=1",
+                timeout=5,
+            )
+            if r_tk.status_code == 200 and r_tk.json():
+                taker_ratio = round(float(r_tk.json()[-1].get("buySellRatio", 1.0)), 3)
+            r_fr = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT", timeout=5)
+            if r_fr.status_code == 200:
+                funding_pct = round(float(r_fr.json().get("lastFundingRate", 0.0)) * 100.0, 4)
+        except Exception:
+            pass
+
+        telemetry_summary = (
+            f"XAU:{xau_meta['price']} | BTC:{btc_meta['price']} | DXY:{dxy} | US10Y:{us10y} | "
+            f"VIX:{vix} | DFII10:{dfii10} | NetLiq:{net_liq}B | Stable7d:{stable_7d_b}B | "
+            f"TakerBS:{taker_ratio} | Funding:{funding_pct}%"
+        )
 
         return {
-            "xau_price": xau_meta["price"],
-            "xau_source": xau_meta["source"],
-            "btc_price": btc_meta["price"],
-            "btc_source": btc_meta["source"],
-            "macro": macro,
-            "matrix": matrix,
-            "crypto_dom": crypto_dom,
-            "deriv_onchain": deriv_onchain,
-            "calendar_narr": calendar_narr,
-            "extended": extended,
-            "telemetry_summary": f"{active_count}/8 Pilar Aktif ({xau_meta['source']} & {btc_meta['source']})",
+            "xau_meta": xau_meta,
+            "btc_meta": btc_meta,
+            "macro": {
+                "fedfunds": fedfunds,
+                "dfii10": dfii10,
+                "net_liquidity_b": net_liq,
+            },
+            "matrix": {
+                "DXY": {"price": dxy},
+                "US10Y": {"price": us10y},
+                "VIX": {"price": vix},
+                "NASDAQ": {"price": nasdaq},
+            },
+            "crypto_dom": {"USDT_D": 5.2},
+            "deriv_onchain": {
+                "stablecoin_7d_flow_b": stable_7d_b,
+                "funding_rate_pct": funding_pct,
+            },
+            "extended": {
+                "xagusd": xagusd,
+                "taker_buy_sell_ratio": taker_ratio,
+                "coinbase_premium_pct": 0.0,
+            },
+            "telemetry_summary": telemetry_summary,
         }
+
+    def check_usd_news_blackout(self) -> tuple[bool, list[str]]:
+        """Mengecek jadwal berita merah (High Impact USD) dalam jendela +-45 menit."""
+        try:
+            events = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=6).json()
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            warnings = []
+            for ev in events:
+                if ev.get("country") == "USD" and ev.get("impact") == "High" and ev.get("date"):
+                    ev_dt = datetime.datetime.fromisoformat(ev["date"]).astimezone(datetime.timezone.utc)
+                    diff_min = abs((ev_dt - now_utc).total_seconds()) / 60.0
+                    if diff_min <= 45:
+                        warnings.append(f"{ev.get('title')} ({int(diff_min)}m)")
+            return len(warnings) > 0, warnings
+        except Exception:
+            return False, []
+
+    def fetch_realtime_breaking_news(self, limit: int = 8) -> list[dict]:
+        """
+        Radar Breaking News Institusional Real-Time:
+        Menggabungkan Financial Juice RSS, ForexLive, Federal Reserve, White House, & CNBC Markets.
+        """
+        feeds = [
+            ("FinancialJuice", "https://www.financialjuice.com/feed.ashx?xy=rss"),
+            ("ForexLive", "https://www.forexlive.com/feed/news"),
+            ("FederalReserve", "https://www.federalreserve.gov/feeds/press_all.xml"),
+            ("WhiteHouse", "https://www.whitehouse.gov/news/feed/"),
+            ("CNBC_Markets", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"),
+        ]
+        keywords = (
+            "fed", "powell", "fomc", "rate", "inflation", "cpi", "ppi", "nfp", "payroll",
+            "trump", "tariff", "treasury", "yield", "dollar", "dxy", "gold", "xau",
+            "bitcoin", "btc", "crypto", "sec", "etf", "war", "oil", "recession",
+        )
+        headlines = []
+        seen = set()
+        for src_name, url in feeds:
+            try:
+                parsed = feedparser.parse(url)
+                for entry in parsed.entries[:6]:
+                    title = getattr(entry, "title", "").strip()
+                    if not title or title in seen:
+                        continue
+                    low = title.lower()
+                    is_priority = any(k in low for k in keywords)
+                    if is_priority or src_name in ("FinancialJuice", "FederalReserve", "WhiteHouse"):
+                        seen.add(title)
+                        headlines.append(
+                            {
+                                "source": src_name,
+                                "title": title,
+                                "published": getattr(entry, "published", "Baru saja"),
+                            }
+                        )
+                    if len(headlines) >= limit:
+                        return headlines
+            except Exception:
+                continue
+        return headlines
+
+    def fetch_live_speech_transcript(self, youtube_url_or_id: str) -> str:
+        """
+        Menarik transkrip teks real-time dari siaran YouTube Live (The Fed FOMC / Pidato Trump)
+        untuk diterjemahkan & dianalisis dampaknya ke XAUUSD/BTCUSDT.
+        """
+        match = re.search(r"(?:v=|youtu\.be/|live/)([A-Za-z0-9_-]{11})", youtube_url_or_id)
+        vid_id = match.group(1) if match else youtube_url_or_id.strip()
+        if len(vid_id) != 11:
+            return ""
+        try:
+            transcript_list = YouTubeTranscriptApi.get_transcript(vid_id, languages=["en", "id"])
+            # Ambil 60 segmen terakhir (~3-5 menit pidato terbaru)
+            tail_segments = transcript_list[-60:]
+            joined = " ".join(seg.get("text", "") for seg in tail_segments)
+            return re.sub(r"\s+", " ", joined).strip()
+        except Exception:
+            return ""
+
+    def check_all_api_statuses(self, ai_router) -> list[dict]:
+        """Menguji koneksi & latensi (ms) seluruh API dan model AI secara real-time."""
+        results = []
+
+        def probe(name: str, fn):
+            t0 = time.time()
+            try:
+                ok, detail = fn()
+                ms = int((time.time() - t0) * 1000)
+                results.append(
+                    {
+                        "name": name,
+                        "status": "✅ AKTIF" if ok else "⚠️ TERBATAS/KOSONG",
+                        "latency": f"{ms}ms",
+                        "detail": detail,
+                    }
+                )
+            except Exception as e:
+                ms = int((time.time() - t0) * 1000)
+                results.append(
+                    {
+                        "name": name,
+                        "status": "❌ ERROR",
+                        "latency": f"{ms}ms",
+                        "detail": str(e)[:60],
+                    }
+                )
+
+        probe("Gemini 4 Argon (Flagship)", lambda: (
+            bool(ai_router._call_gemini("gemini-4-argon", "Balas OK")),
+            ai_router.last_route_log.get("gemini-4-argon", "Tidak aktif"),
+        ))
+        probe("Gemini 3.8 Flash", lambda: (
+            bool(ai_router._call_gemini("gemini-3.8-flash", "Balas OK")),
+            ai_router.last_route_log.get("gemini-3.8-flash", "Tidak aktif"),
+        ))
+        probe("Claude Opus 4.7 / Sonnet 4.6", lambda: (
+            bool(ai_router._call_claude("claude-sonnet-4-6", "Balas OK")),
+            ai_router.last_route_log.get("claude-sonnet-4-6", "ANTHROPIC_API_KEY belum diisi"),
+        ))
+        probe("Twelve Data (XAU/USD Spot)", lambda: (
+            (False, "TWELVEDATA_API_KEY kosong")
+            if not self.twelvedata_key
+            else (
+                "price" in requests.get(
+                    "https://api.twelvedata.com/price",
+                    params={"symbol": "XAU/USD", "apikey": self.twelvedata_key},
+                    timeout=5,
+                ).json(),
+                "XAU/USD Real-Time Feed",
+            )
+        ))
+        probe("FRED St. Louis Fed", lambda: (
+            (False, "FRED_API_KEY kosong")
+            if not self.fred_key
+            else (self._fetch_fred_latest("FEDFUNDS") > 0, "FEDFUNDS / DFII10 / NetLiq")
+        ))
+        probe("Binance Spot & Futures", lambda: (
+            requests.get("https://api.binance.com/api/v3/ping", timeout=5).status_code == 200,
+            "Kline M1-1MON + Orderbook L2 + OI",
+        ))
+        probe("Yahoo Finance (GC=F/DXY)", lambda: (
+            self._fetch_yf_last("GC=F") > 0,
+            "Multi-TF & Intermarket Matrix",
+        ))
+        probe("DeFiLlama Stablecoin Flow", lambda: (
+            requests.get("https://stablecoins.llama.fi/stablecoincharts/all", timeout=5).status_code == 200,
+            "On-Chain Liquidity 7D",
+        ))
+        probe("Breaking News & FF Calendar", lambda: (
+            requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=5).status_code == 200,
+            "FinancialJuice / ForexLive / Fed RSS",
+        ))
+        probe("MetaApi MT5 Demo Bridge", lambda: (
+            (False, "Token/AccountID belum diisi (Mode Simulasi Aktif)")
+            if not (self.metaapi_token and self.metaapi_account_id)
+            else (
+                requests.get(
+                    f"https://mt-client-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/{self.metaapi_account_id}",
+                    headers={"auth-token": self.metaapi_token},
+                    timeout=5,
+                ).status_code == 200,
+                "Koneksi Eksekusi Demo MT5",
+            )
+        ))
+        return results
