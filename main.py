@@ -19,6 +19,7 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "")).strip()
 AUTO_SCAN_INTERVAL_SEC = int(os.getenv("AUTO_SCAN_INTERVAL_SEC", "14400"))
+NEWS_POLL_INTERVAL_SEC = int(os.getenv("NEWS_POLL_INTERVAL_SEC", "60"))
 DB_PATH = "quant_agentlang_247.db"
 WIB = pytz.timezone("Asia/Jakarta")
 
@@ -28,6 +29,7 @@ alpha_engine = InstitutionalSMCAlphaEngine()
 exec_engine = InstitutionalExecutionEngine()
 
 LATEST_CONTEXT_CACHE = {"updated": "Belum ada scan", "summary": "Belum ada data pasar tersimpan."}
+SPEECH_WATCH_STATE = {"active": False, "url": "", "last_tail": ""}
 
 
 def init_db():
@@ -46,8 +48,35 @@ def init_db():
         )
         """
     )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS seen_news (
+            news_hash TEXT PRIMARY KEY,
+            source TEXT,
+            title TEXT,
+            created_wib TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
+
+
+def is_news_seen_and_mark(news_hash: str, source: str, title: str) -> bool:
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM seen_news WHERE news_hash = ?", (news_hash,))
+    exists = c.fetchone() is not None
+    if not exists:
+        now_wib = datetime.datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S WIB")
+        c.execute(
+            "INSERT INTO seen_news (news_hash, source, title, created_wib) VALUES (?, ?, ?, ?)",
+            (news_hash, source, title, now_wib),
+        )
+        conn.commit()
+    conn.close()
+    return exists
 
 
 def save_setup_bundle(symbol: str, live_price: float, score: int, bundle: dict) -> int:
@@ -133,7 +162,6 @@ def build_and_send_institutional_report(trigger: str = "Scheduled"):
     blackout, news_list = feeds.check_usd_news_blackout()
     breaking = feeds.fetch_realtime_breaking_news(limit=5)
 
-    # Tentukan bias makro awal dari DXY & Real Yield
     dxy = intel["matrix"]["DXY"]["price"]
     macro_bias = "BULLISH" if (dxy == 0 or dxy < 104.0) else "BEARISH"
 
@@ -152,7 +180,6 @@ def build_and_send_institutional_report(trigger: str = "Scheduled"):
         setup_id = save_setup_bundle(sym, refined_bundle["live_price"], score, refined_bundle)
         msg = format_asset_report(sym, refined_bundle, score, engine_name, passed, errors)
 
-        # 3 Tombol Approve Terpisah + 1 Tombol Reject
         buttons = {
             "inline_keyboard": [
                 [
@@ -170,6 +197,95 @@ def build_and_send_institutional_report(trigger: str = "Scheduled"):
 
     LATEST_CONTEXT_CACHE["updated"] = datetime.datetime.now(WIB).strftime("%Y-%m-%d %H:%M WIB")
     LATEST_CONTEXT_CACHE["summary"] = "\n".join(summary_parts)
+
+
+def auto_breaking_news_watcher_loop():
+    """
+    Berjalan 24/7 setiap 60 detik: mendeteksi berita dadakan baru dari Financial Juice,
+    ForexLive, Federal Reserve, & White House, lalu otomatis mengirim terjemahan & dampak harga.
+    """
+    # Seed awal saat startup agar tidak membanjiri berita lama
+    initial = feeds.fetch_realtime_breaking_news(limit=10)
+    for item in initial:
+        is_news_seen_and_mark(item["hash"], item["source"], item["title"])
+
+    while True:
+        time.sleep(NEWS_POLL_INTERVAL_SEC)
+        try:
+            latest_items = feeds.fetch_realtime_breaking_news(limit=8)
+            fresh_batch = []
+            for item in latest_items:
+                if not is_news_seen_and_mark(item["hash"], item["source"], item["title"]):
+                    fresh_batch.append(item)
+
+            if fresh_batch:
+                raw_lines = "\n".join(f"- [{b['source']}] {b['title']}" for b in fresh_batch)
+                prompt = (
+                    f"BREAKING NEWS DADAKAN BARU TERDETEKSI:\n{raw_lines}\n\n"
+                    f"1. Terjemahkan ke Bahasa Indonesia secara singkat dan jelas.\n"
+                    f"2. Sebutkan apakah sentimennya BULLISH atau BEARISH untuk XAUUSD (Emas), DXY, dan BTCUSDT."
+                )
+                ai_note, eng = ai_router.generate_with_flagship_cascade(prompt)
+                now_str = datetime.datetime.now(WIB).strftime("%H:%M:%S WIB")
+                alert_msg = (
+                    f"🚨 BREAKING NEWS OTOMATIS ({now_str})\n\n"
+                    f"{raw_lines}\n\n"
+                    f"📊 DAMPAK PASAR ({eng}):\n{ai_note or 'Pantau volatilitas XAUUSD & BTCUSDT.'}"
+                )
+                send_telegram(alert_msg)
+        except Exception as e:
+            print("News watcher error:", e)
+
+
+def live_speech_continuous_worker(youtube_url: str):
+    """
+    Memantau pidato live The Fed / Trump secara otomatis tiap 45 detik, menerjemahkan
+    kalimat baru, dan menyimpulkan arah pergerakan saat pidato berjalan maupun selesai.
+    """
+    SPEECH_WATCH_STATE["active"] = True
+    SPEECH_WATCH_STATE["url"] = youtube_url
+    SPEECH_WATCH_STATE["last_tail"] = ""
+
+    send_telegram(
+        "🎙️ MONITOR PIDATO LIVE AKTIF (Otomatis tiap 45 detik)\n"
+        "Sistem akan otomatis menerjemahkan setiap ucapan baru The Fed / Trump dan menyimpulkan arah XAUUSD & BTCUSDT.\n"
+        "Ketik /stop_pidato kapan saja untuk menghentikan pantauan."
+    )
+
+    empty_streak = 0
+    max_cycles = 120  # Maks 90 menit
+    for _ in range(max_cycles):
+        if not SPEECH_WATCH_STATE["active"]:
+            break
+
+        _, current_text = feeds.fetch_live_speech_transcript(youtube_url, tail_count=45)
+        if not current_text:
+            empty_streak += 1
+            if empty_streak >= 8:
+                send_telegram("⏹️ Siaran pidato berakhir atau subtitle live tidak lagi tersedia. Monitor pidato dihentikan.")
+                break
+            time.sleep(45)
+            continue
+
+        empty_streak = 0
+        prev_tail = SPEECH_WATCH_STATE["last_tail"]
+        if current_text != prev_tail:
+            SPEECH_WATCH_STATE["last_tail"] = current_text
+            # Ambil bagian terbaru (~1200 karakter terakhir)
+            snippet = current_text[-1200:]
+            prompt = (
+                f"Potongan ucapan terbaru dari pidato live The Fed / Trump:\n\"{snippet}\"\n\n"
+                f"1. Terjemahkan inti ucapan ini ke Bahasa Indonesia (2-3 kalimat padat).\n"
+                f"2. Klasifikasikan nada: HAWKISH (USD naik, XAUUSD turun) atau DOVISH (USD turun, XAUUSD naik) atau NETRAL.\n"
+                f"3. Arah proyeksi XAUUSD & BTCUSDT saat pidato berlanjut/selesai."
+            )
+            ai_summary, eng = ai_router.generate_with_flagship_cascade(prompt)
+            now_str = datetime.datetime.now(WIB).strftime("%H:%M:%S WIB")
+            send_telegram(f"🎙️ UPDATE PIDATO LIVE ({now_str} | {eng}):\n\n{ai_summary or snippet[:600]}")
+
+        time.sleep(45)
+
+    SPEECH_WATCH_STATE["active"] = False
 
 
 def handle_status_api():
@@ -207,10 +323,10 @@ def handle_breaking_news():
 
 def handle_speech_transcript(url_arg: str):
     if not url_arg:
-        send_telegram("Kirim format: /transkrip <link_youtube_live_fed_atau_trump>")
+        send_telegram("Kirim format: /transkrip <link_youtube> atau /pantau_pidato <link_youtube>")
         return
     send_telegram("Menyedot transkrip live pidato & menganalisis arah pergerakan XAUUSD/BTCUSDT...")
-    transcript = feeds.fetch_live_speech_transcript(url_arg)
+    _, transcript = feeds.fetch_live_speech_transcript(url_arg, tail_count=60)
     if not transcript:
         send_telegram("Transkrip belum tersedia pada video tersebut (pastikan Closed Captions/CC YouTube aktif).")
         return
@@ -230,7 +346,6 @@ def process_callback_query(cb: dict):
     data = cb.get("data", "")
     from_id = str(cb.get("from", {}).get("id", ""))
 
-    # Jawab callback immediately agar tombol di HP berhenti berputar
     requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
         json={"callback_query_id": cb_id, "text": "Memproses perintah..."},
@@ -248,7 +363,7 @@ def process_callback_query(cb: dict):
         return
 
     if len(parts) == 3 and parts[0] == "approve":
-        horizon_code = parts[1].upper()  # SCALP / INTRADAY / SWING
+        horizon_code = parts[1].upper()
         sid = int(parts[2])
         record = get_setup_bundle(sid)
         if not record:
@@ -287,7 +402,6 @@ def telegram_polling_loop():
         return
 
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-    # Wajib hapus webhook lama agar getUpdates menerima tombol & chat live tanpa konflik
     try:
         requests.get(f"{base_url}/deleteWebhook", params={"drop_pending_updates": False}, timeout=10)
     except Exception:
@@ -313,13 +427,17 @@ def telegram_polling_loop():
                 low = text.lower()
                 if low in ("/start", "/help"):
                     send_telegram(
-                        "🤖 QUANT AGENTLANG 24/7 AKTIF (Mode Interaktif + Eksekusi)\n\n"
-                        "Perintah Cepat:\n"
-                        "• /report atau /cek — Scan M1-1MON & kirim setup dengan 3 tombol Approve\n"
-                        "• /status_api — Cek status & latensi semua API + Model AI (Argon/Claude)\n"
-                        "• /news — Radar breaking news real-time (Financial Juice, Fed, White House)\n"
-                        "• /transkrip <link_youtube> — Sedot teks pidato live The Fed / Trump & analisis arah harga\n"
-                        "• Chat bebas kapan saja — Ketik pertanyaan apa saja untuk diskusi langsung dengan AI!"
+                        "🤖 QUANT AGENTLANG 24/7 AKTIF (Auto Breaking News + Live Chat)\n\n"
+                        "Fitur Otomatis Berjalan 24/7:\n"
+                        "• 🚨 Auto Breaking News Push (cek Financial Juice, ForexLive, Fed, White House tiap 60 detik)\n"
+                        "• 📊 Auto Mapping M1-1MON & 3 Tombol Approve (Scalp / Intraday / Swing)\n\n"
+                        "Perintah Manual:\n"
+                        "• /report atau /cek — Scan M1-1MON sekarang\n"
+                        "• /status_api — Cek status & latensi semua API + Gemini 4 Argon / Claude\n"
+                        "• /news — Rangkuman breaking news terbaru\n"
+                        "• /pantau_pidato <link_youtube> — Auto-translate pidato live Fed/Trump tiap 45 detik\n"
+                        "• /stop_pidato — Hentikan pantauan pidato live\n"
+                        "• Chat bebas kapan saja — Ketik pertanyaan apa saja untuk ngobrol langsung dengan AI!"
                     )
                 elif low in ("/report", "/cek"):
                     send_telegram("⏳ Memindai 9 timeframe (M1-1MON), Orderflow, Heatmap & SMT Divergence...")
@@ -330,11 +448,21 @@ def telegram_polling_loop():
                     threading.Thread(target=handle_status_api, daemon=True).start()
                 elif low == "/news":
                     threading.Thread(target=handle_breaking_news, daemon=True).start()
+                elif low.startswith("/pantau_pidato"):
+                    arg = text[len("/pantau_pidato") :].strip()
+                    if not arg:
+                        send_telegram("Kirim format: /pantau_pidato <link_youtube_live_fed_atau_trump>")
+                    else:
+                        SPEECH_WATCH_STATE["active"] = False
+                        time.sleep(1)
+                        threading.Thread(target=live_speech_continuous_worker, args=(arg,), daemon=True).start()
+                elif low == "/stop_pidato":
+                    SPEECH_WATCH_STATE["active"] = False
+                    send_telegram("⏹️ Pantauan pidato live dihentikan.")
                 elif low.startswith("/transkrip"):
                     arg = text[len("/transkrip") :].strip()
                     threading.Thread(target=handle_speech_transcript, args=(arg,), daemon=True).start()
                 else:
-                    # Live Chat Bebas dengan Flagship AI (Gemini 4 Argon / Claude)
                     def reply_chat(q=text):
                         if LATEST_CONTEXT_CACHE["updated"] == "Belum ada scan":
                             snap = feeds.collect_all_8_pillars()
@@ -364,4 +492,5 @@ if __name__ == "__main__":
         build_and_send_institutional_report("GitHub Actions Scheduled")
     else:
         threading.Thread(target=scheduled_loop, daemon=True).start()
+        threading.Thread(target=auto_breaking_news_watcher_loop, daemon=True).start()
         telegram_polling_loop()
