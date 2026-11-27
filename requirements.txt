@@ -13,3 +13,9 @@ requests
 flask
 metaapi-cloud-sdk
 git+https://github.com/rongardF/tvdatafeed.git
+requests>=2.31.0
+pandas>=2.2.0
+numpy>=1.26.0
+yfinance>=0.2.40
+python-dotenv>=1.0.1
+pytz>=2024.1
