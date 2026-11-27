@@ -1,180 +1,106 @@
 import os
-import hmac
-import time
-import hashlib
-import urllib.parse
 import requests
 
 
 class InstitutionalExecutionEngine:
-    """
-    Mesin Eksekusi Institusional:
-    - Position Sizing dinamis (0.5% - 2% risk per trade)
-    - Memecah Limit Order menjadi 1-3 Layer Sniper
-    - Auto BEP+1 saat TP1 tersentuh
-    - Kill Switch otomatis jika Daily Drawdown melewati batas (3% - 5%)
-    - Mendukung PAPER_SIMULATION, BINANCE_TESTNET, dan MT5_WEBHOOK
-    """
-
     def __init__(self):
-        self.account_balance = float(os.getenv("ACCOUNT_BALANCE", "10000"))
-        self.risk_pct = min(max(float(os.getenv("RISK_PER_TRADE_PCT", "1.0")), 0.5), 2.0)
-        self.max_daily_dd_pct = float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "3.0"))
-        self.layers_count = min(max(int(os.getenv("ENTRY_LAYERS", "3")), 1), 3)
+        self.balance = float(os.getenv("ACCOUNT_BALANCE", "10000.0"))
+        self.risk_pct = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
+        self.max_layers = int(os.getenv("MAX_LAYERS_PER_SETUP", "3"))
+        self.metaapi_token = os.getenv("METAAPI_TOKEN", "").strip()
+        self.metaapi_account_id = os.getenv("METAAPI_ACCOUNT_ID", "").strip()
 
-        self.binance_testnet_key = os.getenv("BINANCE_TESTNET_API_KEY", "").strip()
-        self.binance_testnet_secret = os.getenv("BINANCE_TESTNET_SECRET", "").strip()
-        self.mt5_webhook_url = os.getenv("MT5_WEBHOOK_URL", "").strip()
-
-    def check_kill_switch(self, daily_pnl_pct: float) -> tuple[bool, str]:
-        if daily_pnl_pct <= -abs(self.max_daily_dd_pct):
-            return False, (
-                f"KILL SWITCH AKTIF: Kerugian harian ({daily_pnl_pct:.2f}%) "
-                f"melewati batas maksimal (-{self.max_daily_dd_pct:.2f}%). Semua order baru diblokir."
-            )
-        return True, "AMAN"
-
-    def _find_intraday_setup(self, asset_setups: dict) -> dict | None:
-        for key in ("INTRADAY (M30-H1-H4)", "INTRADAY (M1-M5-M15-M30-H1-H4)", "SESI / SCALP (M1-M5-M15)"):
-            if key in asset_setups and asset_setups[key]:
-                return asset_setups[key]
-        return None
-
-    def build_layered_orders(self, symbol: str, setup: dict) -> list[dict]:
-        direction = setup["direction"]
+    def calculate_position_layers(self, symbol: str, setup: dict) -> dict:
         entry = float(setup["entry"])
         sl = float(setup["sl"])
         tp1 = float(setup["tp1"])
         tp2 = float(setup["tp2"])
         tp3 = float(setup["tp3"])
+        direction = setup["direction"]
 
-        stop_distance = abs(entry - sl)
-        if stop_distance <= 0:
-            return []
+        risk_usd = round(self.balance * (self.risk_pct / 100.0), 2)
+        sl_dist = max(abs(entry - sl), 0.01)
 
-        total_risk_usd = self.account_balance * (self.risk_pct / 100.0)
-        total_units = round(total_risk_usd / stop_distance, 4)
+        is_xau = "XAU" in symbol.upper()
+        # Kontrak standar: XAUUSD 1 lot = $100 per $1 gerak; BTCUSDT 1 lot = $1 per $1 gerak
+        contract_mult = 100.0 if is_xau else 1.0
+        total_lot = max(0.01, round(risk_usd / (sl_dist * contract_mult), 2))
 
-        layer_weights = {
-            1: [1.0],
-            2: [0.60, 0.40],
-            3: [0.40, 0.35, 0.25],
-        }[self.layers_count]
+        layers_count = min(self.max_layers, 3) if total_lot >= 0.03 else 1
+        lot_per_layer = max(0.01, round(total_lot / layers_count, 2))
 
-        layer_offsets = {
-            1: [0.0],
-            2: [0.0, 0.35],
-            3: [0.0, 0.30, 0.60],
-        }[self.layers_count]
+        step = round(sl_dist * 0.18, 2)
+        is_buy = "BUY" in direction
+        tps = [tp1, tp2, tp3]
+        layers = []
 
-        orders = []
-        for idx, (weight, offset_ratio) in enumerate(zip(layer_weights, layer_offsets), start=1):
-            if "SELL" in direction:
-                layer_price = round(entry + (stop_distance * offset_ratio), 2)
-                bep_price = round(layer_price - (stop_distance * 0.05), 2)
-            else:
-                layer_price = round(entry - (stop_distance * offset_ratio), 2)
-                bep_price = round(layer_price + (stop_distance * 0.05), 2)
-
-            qty = round(total_units * weight, 4)
-            orders.append(
+        for idx in range(layers_count):
+            px = round(entry - (idx * step), 2) if is_buy else round(entry + (idx * step), 2)
+            layers.append(
                 {
-                    "layer": idx,
-                    "symbol": symbol,
-                    "side": "SELL" if "SELL" in direction else "BUY",
-                    "order_type": "LIMIT",
-                    "price": layer_price,
+                    "layer": idx + 1,
+                    "order_type": "BUY LIMIT" if is_buy else "SELL LIMIT",
+                    "price": px,
                     "sl": sl,
-                    "bep_plus_1": bep_price,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "tp3": tp3,
-                    "qty": qty,
-                    "risk_usd": round(total_risk_usd * weight, 2),
+                    "tp": tps[idx % len(tps)],
+                    "lot": lot_per_layer,
                 }
             )
-        return orders
 
-    def _send_binance_testnet_order(self, order: dict) -> str:
-        base_url = "https://testnet.binancefuture.com"
-        endpoint = "/fapi/v1/order"
-        params = {
-            "symbol": "BTCUSDT",
-            "side": order["side"],
-            "type": "LIMIT",
-            "timeInForce": "GTC",
-            "quantity": max(round(order["qty"], 3), 0.001),
-            "price": order["price"],
-            "timestamp": int(time.time() * 1000),
+        return {
+            "symbol": symbol,
+            "direction": direction,
+            "risk_usd": risk_usd,
+            "total_lot": total_lot,
+            "layers": layers,
         }
-        query_string = urllib.parse.urlencode(params)
-        signature = hmac.new(
-            self.binance_testnet_secret.encode("utf-8"),
-            query_string.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        params["signature"] = signature
 
-        headers = {"X-MBX-APIKEY": self.binance_testnet_key}
-        resp = requests.post(f"{base_url}{endpoint}", headers=headers, params=params, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            return f"BinanceTestnet OrderID #{data.get('orderId')}"
-        return f"PaperFallback ({resp.status_code})"
+    def execute_horizon_setup(self, symbol: str, horizon_label: str, setup: dict) -> dict:
+        plan = self.calculate_position_layers(symbol, setup)
+        if not (self.metaapi_token and self.metaapi_account_id):
+            return {
+                "mode": "SIMULATION_JOURNAL",
+                "horizon": horizon_label,
+                "plan": plan,
+                "message": (
+                    f"Order {horizon_label} ({plan['direction']}) dicatat ke Jurnal Audit & Outcome Verifier "
+                    f"(Total {plan['total_lot']} lot dalam {len(plan['layers'])} layer | Risiko ${plan['risk_usd']})."
+                ),
+            }
 
-    def execute_approved_setup(self, record_id: int, payload: dict, daily_pnl_pct: float = 0.0) -> str:
-        is_safe, kill_msg = self.check_kill_switch(daily_pnl_pct)
-        if not is_safe:
-            return f"🛑 {kill_msg}"
+        url = f"https://mt-client-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/{self.metaapi_account_id}/trade"
+        headers = {"auth-token": self.metaapi_token, "Content-Type": "application/json"}
+        placed = []
+        errors = []
 
-        summary_lines = [f"⚡ <b>EKSEKUSI SNIPER AKTIF (Setup #{record_id})</b>"]
-        executed_any = False
+        for lyr in plan["layers"]:
+            action_type = "ORDER_TYPE_BUY_LIMIT" if "BUY" in lyr["order_type"] else "ORDER_TYPE_SELL_LIMIT"
+            payload = {
+                "actionType": action_type,
+                "symbol": symbol,
+                "volume": lyr["lot"],
+                "openPrice": lyr["price"],
+                "stopLoss": lyr["sl"],
+                "takeProfit": lyr["tp"],
+                "comment": f"QuantLang-{horizon_label[:5]}-L{lyr['layer']}",
+            }
+            try:
+                r = requests.post(url, headers=headers, json=payload, timeout=10)
+                if r.status_code in (200, 201):
+                    placed.append(f"L{lyr['layer']}@{lyr['price']}")
+                else:
+                    errors.append(f"L{lyr['layer']}:HTTP{r.status_code}")
+            except Exception as e:
+                errors.append(f"L{lyr['layer']}:{str(e)[:40]}")
 
-        for asset_key, symbol_label in [("xau", "XAUUSD"), ("btc", "BTCUSDT")]:
-            asset_setups = payload.get(asset_key, {})
-            setup = self._find_intraday_setup(asset_setups)
-            if not setup:
-                continue
-
-            layered = self.build_layered_orders(symbol_label, setup)
-            if not layered:
-                continue
-
-            executed_any = True
-            mode_tag = "PAPER-SIM"
-            if asset_key == "btc" and self.binance_testnet_key and self.binance_testnet_secret:
-                try:
-                    mode_tag = self._send_binance_testnet_order(layered[0])
-                except Exception:
-                    mode_tag = "PAPER-SIM"
-            elif self.mt5_webhook_url:
-                try:
-                    requests.post(
-                        self.mt5_webhook_url,
-                        json={"record_id": record_id, "symbol": symbol_label, "orders": layered},
-                        timeout=10,
-                    )
-                    mode_tag = "MT5-WEBHOOK-SENT"
-                except Exception:
-                    mode_tag = "PAPER-SIM"
-
-            summary_lines.append(
-                f"\n📌 <b>{symbol_label} [{setup['direction']}]</b> — Mode: <code>{mode_tag}</code>\n"
-                f"• Layer 1 (40%): <code>{layered[0]['price']}</code> | Risk: <code>${layered[0]['risk_usd']}</code>\n"
-                + (
-                    f"• Layer 2 (35%): <code>{layered[1]['price']}</code> | Risk: <code>${layered[1]['risk_usd']}</code>\n"
-                    if len(layered) >= 2
-                    else ""
-                )
-                + (
-                    f"• Layer 3 (25%): <code>{layered[2]['price']}</code> | Risk: <code>${layered[2]['risk_usd']}</code>\n"
-                    if len(layered) >= 3
-                    else ""
-                )
-                + f"• Hard SL: <code>{setup['sl']}</code> | Auto BEP+1 saat TP1 (<code>{setup['tp1']}</code>)"
-            )
-
-        if not executed_any:
-            summary_lines.append("⚠️ Tidak ditemukan setup Intraday valid pada payload ini.")
-
-        return "\n".join(summary_lines)
+        return {
+            "mode": "METAAPI_MT5_DEMO",
+            "horizon": horizon_label,
+            "plan": plan,
+            "placed": placed,
+            "errors": errors,
+            "message": (
+                f"Eksekusi MetaApi MT5 Demo ({horizon_label}): Sukses {len(placed)}/{len(plan['layers'])} layer "
+                f"({', '.join(placed) if placed else 'Gagal: ' + ', '.join(errors)})"
+            ),
+        }
