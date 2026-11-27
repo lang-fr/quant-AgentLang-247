@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import hashlib
 import datetime
 import pytz
 import requests
@@ -37,7 +38,6 @@ class InstitutionalMarketFeeds:
                 pass
             return {"price": 0.0, "source": "Offline", "realtime": False}
 
-        # XAUUSD: Prioritas Twelve Data Spot Live -> Fallback Yahoo Finance GC=F / XAUUSD=X
         if self.twelvedata_key:
             try:
                 r = requests.get(
@@ -94,7 +94,6 @@ class InstitutionalMarketFeeds:
         xau_meta = self.get_live_price_with_meta("XAUUSD")
         btc_meta = self.get_live_price_with_meta("BTCUSDT")
 
-        # 1. Makro & Likuiditas (FRED)
         fedfunds = self._fetch_fred_latest("FEDFUNDS")
         dfii10 = self._fetch_fred_latest("DFII10")
         walcl = self._fetch_fred_latest("WALCL") / 1000.0
@@ -102,14 +101,12 @@ class InstitutionalMarketFeeds:
         rrp = self._fetch_fred_latest("RRPONTSYD")
         net_liq = round(walcl - tga - rrp, 2) if walcl > 0 else 0.0
 
-        # 2. Intermarket Matrix
         dxy = self._fetch_yf_last("DX-Y.NYB")
         us10y = self._fetch_yf_last("^TNX")
         vix = self._fetch_yf_last("^VIX")
         nasdaq = self._fetch_yf_last("^IXIC")
         xagusd = self._fetch_yf_last("SI=F")
 
-        # 3. Stablecoin 7d Flow (DeFiLlama)
         stable_7d_b = 0.0
         try:
             sc = requests.get("https://stablecoins.llama.fi/stablecoincharts/all", timeout=6).json()
@@ -120,7 +117,6 @@ class InstitutionalMarketFeeds:
         except Exception:
             pass
 
-        # 4. Taker Buy/Sell Ratio & Funding (Binance Futures)
         taker_ratio = 1.0
         funding_pct = 0.0
         try:
@@ -145,11 +141,7 @@ class InstitutionalMarketFeeds:
         return {
             "xau_meta": xau_meta,
             "btc_meta": btc_meta,
-            "macro": {
-                "fedfunds": fedfunds,
-                "dfii10": dfii10,
-                "net_liquidity_b": net_liq,
-            },
+            "macro": {"fedfunds": fedfunds, "dfii10": dfii10, "net_liquidity_b": net_liq},
             "matrix": {
                 "DXY": {"price": dxy},
                 "US10Y": {"price": us10y},
@@ -157,20 +149,12 @@ class InstitutionalMarketFeeds:
                 "NASDAQ": {"price": nasdaq},
             },
             "crypto_dom": {"USDT_D": 5.2},
-            "deriv_onchain": {
-                "stablecoin_7d_flow_b": stable_7d_b,
-                "funding_rate_pct": funding_pct,
-            },
-            "extended": {
-                "xagusd": xagusd,
-                "taker_buy_sell_ratio": taker_ratio,
-                "coinbase_premium_pct": 0.0,
-            },
+            "deriv_onchain": {"stablecoin_7d_flow_b": stable_7d_b, "funding_rate_pct": funding_pct},
+            "extended": {"xagusd": xagusd, "taker_buy_sell_ratio": taker_ratio, "coinbase_premium_pct": 0.0},
             "telemetry_summary": telemetry_summary,
         }
 
     def check_usd_news_blackout(self) -> tuple[bool, list[str]]:
-        """Mengecek jadwal berita merah (High Impact USD) dalam jendela +-45 menit."""
         try:
             events = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=6).json()
             now_utc = datetime.datetime.now(datetime.timezone.utc)
@@ -185,10 +169,10 @@ class InstitutionalMarketFeeds:
         except Exception:
             return False, []
 
-    def fetch_realtime_breaking_news(self, limit: int = 8) -> list[dict]:
+    def fetch_realtime_breaking_news(self, limit: int = 10) -> list[dict]:
         """
         Radar Breaking News Institusional Real-Time:
-        Menggabungkan Financial Juice RSS, ForexLive, Federal Reserve, White House, & CNBC Markets.
+        Financial Juice, ForexLive, Federal Reserve, White House, CNBC Markets, & Investing Macro.
         """
         feeds = [
             ("FinancialJuice", "https://www.financialjuice.com/feed.ashx?xy=rss"),
@@ -196,27 +180,34 @@ class InstitutionalMarketFeeds:
             ("FederalReserve", "https://www.federalreserve.gov/feeds/press_all.xml"),
             ("WhiteHouse", "https://www.whitehouse.gov/news/feed/"),
             ("CNBC_Markets", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"),
+            ("Investing_Macro", "https://www.investing.com/rss/news_25.rss"),
         ]
         keywords = (
             "fed", "powell", "fomc", "rate", "inflation", "cpi", "ppi", "nfp", "payroll",
             "trump", "tariff", "treasury", "yield", "dollar", "dxy", "gold", "xau",
-            "bitcoin", "btc", "crypto", "sec", "etf", "war", "oil", "recession",
+            "bitcoin", "btc", "crypto", "sec", "etf", "war", "oil", "recession", "jerome",
+            "bessent", "cut", "hike", "emergency", "breaking",
         )
         headlines = []
         seen = set()
         for src_name, url in feeds:
             try:
                 parsed = feedparser.parse(url)
-                for entry in parsed.entries[:6]:
+                for entry in parsed.entries[:5]:
                     title = getattr(entry, "title", "").strip()
-                    if not title or title in seen:
+                    if not title:
+                        continue
+                    norm_key = re.sub(r"\W+", "", title.lower())[:70]
+                    if norm_key in seen:
                         continue
                     low = title.lower()
                     is_priority = any(k in low for k in keywords)
                     if is_priority or src_name in ("FinancialJuice", "FederalReserve", "WhiteHouse"):
-                        seen.add(title)
+                        seen.add(norm_key)
+                        news_hash = hashlib.md5(norm_key.encode("utf-8")).hexdigest()
                         headlines.append(
                             {
+                                "hash": news_hash,
                                 "source": src_name,
                                 "title": title,
                                 "published": getattr(entry, "published", "Baru saja"),
@@ -228,26 +219,25 @@ class InstitutionalMarketFeeds:
                 continue
         return headlines
 
-    def fetch_live_speech_transcript(self, youtube_url_or_id: str) -> str:
+    def fetch_live_speech_transcript(self, youtube_url_or_id: str, tail_count: int = 50) -> tuple[str, str]:
         """
-        Menarik transkrip teks real-time dari siaran YouTube Live (The Fed FOMC / Pidato Trump)
-        untuk diterjemahkan & dianalisis dampaknya ke XAUUSD/BTCUSDT.
+        Menarik transkrip teks real-time dari siaran YouTube Live (The Fed FOMC / Pidato Trump).
+        Mengembalikan (video_id, teks_terbaru).
         """
         match = re.search(r"(?:v=|youtu\.be/|live/)([A-Za-z0-9_-]{11})", youtube_url_or_id)
         vid_id = match.group(1) if match else youtube_url_or_id.strip()
         if len(vid_id) != 11:
-            return ""
+            return "", ""
         try:
             transcript_list = YouTubeTranscriptApi.get_transcript(vid_id, languages=["en", "id"])
-            # Ambil 60 segmen terakhir (~3-5 menit pidato terbaru)
-            tail_segments = transcript_list[-60:]
+            tail_segments = transcript_list[-tail_count:]
             joined = " ".join(seg.get("text", "") for seg in tail_segments)
-            return re.sub(r"\s+", " ", joined).strip()
+            clean_text = re.sub(r"\s+", " ", joined).strip()
+            return vid_id, clean_text
         except Exception:
-            return ""
+            return vid_id, ""
 
     def check_all_api_statuses(self, ai_router) -> list[dict]:
-        """Menguji koneksi & latensi (ms) seluruh API dan model AI secara real-time."""
         results = []
 
         def probe(name: str, fn):
@@ -315,9 +305,9 @@ class InstitutionalMarketFeeds:
             requests.get("https://stablecoins.llama.fi/stablecoincharts/all", timeout=5).status_code == 200,
             "On-Chain Liquidity 7D",
         ))
-        probe("Breaking News & FF Calendar", lambda: (
-            requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=5).status_code == 200,
-            "FinancialJuice / ForexLive / Fed RSS",
+        probe("Auto Breaking News & FF Calendar", lambda: (
+            len(self.fetch_realtime_breaking_news(limit=2)) > 0,
+            "FinancialJuice / ForexLive / Fed / WhiteHouse (Push 60s)",
         ))
         probe("MetaApi MT5 Demo Bridge", lambda: (
             (False, "Token/AccountID belum diisi (Mode Simulasi Aktif)")
