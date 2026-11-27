@@ -5,6 +5,30 @@ from datetime import datetime, timezone
 
 
 class InstitutionalMarketFeeds:
+    def collect_all_8_pillars(self) -> dict:
+        xau_meta = self.get_live_price_with_meta("XAUUSD") if hasattr(self, "get_live_price_with_meta") else {
+            "price": self.get_live_price("XAUUSD"),
+            "source": "Primary Feed",
+            "realtime": True,
+        }
+        btc_meta = self.get_live_price_with_meta("BTCUSDT") if hasattr(self, "get_live_price_with_meta") else {
+            "price": self.get_live_price("BTCUSDT"),
+            "source": "Primary Feed",
+            "realtime": True,
+        }
+        extended = (
+            self.get_extended_institutional_pillars(btc_meta.get("price", 0.0))
+            if hasattr(self, "get_extended_institutional_pillars")
+            else {}
+        )
+        return {
+            "xau_price": xau_meta.get("price", 0.0),
+            "xau_source": xau_meta.get("source", "OFFLINE"),
+            "btc_price": btc_meta.get("price", 0.0),
+            "btc_source": btc_meta.get("source", "OFFLINE"),
+            "extended": extended,
+        }
+        
     def __init__(self):
         self.fred_key = os.getenv("FRED_API_KEY", "").strip()
         self.twelvedata_key = os.getenv("TWELVEDATA_API_KEY", "").strip()
