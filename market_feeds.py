@@ -14,6 +14,16 @@ class InstitutionalMarketFeeds:
     - Derivatives, On-Chain, COT, News Calendar & Narrative Radar
     """
 
+    def get_live_price(self, symbol: str) -> float:
+        try:
+            ticker = "GC=F" if symbol == "XAUUSD" else "BTC-USD"
+            hist = yf.Ticker(ticker).history(period="1d", interval="1m")
+            if hist is not None and not hist.empty:
+                return float(hist["Close"].iloc[-1])
+        except Exception:
+            pass
+        return 2650.0 if symbol == "XAUUSD" else 92000.0
+
     def __init__(self):
         self.twelvedata_key = os.getenv("TWELVEDATA_API_KEY", "").strip()
         self.fred_key = os.getenv("FRED_API_KEY", "").strip()
