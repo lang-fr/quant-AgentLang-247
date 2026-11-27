@@ -91,48 +91,65 @@ class InstitutionalSMCAlphaEngine:
 
         return dfs, ladder
 
+    def _calc_atr(self, df: pd.DataFrame, period: int = 14) -> float:
+        if df is None or len(df) < 3:
+            return 0.0
+        high = df["High"].astype(float)
+        low = df["Low"].astype(float)
+        close = df["Close"].astype(float)
+        prev_close = close.shift(1).fillna(close)
+        tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+        return float(tr.tail(period).mean())
+
     def _compute_zone_setup(self, df: pd.DataFrame, live_price: float, direction: str, is_xau: bool, horizon: str = "INTRADAY") -> dict:
         dec = 2
+        atr = self._calc_atr(df, 14)
+
         if df is not None and not df.empty:
             high_val = float(df["High"].max())
             low_val = float(df["Low"].min())
-            rng = max(high_val - low_val, live_price * (0.004 if is_xau else 0.01))
+            rng = max(high_val - low_val, atr * 2.0, live_price * (0.002 if is_xau else 0.004))
         else:
-            rng = live_price * (0.01 if is_xau else 0.025)
+            rng = live_price * (0.005 if is_xau else 0.015)
             high_val = live_price + (rng * 0.5)
             low_val = live_price - (rng * 0.5)
 
-        min_risk = live_price * (0.002 if is_xau else 0.005)
-        max_risk_pct = {
-            "SCALP": 0.012 if is_xau else 0.02,
-            "INTRADAY": 0.02 if is_xau else 0.04,
-            "SWING": 0.05 if is_xau else 0.12,
-            "HOLD": 0.12 if is_xau else 0.25,
-        }.get(horizon, 0.03)
-        max_risk = live_price * max_risk_pct
+        if horizon == "SCALP":
+            if is_xau:
+                risk = min(max(atr * 0.85, 1.50), 2.20)
+                entry_offset = min(max(atr * 0.45, 0.80), 2.50)
+            else:
+                risk = min(max(atr * 0.9, live_price * 0.0022), live_price * 0.0045)
+                entry_offset = min(max(atr * 0.5, live_price * 0.0012), live_price * 0.0035)
+            rr_mult = (2.5, 5.0, 7.5)
+        elif horizon == "INTRADAY":
+            risk = min(max(atr * 1.35, live_price * (0.0035 if is_xau else 0.008)), live_price * (0.009 if is_xau else 0.022))
+            entry_offset = min(max(atr * 0.9, rng * 0.18), live_price * (0.012 if is_xau else 0.025))
+            rr_mult = (2.6, 5.2, 8.0)
+        elif horizon == "SWING":
+            risk = min(max(atr * 1.5, live_price * (0.012 if is_xau else 0.025)), live_price * (0.03 if is_xau else 0.07))
+            entry_offset = min(max(rng * 0.25, live_price * (0.018 if is_xau else 0.04)), live_price * (0.05 if is_xau else 0.12))
+            rr_mult = (2.8, 5.5, 8.5)
+        else:
+            risk = min(max(atr * 1.6, live_price * (0.035 if is_xau else 0.08)), live_price * (0.08 if is_xau else 0.18))
+            entry_offset = min(max(rng * 0.30, live_price * (0.05 if is_xau else 0.12)), live_price * (0.14 if is_xau else 0.28))
+            rr_mult = (3.0, 6.0, 9.0)
 
         if direction == "SELL LIMIT":
-            entry = low_val + (rng * 0.705)
-            if entry <= live_price * 1.0005:
-                entry = live_price + max(rng * 0.15, min_risk * 0.8)
-            raw_sl = max(high_val + (rng * 0.05), entry + min_risk)
-            risk = min(max(raw_sl - entry, min_risk), max_risk)
+            raw_entry = low_val + (rng * 0.705)
+            entry = raw_entry if raw_entry > live_price * 1.0003 else (live_price + entry_offset)
             sl = entry + risk
-            tp1 = entry - (risk * 2.0)
-            tp2 = entry - (risk * 4.0)
-            tp3 = entry - (risk * 6.0)
+            tp1 = entry - (risk * rr_mult[0])
+            tp2 = entry - (risk * rr_mult[1])
+            tp3 = entry - (risk * rr_mult[2])
         else:
-            entry = high_val - (rng * 0.705)
-            if entry >= live_price * 0.9995:
-                entry = live_price - max(rng * 0.15, min_risk * 0.8)
-            raw_sl = min(low_val - (rng * 0.05), entry - min_risk)
-            risk = min(max(entry - raw_sl, min_risk), max_risk)
-            # Cegah SL menyentuh atau menembus 0
-            sl = max(entry - risk, entry * 0.5)
-            risk = max(entry - sl, min_risk * 0.5)
-            tp1 = entry + (risk * 2.0)
-            tp2 = entry + (risk * 4.0)
-            tp3 = entry + (risk * 6.0)
+            raw_entry = high_val - (rng * 0.705)
+            entry = raw_entry if raw_entry < live_price * 0.9997 else (live_price - entry_offset)
+            sl = max(entry - risk, entry * 0.55)
+            risk = max(entry - sl, 0.5 if is_xau else 25.0)
+            tp1 = entry + (risk * rr_mult[0])
+            tp2 = entry + (risk * rr_mult[1])
+            tp3 = entry + (risk * rr_mult[2])
 
         rr_tp1 = round(abs(tp1 - entry) / max(abs(entry - sl), 1e-9), 1)
         rr_tp2 = round(abs(tp2 - entry) / max(abs(entry - sl), 1e-9), 1)
