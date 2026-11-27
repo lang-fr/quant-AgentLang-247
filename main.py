@@ -1,484 +1,367 @@
 import os
 import sys
-import html
-import time
 import json
+import time
 import sqlite3
-import datetime
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
+import datetime
 import pytz
 import requests
 from dotenv import load_dotenv
 
-from ai_router import UnifiedAIRouter
+from ai_router import FlagshipAIRouter
 from market_feeds import InstitutionalMarketFeeds
 from smc_alpha import InstitutionalSMCAlphaEngine
 from execution_engine import InstitutionalExecutionEngine
-from outcome_verifier import OutcomeVerifierEngine
 
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "10000"))
-RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
-MAX_ENTRIES_PER_SESSION = int(os.getenv("MAX_ENTRIES_PER_SESSION", "3"))
-
+TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+AUTO_SCAN_INTERVAL_SEC = int(os.getenv("AUTO_SCAN_INTERVAL_SEC", "14400"))
+DB_PATH = "quant_agentlang_247.db"
 WIB = pytz.timezone("Asia/Jakarta")
-DB_PATH = "quant_cloud_audit.db"
 
-ai_router = UnifiedAIRouter()
+ai_router = FlagshipAIRouter()
 feeds = InstitutionalMarketFeeds()
 alpha_engine = InstitutionalSMCAlphaEngine()
-execution_engine = InstitutionalExecutionEngine()
-outcome_verifier = OutcomeVerifierEngine(DB_PATH)
+exec_engine = InstitutionalExecutionEngine()
+
+LATEST_CONTEXT_CACHE = {"updated": "Belum ada scan", "summary": "Belum ada data pasar tersimpan."}
 
 
-def init_audit_db():
+def init_db():
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
+    c = conn.cursor()
+    c.execute(
         """
-        CREATE TABLE IF NOT EXISTS signal_audit_log (
+        CREATE TABLE IF NOT EXISTS setups_store (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at_wib TEXT,
-            session_name TEXT,
-            ai_model TEXT,
-            xau_price REAL,
-            btc_price REAL,
-            macro_bias TEXT,
-            audit_passed INTEGER,
-            status TEXT,
-            payload_json TEXT,
-            outcome_status TEXT DEFAULT 'OPEN',
-            realized_r REAL DEFAULT 0.0
+            created_wib TEXT,
+            symbol TEXT,
+            live_price REAL,
+            confluence_score INTEGER,
+            bundle_json TEXT,
+            status TEXT
         )
         """
     )
     conn.commit()
     conn.close()
-    outcome_verifier._ensure_columns()
 
 
-def save_signal_record(
-    session_name: str,
-    ai_model: str,
-    xau_price: float,
-    btc_price: float,
-    macro_bias: str,
-    audit_passed: bool,
-    payload: dict,
-) -> int:
+def save_setup_bundle(symbol: str, live_price: float, score: int, bundle: dict) -> int:
+    init_db()
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    now_str = datetime.datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
-    cur.execute(
-        """
-        INSERT INTO signal_audit_log
-        (created_at_wib, session_name, ai_model, xau_price, btc_price, macro_bias, audit_passed, status, payload_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            now_str,
-            session_name,
-            ai_model,
-            xau_price,
-            btc_price,
-            macro_bias,
-            1 if audit_passed else 0,
-            "PENDING_REVIEW" if audit_passed else "BLOCKED_BY_GATE",
-            json.dumps(payload),
-        ),
+    c = conn.cursor()
+    now_wib = datetime.datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S WIB")
+    c.execute(
+        "INSERT INTO setups_store (created_wib, symbol, live_price, confluence_score, bundle_json, status) VALUES (?, ?, ?, ?, ?, ?)",
+        (now_wib, symbol, live_price, score, json.dumps(bundle), "PENDING"),
     )
-    record_id = cur.lastrowid
+    sid = c.lastrowid
     conn.commit()
     conn.close()
-    return record_id
+    return sid
 
 
-def get_signal_payload(record_id: int) -> dict:
+def get_setup_bundle(setup_id: int) -> dict | None:
+    init_db()
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT payload_json FROM signal_audit_log WHERE id = ?", (record_id,))
-    row = cur.fetchone()
+    c = conn.cursor()
+    c.execute("SELECT symbol, bundle_json, status FROM setups_store WHERE id = ?", (setup_id,))
+    row = c.fetchone()
     conn.close()
     if not row:
-        return {}
-    try:
-        return json.loads(row[0])
-    except Exception:
-        return {}
+        return None
+    return {"symbol": row[0], "bundle": json.loads(row[1]), "status": row[2]}
 
 
-def update_signal_status(record_id: int, new_status: str):
+def update_setup_status(setup_id: int, new_status: str):
+    init_db()
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("UPDATE signal_audit_log SET status = ? WHERE id = ?", (new_status, record_id))
+    c = conn.cursor()
+    c.execute("UPDATE setups_store SET status = ? WHERE id = ?", (new_status, setup_id))
     conn.commit()
     conn.close()
 
 
-def get_session_quota_info() -> tuple[str, int]:
-    now_wib = datetime.datetime.now(WIB)
-    hour = now_wib.hour
-    if 7 <= hour < 14:
-        session = "ASIA_RANGE (07:00-14:00 WIB)"
-    elif 14 <= hour < 19:
-        session = "LONDON_KILLZONE (14:00-19:00 WIB)"
-    elif 19 <= hour <= 23:
-        session = "NEW_YORK_KILLZONE (19:00-24:00 WIB)"
-    else:
-        session = "DEAD_ZONE_ROLLOVER (00:00-07:00 WIB)"
-
-    today_prefix = now_wib.strftime("%Y-%m-%d")
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT COUNT(*) FROM signal_audit_log WHERE created_at_wib LIKE ? AND session_name = ? AND status = 'APPROVED'",
-        (f"{today_prefix}%", session),
-    )
-    used = cur.fetchone()[0]
-    conn.close()
-    return session, max(0, MAX_ENTRIES_PER_SESSION - used)
-
-
-def send_telegram_message(text: str, chat_id: str = None, reply_markup: dict = None):
-    target_chat = chat_id or TELEGRAM_CHAT_ID
-    if not TELEGRAM_BOT_TOKEN or not target_chat:
+def send_telegram(text: str, reply_markup: dict | None = None):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(text)
         return
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    chunks = [text[i : i + 3900] for i in range(0, len(text), 3900)]
-
+    clean_text = text.replace("<", "").replace(">", "")
+    chunks = [clean_text[i : i + 3900] for i in range(0, len(clean_text), 3900)]
     for idx, chunk in enumerate(chunks):
-        payload = {
-            "chat_id": target_chat,
-            "text": chunk,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk}
         if reply_markup and idx == len(chunks) - 1:
-            payload["reply_markup"] = reply_markup
-
+            payload["reply_markup"] = json.dumps(reply_markup)
         try:
-            resp = requests.post(url, json=payload, timeout=20)
-            if resp.status_code == 400:
-                payload.pop("parse_mode", None)
-                requests.post(url, json=payload, timeout=20)
-        except Exception as exc:
-            print(f"[ERROR TELEGRAM] {exc}")
+            requests.post(url, json=payload, timeout=15)
+        except Exception as e:
+            print("Telegram send error:", e)
 
 
-def _format_asset_mapping(asset_title: str, bundle: dict) -> str:
-    live = bundle.get("live_price", 0.0)
-    src = bundle.get("price_source", "Live")
+def format_asset_report(symbol: str, bundle: dict, score: int, engine_name: str, passed: bool, errors: list[str]) -> str:
     setups = bundle.get("setups", {})
-    risk_usd = round(ACCOUNT_BALANCE * (RISK_PER_TRADE_PCT / 100.0), 2)
-
-    blocks = [
-        f"<b>{html.escape(asset_title)} (Live: {live} | {html.escape(src)}) — Risk/Trade: ${risk_usd} ({RISK_PER_TRADE_PCT}%)</b>"
+    risk_usd = round(exec_engine.balance * (exec_engine.risk_pct / 100.0), 1)
+    lines = [
+        f"MAPPING SNIPER {symbol} (ZERO FLOATING) (Live: {bundle['live_price']} | {bundle['price_source']}) — Risk/Trade: ${risk_usd} ({exec_engine.risk_pct}%)",
+        f"Skor Konfluensi: {score}/100 | Audit Gate: {'LOLOS 6/6' if passed else 'PERHATIAN: ' + ', '.join(errors)}",
+        "",
     ]
-    for horizon_label, s in setups.items():
-        reason_text = html.escape(str(s.get("reason", "-")))
-        blocks.append(
-            f"\n🎯 <b>{html.escape(horizon_label)}</b> — [<b>{s['direction']}</b>] (RR: <code>{s['rr']}</code>)\n"
-            f"• Rantai MTF: <code>{html.escape(s['tf_chain'])}</code> ({s['aligned_count']})\n"
-            f"• Sniper Limit Entry (1-3 Layer): <code>{s['entry']}</code>\n"
-            f"• Tight Stop Loss: <code>{s['sl']}</code>\n"
-            f"• TP1 (Geser SL ke BEP+1): <code>{s['tp1']}</code>\n"
-            f"• TP2 / TP3 Runner: <code>{s['tp2']}</code> | <code>{s['tp3']}</code>\n"
-            f"• Alasan Presisi: {reason_text}"
-        )
-    return "\n".join(blocks)
-
-
-def _derive_macro_bias(macro: dict, matrix: dict) -> str:
-    bearish_votes = 0
-    if macro["net_liquidity_b"] < 0:
-        bearish_votes += 1
-    if macro["dfii10"] > 2.0:
-        bearish_votes += 1
-    if matrix["DXY"]["price"] >= 103.5:
-        bearish_votes += 1
-    if matrix["VIX"]["price"] >= 22.0:
-        bearish_votes += 1
-    return "BEARISH" if bearish_votes >= 2 else "BULLISH"
-
-
-def build_and_send_institutional_report(target_chat_id: str = None):
-    now_str = datetime.datetime.now(WIB).strftime("%d %b %Y %H:%M WIB")
-    session_name, quota_left = get_session_quota_info()
-
-    perf_stats = outcome_verifier.verify_all_approved_setups()
-
-    intel = feeds.collect_all_8_pillars()
-    macro = intel["macro"]
-    matrix = intel["matrix"]
-    dom = intel["crypto_dom"]
-    deriv = intel["deriv_onchain"]
-    cal = intel["calendar_narr"]
-    ext = intel["extended"]
-
-    macro_bias = _derive_macro_bias(macro, matrix)
-
-    xau_raw = alpha_engine.build_cascade_setups("XAUUSD", feeds, macro_bias)
-    btc_raw = alpha_engine.build_cascade_setups("BTCUSD", feeds, macro_bias)
-
-    xau_bundle, xau_model = alpha_engine.refine_setups_with_flagship_ai("XAUUSD", xau_raw, intel, ai_router)
-    btc_bundle, btc_model = alpha_engine.refine_setups_with_flagship_ai("BTCUSD", btc_raw, intel, ai_router)
-
-    xau_score = alpha_engine.calculate_confluence_score("XAUUSD", intel, macro_bias, xau_raw.get("mtf_ladder"))
-    btc_score = alpha_engine.calculate_confluence_score("BTCUSD", intel, macro_bias, btc_raw.get("mtf_ladder"))
-
-    xau_ok, xau_err = alpha_engine.verify_setup_before_send(xau_bundle, cal["news_blackout_active"], xau_score)
-    btc_ok, btc_err = alpha_engine.verify_setup_before_send(btc_bundle, cal["news_blackout_active"], btc_score)
-    all_ok = xau_ok and btc_ok
-
-    sys_prompt = (
-        "Anda adalah Institutional Quant Strategist. Tulis analisis 3 poin padat dalam Bahasa Indonesia "
-        "(1. Makro & Likuiditas, 2. Konfluensi Intermarket, On-Chain & Orderflow, 3. Skeptic Veto & Risiko Pembatalan). "
-        "Jangan gunakan simbol < atau >."
-    )
-    usr_prompt = (
-        f"Sesi: {session_name}. Makro: NetLiq={macro['net_liquidity_b']}B, DFII10={macro['dfii10']}%, "
-        f"US02Y={macro['us02y']}%, US10Y={macro['us10y']}%, FEDFUNDS={macro['fedfunds']}%, "
-        f"DXY={matrix['DXY']['price']}, USOIL={matrix['USOIL']['price']}, NDX={matrix['NASDAQ100']['price']}, "
-        f"SPX={matrix['SP500']['price']}, VIX={matrix['VIX']['price']}, XAGUSD={ext['xagusd']}. "
-        f"Crypto Dom: TOTAL={dom['TOTAL_B']}B, TOTAL2={dom['TOTAL2_B']}B, TOTAL3={dom['TOTAL3_B']}B, "
-        f"BTC.D={dom['BTC_D']}%, USDT.D={dom['USDT_D']}%. "
-        f"Derivatif/On-Chain: Funding={deriv['funding_rate_pct']}%, OI={deriv['open_interest_btc']}, "
-        f"L/S={deriv['long_short_ratio']}, TakerBS={ext['taker_buy_sell_ratio']}, "
-        f"CoinbasePrem={ext['coinbase_premium_pct']}%, Stable7D={deriv['stablecoin_7d_flow_b']}B, "
-        f"FnG={deriv['fear_greed_value']} ({deriv['fear_greed_label']}). "
-        f"Kalender Merah: {cal['high_impact_upcoming']}. Narasi: {cal['narrative_watch']}."
-    )
-    narrative_raw, narrative_model = ai_router.generate(sys_prompt, usr_prompt, max_tokens=750)
-    narrative_safe = html.escape(narrative_raw)
-
-    record_id = save_signal_record(
-        session_name=session_name,
-        ai_model=f"Setup:{xau_model} | Analisa:{narrative_model}",
-        xau_price=xau_bundle.get("live_price", 0.0),
-        btc_price=btc_bundle.get("live_price", 0.0),
-        macro_bias=macro_bias,
-        audit_passed=all_ok,
-        payload={
-            "xau": xau_bundle.get("setups", {}),
-            "btc": btc_bundle.get("setups", {}),
-        },
-    )
-
-    audit_status = (
-        "✅ TERVERIFIKASI AMAN (6/6 Audit Gate Lolos)"
-        if all_ok
-        else f"⚠️ DITAHAN AUDIT GATE: {html.escape(', '.join(xau_err + btc_err))}"
-    )
-
-    report_header = (
-        f"🏛 <b>AGENT QUANT LANG - SNIPER ENTRY INSTITUTIONAL ORDERFLOW</b>\n"
-        f"🕒 {now_str}\n"
-        f"🧠 AI Engine (Setup): <code>{html.escape(xau_model)}</code>\n"
-        f"🧠 AI Engine (Analisa): <code>{html.escape(narrative_model)}</code>\n"
-        f"🌐 Sesi: {session_name} | Kuota Sesi: <b>{quota_left}/{MAX_ENTRIES_PER_SESSION}</b>\n"
-        f"📈 Audit Win Rate: <b>{perf_stats['win_rate_pct']}%</b> ({perf_stats['wins']}W/{perf_stats['losses']}L) | "
-        f"Daily PnL: <b>{perf_stats['daily_pnl_pct']}%</b>\n"
-        f"📡 Telemetry API: {html.escape(intel['telemetry_summary'])}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 <b>RINGKASAN KONFIRMASI &amp; 8 PILAR INTERMARKET</b>\n"
-        f"🥇 <b>XAUUSD (Live: {xau_bundle.get('live_price')})</b> — Bias: <b>{macro_bias}</b> | Skor: <b>{xau_score}/100</b>\n"
-        f"₿ <b>BTCUSDT (Live: {btc_bundle.get('live_price')})</b> — Bias: <b>{macro_bias}</b> | Skor: <b>{btc_score}/100</b>\n\n"
-        f"• <b>Makro &amp; Yields:</b> NetLiq <code>${macro['net_liquidity_b']}B</code> | DFII10 <code>{macro['dfii10']}%</code> | "
-        f"US02Y <code>{macro['us02y']}%</code> | US10Y <code>{macro['us10y']}%</code> | FEDFUNDS <code>{macro['fedfunds']}%</code>\n"
-        f"• <b>Lawan Pair:</b> DXY <code>{matrix['DXY']['price']}</code> | USOIL <code>{matrix['USOIL']['price']}</code> | "
-        f"NDX <code>{matrix['NASDAQ100']['price']}</code> | SPX <code>{matrix['SP500']['price']}</code> | VIX <code>{matrix['VIX']['price']}</code>\n"
-        f"• <b>Crypto Cap &amp; Dom:</b> TOTAL <code>${dom['TOTAL_B']}B</code> | TOTAL2 <code>${dom['TOTAL2_B']}B</code> | "
-        f"TOTAL3 <code>${dom['TOTAL3_B']}B</code> | BTC.D <code>{dom['BTC_D']}%</code> | USDT.D <code>{dom['USDT_D']}%</code>\n"
-        f"• <b>On-Chain &amp; Orderflow:</b> Stable7D <code>${deriv['stablecoin_7d_flow_b']}B</code> | "
-        f"Funding <code>{deriv['funding_rate_pct']}%</code> | L/S <code>{deriv['long_short_ratio']}</code> | "
-        f"TakerBS <code>{ext['taker_buy_sell_ratio']}</code> | CBPrem <code>{ext['coinbase_premium_pct']}%</code> | "
-        f"FnG <code>{deriv['fear_greed_value']} ({deriv['fear_greed_label']})</code>\n"
-        f"• <b>Kalender Tier-1:</b> {html.escape(cal['high_impact_upcoming'])}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{narrative_safe}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{_format_asset_mapping('🥇 MAPPING SNIPER XAUUSD (ZERO FLOATING)', xau_bundle)}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{_format_asset_mapping('₿ MAPPING SNIPER BTCUSDT (ZERO FLOATING)', btc_bundle)}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🛡 <b>Pre-Send Verification Gate (ID #{record_id}):</b> {audit_status}"
-    )
-
-    inline_buttons = {
-        "inline_keyboard": [
+    for horizon_title, st in setups.items():
+        lines.extend(
             [
-                {"text": "✅ Approve & Eksekusi 1-3 Layer", "callback_data": f"approve_{record_id}"},
-                {"text": "❌ Reject / Skip", "callback_data": f"reject_{record_id}"},
+                f"🎯 {horizon_title} — [{st['direction']}] (RR: {st['rr']})",
+                f"- Rantai MTF: {st['tf_chain']} ({st['aligned_count']})",
+                f"- Sniper Limit Entry (1-3 Layer): {st['entry']}",
+                f"- Tight Stop Loss: {st['sl']}",
+                f"- TP1 (Geser SL ke BEP+1): {st['tp1']}",
+                f"- TP2 / TP3 Runner: {st['tp2']} | {st['tp3']}",
+                f"- Alasan Presisi: {st['reason']}",
+                "",
             ]
-        ]
-    }
-    send_telegram_message(report_header, chat_id=target_chat_id, reply_markup=inline_buttons)
+        )
+    lines.append(f"AI Engine Aktif: {engine_name}")
+    return "\n".join(lines)
 
 
-def handle_copilot_live_chat(user_message: str) -> str:
-    session_name, quota_left = get_session_quota_info()
-    sys_prompt = (
-        "Anda adalah QUANT CO-PILOT LIVE untuk sistem AGENT QUANT LANG - SNIPER ENTRY INSTITUTIONAL ORDERFLOW. "
-        "Anda selalu menggunakan Multi-Timeframe dari M1 (Menit 1) membesar ke 1MON (1 Bulan), SMC, Orderflow, "
-        "dan manajemen risiko ketat 0.5% - 2% per trade. Jawab ringkas, tajam, dan terstruktur dalam Bahasa Indonesia."
-    )
-    context_prompt = (
-        f"[Konteks Sesi Aktif: {session_name} | Sisa Kuota Sesi: {quota_left}/{MAX_ENTRIES_PER_SESSION}]\n"
-        f"Pesan CEO/Trader: {user_message}"
-    )
-    reply_raw, active_model = ai_router.generate(sys_prompt, context_prompt, max_tokens=900)
-    reply_safe = html.escape(reply_raw)
+def build_and_send_institutional_report(trigger: str = "Scheduled"):
+    intel = feeds.collect_all_8_pillars()
+    blackout, news_list = feeds.check_usd_news_blackout()
+    breaking = feeds.fetch_realtime_breaking_news(limit=5)
 
-    return (
-        f"💬 <b>AGENT QUANT LANG — CO-PILOT LIVE</b> (<code>{html.escape(active_model)}</code>)\n"
-        f"🌐 Sesi: {session_name} | Kuota: <b>{quota_left}/{MAX_ENTRIES_PER_SESSION}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{reply_safe}"
-    )
+    # Tentukan bias makro awal dari DXY & Real Yield
+    dxy = intel["matrix"]["DXY"]["price"]
+    macro_bias = "BULLISH" if (dxy == 0 or dxy < 104.0) else "BEARISH"
+
+    summary_parts = [
+        f"Update ({trigger}): {intel['telemetry_summary']}",
+        f"News Blackout: {blackout} {news_list}",
+        "Breaking Headlines: " + " | ".join(h["title"] for h in breaking[:3]),
+    ]
+
+    for sym in ("XAUUSD", "BTCUSDT"):
+        raw_bundle = alpha_engine.build_cascade_setups(sym, feeds, macro_bias)
+        refined_bundle, engine_name = alpha_engine.refine_setups_with_flagship_ai(sym, raw_bundle, intel, ai_router)
+        score = alpha_engine.calculate_confluence_score(sym, intel, macro_bias, refined_bundle.get("mtf_ladder"))
+        passed, errors = alpha_engine.verify_setup_before_send(refined_bundle, blackout, score)
+
+        setup_id = save_setup_bundle(sym, refined_bundle["live_price"], score, refined_bundle)
+        msg = format_asset_report(sym, refined_bundle, score, engine_name, passed, errors)
+
+        # 3 Tombol Approve Terpisah + 1 Tombol Reject
+        buttons = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Approve Scalp", "callback_data": f"approve_scalp_{setup_id}"},
+                    {"text": "✅ Approve Intraday", "callback_data": f"approve_intraday_{setup_id}"},
+                ],
+                [
+                    {"text": "✅ Approve Swing", "callback_data": f"approve_swing_{setup_id}"},
+                    {"text": "❌ Reject", "callback_data": f"reject_{setup_id}"},
+                ],
+            ]
+        }
+        send_telegram(msg, reply_markup=buttons)
+        summary_parts.append(f"{sym} Score {score}/100: {json.dumps(refined_bundle.get('setups', {}))[:450]}")
+
+    LATEST_CONTEXT_CACHE["updated"] = datetime.datetime.now(WIB).strftime("%Y-%m-%d %H:%M WIB")
+    LATEST_CONTEXT_CACHE["summary"] = "\n".join(summary_parts)
 
 
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"AGENT QUANT LANG 24/7 ONLINE")
+def handle_status_api():
+    send_telegram("Memeriksa status & latensi seluruh API dan Model AI Flagship...")
+    statuses = feeds.check_all_api_statuses(ai_router)
+    lines = [f"STATUS KONEKSI API & AI REAL-TIME ({datetime.datetime.now(WIB).strftime('%H:%M WIB')})\n"]
+    for item in statuses:
+        lines.append(f"{item['status']} {item['name']} ({item['latency']})\n   └ {item['detail']}")
+    send_telegram("\n".join(lines))
 
-    def log_message(self, format, *args):
+
+def handle_breaking_news():
+    headlines = feeds.fetch_realtime_breaking_news(limit=8)
+    blackout, active_ev = feeds.check_usd_news_blackout()
+    if not headlines:
+        send_telegram("Belum ada headline breaking news baru yang tertangkap dari feed RSS.")
         return
 
+    raw_text = "\n".join(f"- [{h['source']}] {h['title']}" for h in headlines)
+    prompt = (
+        f"Ini adalah headline breaking news real-time terbaru:\n{raw_text}\n\n"
+        f"Terjemahkan poin terpenting ke Bahasa Indonesia dan simpulkan dalam 3 bullet singkat "
+        f"arah dampaknya terhadap XAUUSD (Emas), DXY, dan BTCUSDT."
+    )
+    ai_summary, eng = ai_router.generate_with_flagship_cascade(prompt)
+    header = (
+        f"RADAR BREAKING NEWS REAL-TIME ({datetime.datetime.now(WIB).strftime('%H:%M WIB')})\n"
+        f"Rem Darurat News USD (±45m): {'AKTIF ' + str(active_ev) if blackout else 'AMAN'}\n\n"
+        f"{raw_text}\n\n"
+    )
+    if ai_summary:
+        header += f"ANALISA DAMPAK HARGA ({eng}):\n{ai_summary}"
+    send_telegram(header)
 
-def start_health_server():
-    port = int(os.getenv("PORT", "8080"))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+
+def handle_speech_transcript(url_arg: str):
+    if not url_arg:
+        send_telegram("Kirim format: /transkrip <link_youtube_live_fed_atau_trump>")
+        return
+    send_telegram("Menyedot transkrip live pidato & menganalisis arah pergerakan XAUUSD/BTCUSDT...")
+    transcript = feeds.fetch_live_speech_transcript(url_arg)
+    if not transcript:
+        send_telegram("Transkrip belum tersedia pada video tersebut (pastikan Closed Captions/CC YouTube aktif).")
+        return
+
+    prompt = (
+        f"Berikut potongan transkrip langsung pidato The Fed / pejabat AS:\n\"{transcript[:3500]}\"\n\n"
+        f"1. Terjemahkan inti pernyataan terpenting ke Bahasa Indonesia.\n"
+        f"2. Tentukan apakah nadanya HAWKISH (USD naik, XAUUSD turun) atau DOVISH (USD turun, XAUUSD naik).\n"
+        f"3. Berikan proyeksi pergerakan setelah pidato selesai untuk XAUUSD dan BTCUSDT."
+    )
+    analysis, eng = ai_router.generate_with_flagship_cascade(prompt)
+    send_telegram(f"TRANSKRIP & ANALISA PIDATO LIVE ({eng}):\n\n{analysis or transcript[:1500]}")
 
 
-def run_247_polling_and_scheduler():
+def process_callback_query(cb: dict):
+    cb_id = cb["id"]
+    data = cb.get("data", "")
+    from_id = str(cb.get("from", {}).get("id", ""))
+
+    # Jawab callback immediately agar tombol di HP berhenti berputar
+    requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+        json={"callback_query_id": cb_id, "text": "Memproses perintah..."},
+        timeout=8,
+    )
+
+    if TELEGRAM_CHAT_ID and from_id != TELEGRAM_CHAT_ID:
+        return
+
+    parts = data.split("_")
+    if len(parts) == 2 and parts[0] == "reject":
+        sid = int(parts[1])
+        update_setup_status(sid, "REJECTED")
+        send_telegram(f"❌ Setup #{sid} DITOLAK & diabaikan.")
+        return
+
+    if len(parts) == 3 and parts[0] == "approve":
+        horizon_code = parts[1].upper()  # SCALP / INTRADAY / SWING
+        sid = int(parts[2])
+        record = get_setup_bundle(sid)
+        if not record:
+            send_telegram(f"⚠️ Data Setup #{sid} tidak ditemukan di database.")
+            return
+
+        setups = record["bundle"].get("setups", {})
+        horizon_key_map = {
+            "SCALP": "SESI / SCALP (M1-M5-M15)",
+            "INTRADAY": "INTRADAY (M1-M5-M15-M30-H1-H4)",
+            "SWING": "SWING / POSITION (M1-M5-M15-M30-H1-H4-D1-W1-1MON)",
+        }
+        chosen_key = horizon_key_map.get(horizon_code, "")
+        chosen_setup = setups.get(chosen_key)
+        if not chosen_setup:
+            send_telegram(f"⚠️ Horizon {horizon_code} pada Setup #{sid} kosong.")
+            return
+
+        res = exec_engine.execute_horizon_setup(record["symbol"], horizon_code, chosen_setup)
+        update_setup_status(sid, f"APPROVED_{horizon_code}")
+        layers_txt = "\n".join(
+            f"  - Layer {l['layer']}: {l['order_type']} @ {l['price']} | Lot: {l['lot']} | SL: {l['sl']} | TP: {l['tp']}"
+            for l in res["plan"]["layers"]
+        )
+        send_telegram(
+            f"✅ EKSEKUSI {horizon_code} DISETUJUI — {record['symbol']} (Setup #{sid})\n"
+            f"Mode: {res['mode']}\n"
+            f"{layers_txt}\n\n"
+            f"Status: {res['message']}"
+        )
+
+
+def telegram_polling_loop():
     if not TELEGRAM_BOT_TOKEN:
-        print("[ERROR] TELEGRAM_BOT_TOKEN kosong.")
+        print("TELEGRAM_BOT_TOKEN kosong, listener tidak dijalankan.")
         return
+
+    base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    # Wajib hapus webhook lama agar getUpdates menerima tombol & chat live tanpa konflik
+    try:
+        requests.get(f"{base_url}/deleteWebhook", params={"drop_pending_updates": False}, timeout=10)
+    except Exception:
+        pass
 
     offset = 0
-    last_sent_slot = ""
-    last_audit_minute = -1
-    print("[BOT] AGENT QUANT LANG 24/7 aktif...")
-
     while True:
-        now_wib = datetime.datetime.now(WIB)
-
-        if now_wib.minute % 15 == 0 and now_wib.minute != last_audit_minute:
-            last_audit_minute = now_wib.minute
-            try:
-                outcome_verifier.verify_all_approved_setups()
-            except Exception as exc:
-                print(f"[AUDIT VERIFIER] {exc}")
-
-        slot_key = now_wib.strftime("%Y-%m-%d_%H")
-        if now_wib.hour in (8, 14, 19) and now_wib.minute == 0 and slot_key != last_sent_slot:
-            last_sent_slot = slot_key
-            try:
-                build_and_send_institutional_report()
-            except Exception as exc:
-                print(f"[ERROR REPORT] {exc}")
-
         try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-            resp = requests.get(url, params={"offset": offset, "timeout": 25}, timeout=30).json()
-            for update in resp.get("result", []):
-                offset = update["update_id"] + 1
+            resp = requests.get(f"{base_url}/getUpdates", params={"offset": offset, "timeout": 30}, timeout=35).json()
+            for item in resp.get("result", []):
+                offset = item["update_id"] + 1
 
-                if "callback_query" in update:
-                    cb = update["callback_query"]
-                    cb_data = cb.get("data", "")
-                    cb_chat = str(cb["message"]["chat"]["id"])
-                    requests.post(
-                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-                        json={"callback_query_id": cb["id"]},
-                        timeout=10,
+                if "callback_query" in item:
+                    threading.Thread(target=process_callback_query, args=(item["callback_query"],), daemon=True).start()
+                    continue
+
+                msg = item.get("message", {})
+                text = msg.get("text", "").strip()
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                if not text or (TELEGRAM_CHAT_ID and chat_id != TELEGRAM_CHAT_ID):
+                    continue
+
+                low = text.lower()
+                if low in ("/start", "/help"):
+                    send_telegram(
+                        "🤖 QUANT AGENTLANG 24/7 AKTIF (Mode Interaktif + Eksekusi)\n\n"
+                        "Perintah Cepat:\n"
+                        "• /report atau /cek — Scan M1-1MON & kirim setup dengan 3 tombol Approve\n"
+                        "• /status_api — Cek status & latensi semua API + Model AI (Argon/Claude)\n"
+                        "• /news — Radar breaking news real-time (Financial Juice, Fed, White House)\n"
+                        "• /transkrip <link_youtube> — Sedot teks pidato live The Fed / Trump & analisis arah harga\n"
+                        "• Chat bebas kapan saja — Ketik pertanyaan apa saja untuk diskusi langsung dengan AI!"
                     )
-                    if cb_data.startswith("approve_"):
-                        rec_id = int(cb_data.split("_")[1])
-                        session_now, quota_left = get_session_quota_info()
-                        perf_now = outcome_verifier.get_performance_summary()
+                elif low in ("/report", "/cek"):
+                    send_telegram("⏳ Memindai 9 timeframe (M1-1MON), Orderflow, Heatmap & SMT Divergence...")
+                    threading.Thread(
+                        target=build_and_send_institutional_report, args=("Manual /report",), daemon=True
+                    ).start()
+                elif low == "/status_api":
+                    threading.Thread(target=handle_status_api, daemon=True).start()
+                elif low == "/news":
+                    threading.Thread(target=handle_breaking_news, daemon=True).start()
+                elif low.startswith("/transkrip"):
+                    arg = text[len("/transkrip") :].strip()
+                    threading.Thread(target=handle_speech_transcript, args=(arg,), daemon=True).start()
+                else:
+                    # Live Chat Bebas dengan Flagship AI (Gemini 4 Argon / Claude)
+                    def reply_chat(q=text):
+                        if LATEST_CONTEXT_CACHE["updated"] == "Belum ada scan":
+                            snap = feeds.collect_all_8_pillars()
+                            LATEST_CONTEXT_CACHE["summary"] = snap["telemetry_summary"]
+                        ans, eng = ai_router.chat_live(q, LATEST_CONTEXT_CACHE["summary"])
+                        send_telegram(f"{ans}\n\n[{eng}]")
 
-                        if quota_left <= 0:
-                            send_telegram_message(
-                                f"⛔ <b>KUOTA SESI HABIS ({MAX_ENTRIES_PER_SESSION}/{MAX_ENTRIES_PER_SESSION})</b> untuk {session_now}. "
-                                f"Setup #{rec_id} ditahan demi mencegah overtrading.",
-                                chat_id=cb_chat,
-                            )
-                        else:
-                            update_signal_status(rec_id, "APPROVED")
-                            payload_data = get_signal_payload(rec_id)
-                            exec_receipt = execution_engine.execute_approved_setup(
-                                rec_id, payload_data, perf_now["daily_pnl_pct"]
-                            )
-                            send_telegram_message(
-                                f"✅ <b>Setup #{rec_id} DISETUJUI.</b>\n\n{exec_receipt}",
-                                chat_id=cb_chat,
-                            )
+                    threading.Thread(target=reply_chat, daemon=True).start()
+        except Exception as e:
+            print("Polling error:", e)
+            time.sleep(4)
 
-                    elif cb_data.startswith("reject_"):
-                        rec_id = int(cb_data.split("_")[1])
-                        update_signal_status(rec_id, "REJECTED")
-                        send_telegram_message(
-                            f"❌ <b>Setup #{rec_id} DILEWATI.</b> Kuota sesi tetap utuh dan aman.",
-                            chat_id=cb_chat,
-                        )
 
-                elif "message" in update and "text" in update["message"]:
-                    msg_text = update["message"]["text"].strip()
-                    chat_id = str(update["message"]["chat"]["id"])
-                    cmd = msg_text.lower()
-
-                    if cmd in ("/report", "report", "analisa", "sinyal"):
-                        send_telegram_message("⏳ Menarik 8 Pilar Data & memindai Cascade M1 → 1MON...", chat_id=chat_id)
-                        build_and_send_institutional_report(target_chat_id=chat_id)
-                    elif cmd in ("/stats", "/audit", "stats", "audit"):
-                        stats = outcome_verifier.verify_all_approved_setups()
-                        send_telegram_message(
-                            f"📊 <b>AUDIT PERFORMA &amp; WIN RATE RIIL</b>\n"
-                            f"• Total Setup Approved: <b>{stats['total_approved']}</b>\n"
-                            f"• Menang (TP1/TP2/TP3/BEP): <b>{stats['wins']}</b> | Kalah (SL): <b>{stats['losses']}</b>\n"
-                            f"• Win Rate Aktual: <b>{stats['win_rate_pct']}%</b>\n"
-                            f"• Akumulasi Profit: <b>{stats['total_r']}R</b> | Daily PnL: <b>{stats['daily_pnl_pct']}%</b>",
-                            chat_id=chat_id,
-                        )
-                    elif cmd in ("/status", "status"):
-                        session_now, quota_left = get_session_quota_info()
-                        chain_label = f"{ai_router.primary_gemini} → {ai_router.primary_claude} → {ai_router.fallback_gemini}"
-                        send_telegram_message(
-                            f"🟢 <b>AGENT QUANT LANG ONLINE</b>\n"
-                            f"• Sesi Aktif: {session_now}\n"
-                            f"• Sisa Kuota Sesi: <b>{quota_left}/{MAX_ENTRIES_PER_SESSION}</b>\n"
-                            f"• Prioritas AI: <code>{html.escape(chain_label)}</code>",
-                            chat_id=chat_id,
-                        )
-                    else:
-                        reply = handle_copilot_live_chat(msg_text)
-                        send_telegram_message(reply, chat_id=chat_id)
-
-        except Exception as exc:
-            print(f"[POLLING RETRY] {exc}")
-            time.sleep(3)
+def scheduled_loop():
+    time.sleep(10)
+    while True:
+        try:
+            build_and_send_institutional_report("Auto-Scan 24/7")
+        except Exception as e:
+            print("Scheduler error:", e)
+        time.sleep(AUTO_SCAN_INTERVAL_SEC)
 
 
 if __name__ == "__main__":
-    init_audit_db()
-    is_github_actions = os.getenv("GITHUB_ACTIONS", "").lower() == "true"
-    is_report_flag = "--report" in sys.argv or os.getenv("RUN_MODE", "").lower() == "report"
-
-    if is_github_actions or is_report_flag:
-        build_and_send_institutional_report()
+    init_db()
+    if "--report" in sys.argv:
+        build_and_send_institutional_report("GitHub Actions Scheduled")
     else:
-        start_health_server()
-        run_247_polling_and_scheduler()
+        threading.Thread(target=scheduled_loop, daemon=True).start()
+        telegram_polling_loop()
