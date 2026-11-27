@@ -1,6 +1,6 @@
 import os
 import requests
-
+UnifiedAIRouter = MultiTierAIRouter
 
 class MultiTierAIRouter:
     def __init__(self):
