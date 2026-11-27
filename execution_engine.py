@@ -9,11 +9,11 @@ import requests
 class InstitutionalExecutionEngine:
     """
     Mesin Eksekusi Institusional:
-    - Menghitung Position Sizing dinamis (0.5% - 2% risk per trade)
+    - Position Sizing dinamis (0.5% - 2% risk per trade)
     - Memecah Limit Order menjadi 1-3 Layer Sniper
-    - Mengaktifkan pengaman Auto BEP+1 saat TP1 tersentuh
-    - Memblokir order otomatis jika Daily Drawdown menyentuh batas Kill Switch (3% - 5%)
-    - Mendukung Mode: PAPER_SIMULATION (Default), BINANCE_TESTNET, dan MT5_WEBHOOK
+    - Auto BEP+1 saat TP1 tersentuh
+    - Kill Switch otomatis jika Daily Drawdown melewati batas (3% - 5%)
+    - Mendukung PAPER_SIMULATION, BINANCE_TESTNET, dan MT5_WEBHOOK
     """
 
     def __init__(self):
@@ -27,9 +27,6 @@ class InstitutionalExecutionEngine:
         self.mt5_webhook_url = os.getenv("MT5_WEBHOOK_URL", "").strip()
 
     def check_kill_switch(self, daily_pnl_pct: float) -> tuple[bool, str]:
-        """
-        Memeriksa apakah kerugian harian sudah menyentuh batas Kill Switch (-3.0%).
-        """
         if daily_pnl_pct <= -abs(self.max_daily_dd_pct):
             return False, (
                 f"KILL SWITCH AKTIF: Kerugian harian ({daily_pnl_pct:.2f}%) "
@@ -37,11 +34,13 @@ class InstitutionalExecutionEngine:
             )
         return True, "AMAN"
 
+    def _find_intraday_setup(self, asset_setups: dict) -> dict | None:
+        for key in ("INTRADAY (M30-H1-H4)", "INTRADAY (M1-M5-M15-M30-H1-H4)", "SESI / SCALP (M1-M5-M15)"):
+            if key in asset_setups and asset_setups[key]:
+                return asset_setups[key]
+        return None
+
     def build_layered_orders(self, symbol: str, setup: dict) -> list[dict]:
-        """
-        Memecah 1 setup menjadi 1-3 Layer Limit Order di antara Entry dan Stop Loss
-        dengan total risiko tetap terkunci pada self.risk_pct (0.5% - 2%).
-        """
         direction = setup["direction"]
         entry = float(setup["entry"])
         sl = float(setup["sl"])
@@ -70,7 +69,7 @@ class InstitutionalExecutionEngine:
 
         orders = []
         for idx, (weight, offset_ratio) in enumerate(zip(layer_weights, layer_offsets), start=1):
-            if direction == "SELL LIMIT":
+            if "SELL" in direction:
                 layer_price = round(entry + (stop_distance * offset_ratio), 2)
                 bep_price = round(layer_price - (stop_distance * 0.05), 2)
             else:
@@ -97,9 +96,6 @@ class InstitutionalExecutionEngine:
         return orders
 
     def _send_binance_testnet_order(self, order: dict) -> str:
-        """
-        Mengirim Limit Order ke Binance USD-M Futures Testnet (gratis, tanpa dana riil).
-        """
         base_url = "https://testnet.binancefuture.com"
         endpoint = "/fapi/v1/order"
         params = {
@@ -127,29 +123,24 @@ class InstitutionalExecutionEngine:
         return f"PaperFallback ({resp.status_code})"
 
     def execute_approved_setup(self, record_id: int, payload: dict, daily_pnl_pct: float = 0.0) -> str:
-        """
-        Menjalankan eksekusi saat tombol Approve ditekan di Telegram.
-        """
         is_safe, kill_msg = self.check_kill_switch(daily_pnl_pct)
         if not is_safe:
             return f"🛑 {kill_msg}"
 
         summary_lines = [f"⚡ <b>EKSEKUSI SNIPER AKTIF (Setup #{record_id})</b>"]
+        executed_any = False
 
-        for asset_key, horizon_target in [
-            ("xau", "INTRADAY (M1-M5-M15-M30-H1-H4)"),
-            ("btc", "INTRADAY (M1-M5-M15-M30-H1-H4)"),
-        ]:
+        for asset_key, symbol_label in [("xau", "XAUUSD"), ("btc", "BTCUSDT")]:
             asset_setups = payload.get(asset_key, {})
-            setup = asset_setups.get(horizon_target)
+            setup = self._find_intraday_setup(asset_setups)
             if not setup:
                 continue
 
-            symbol_label = "XAUUSD" if asset_key == "xau" else "BTCUSDT"
             layered = self.build_layered_orders(symbol_label, setup)
             if not layered:
                 continue
 
+            executed_any = True
             mode_tag = "PAPER-SIM"
             if asset_key == "btc" and self.binance_testnet_key and self.binance_testnet_secret:
                 try:
@@ -182,5 +173,8 @@ class InstitutionalExecutionEngine:
                 )
                 + f"• Hard SL: <code>{setup['sl']}</code> | Auto BEP+1 saat TP1 (<code>{setup['tp1']}</code>)"
             )
+
+        if not executed_any:
+            summary_lines.append("⚠️ Tidak ditemukan setup Intraday valid pada payload ini.")
 
         return "\n".join(summary_lines)
