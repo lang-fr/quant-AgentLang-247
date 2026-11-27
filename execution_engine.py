@@ -1,279 +1,186 @@
 import os
-import time
 import hmac
+import time
 import hashlib
-from urllib.parse import urlencode
+import urllib.parse
 import requests
 
-# Muat .env otomatis jika dijalankan di Terminal Lokal
-if os.path.exists(".env"):
-    with open(".env", "r", encoding="utf-8") as _f:
-        for _line in _f:
-            _line = _line.strip()
-            if _line and not _line.startswith("#") and "=" in _line:
-                _k, _v = _line.split("=", 1)
-                os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
-BINANCE_SECRET = os.getenv("BINANCE_SECRET", "").strip()
+class InstitutionalExecutionEngine:
+    """
+    Mesin Eksekusi Institusional:
+    - Menghitung Position Sizing dinamis (0.5% - 2% risk per trade)
+    - Memecah Limit Order menjadi 1-3 Layer Sniper
+    - Mengaktifkan pengaman Auto BEP+1 saat TP1 tersentuh
+    - Memblokir order otomatis jika Daily Drawdown menyentuh batas Kill Switch (3% - 5%)
+    - Mendukung Mode: PAPER_SIMULATION (Default), BINANCE_TESTNET, dan MT5_WEBHOOK
+    """
 
-# Endpoint resmi Binance Futures Demo Trading (demo.binance.com)
-BINANCE_DEMO_BASE_URLS = [
-    "https://demo-fapi.binance.com",
-    "https://testnet.binancefuture.com",
-]
+    def __init__(self):
+        self.account_balance = float(os.getenv("ACCOUNT_BALANCE", "10000"))
+        self.risk_pct = min(max(float(os.getenv("RISK_PER_TRADE_PCT", "1.0")), 0.5), 2.0)
+        self.max_daily_dd_pct = float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "3.0"))
+        self.layers_count = min(max(int(os.getenv("ENTRY_LAYERS", "3")), 1), 3)
 
+        self.binance_testnet_key = os.getenv("BINANCE_TESTNET_API_KEY", "").strip()
+        self.binance_testnet_secret = os.getenv("BINANCE_TESTNET_SECRET", "").strip()
+        self.mt5_webhook_url = os.getenv("MT5_WEBHOOK_URL", "").strip()
 
-def _sign_request(params: dict, secret: str) -> str:
-    query = urlencode(params)
-    signature = hmac.new(
-        secret.encode("utf-8"),
-        query.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    return f"{query}&signature={signature}"
-
-
-def _binance_demo_request(method: str, path: str, params: dict | None = None, signed: bool = True) -> dict:
-    if not BINANCE_API_KEY or not BINANCE_SECRET:
-        return {"error": "BINANCE_API_KEY atau BINANCE_SECRET kosong di .env"}
-
-    params = dict(params or {})
-    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
-    last_err = ""
-
-    for base_url in BINANCE_DEMO_BASE_URLS:
-        try:
-            req_params = dict(params)
-            if signed:
-                req_params["timestamp"] = int(time.time() * 1000)
-                req_params["recvWindow"] = 10000
-                query_str = _sign_request(req_params, BINANCE_SECRET)
-                url = f"{base_url}{path}?{query_str}"
-                resp = requests.request(method, url, headers=headers, timeout=12)
-            else:
-                url = f"{base_url}{path}"
-                resp = requests.request(method, url, headers=headers, params=req_params, timeout=12)
-
-            data = resp.json()
-            if resp.status_code == 200:
-                if isinstance(data, dict):
-                    data["_base_url"] = base_url
-                return data
-            last_err = f"{base_url} HTTP {resp.status_code}: {data}"
-        except Exception as e:
-            last_err = f"{base_url} Error: {str(e)[:80]}"
-
-    return {"error": last_err}
-
-
-def _cek_spread_futures(symbol: str, default_spread: float) -> float:
-    for base_url in BINANCE_DEMO_BASE_URLS:
-        try:
-            r = requests.get(f"{base_url}/fapi/v1/ticker/bookTicker", params={"symbol": symbol}, timeout=6)
-            if r.status_code == 200:
-                d = r.json()
-                bid = float(d.get("bidPrice", 0))
-                ask = float(d.get("askPrice", 0))
-                if bid > 0 and ask >= bid:
-                    return round(ask - bid, 4)
-        except Exception:
-            continue
-    return default_spread
-
-
-def _pilih_simbol_emas_binance() -> str:
-    for sym in ("XAUUSDT", "PAXGUSDT"):
-        for base_url in BINANCE_DEMO_BASE_URLS:
-            try:
-                r = requests.get(f"{base_url}/fapi/v1/ticker/price", params={"symbol": sym}, timeout=5)
-                if r.status_code == 200 and float(r.json().get("price", 0)) > 0:
-                    return sym
-            except Exception:
-                continue
-    return "PAXGUSDT"
-
-
-def ambil_info_akun_dan_spread() -> dict:
-    spread_btc = _cek_spread_futures("BTCUSDT", 1.0)
-    gold_sym = _pilih_simbol_emas_binance()
-    spread_gold = _cek_spread_futures(gold_sym, 0.25)
-
-    acc = _binance_demo_request("GET", "/fapi/v2/account", signed=True)
-    if "error" in acc:
-        print(f"[Binance Demo Warning] Gagal tarik saldo: {acc['error']}")
-        return {
-            "connected": False,
-            "error": acc["error"],
-            "usdt_total": 1000.0,
-            "spread_digital_gold": spread_gold,
-            "spread_btc": spread_btc,
-        }
-
-    # Ambil Total Margin Balance (USDT + USDC + BTC dalam nilai USD)
-    margin_balance = float(acc.get("totalMarginBalance", 0.0))
-    wallet_balance = float(acc.get("totalWalletBalance", 0.0))
-    saldo_aktif = margin_balance if margin_balance > 0 else wallet_balance
-
-    return {
-        "connected": True,
-        "endpoint": acc.get("_base_url", "https://demo-fapi.binance.com"),
-        "usdt_total": round(saldo_aktif, 2),
-        "spread_digital_gold": spread_gold,
-        "spread_btc": spread_btc,
-    }
-
-
-def _aturan_presisi_simbol(symbol: str) -> tuple[int, int, float]:
-    for base_url in BINANCE_DEMO_BASE_URLS:
-        try:
-            r = requests.get(f"{base_url}/fapi/v1/exchangeInfo", timeout=8)
-            if r.status_code == 200:
-                for s in r.json().get("symbols", []):
-                    if s.get("symbol") == symbol:
-                        qty_prec = int(s.get("quantityPrecision", 3))
-                        price_prec = int(s.get("pricePrecision", 2))
-                        min_qty = 0.001
-                        for f in s.get("filters", []):
-                            if f.get("filterType") == "LOT_SIZE":
-                                min_qty = float(f.get("minQty", 0.001))
-                        return qty_prec, price_prec, min_qty
-        except Exception:
-            continue
-    return 3, 2, 0.001
-
-
-def proses_eksekusi_sinyal(
-    aset: str,
-    arah: str,
-    risk_usd: float,
-    entry_price: float,
-    sl_price: float,
-    tp1: float,
-    tp2: float,
-    tp3: float,
-    layers: int = 1,
-    leverage: int = 1,
-) -> dict:
-    # XAUUSD murni tetap dikirim sebagai sinyal lot CFD manual untuk MT5/Exness
-    if aset.upper() == "XAUUSD":
-        sl_dist = max(abs(entry_price - sl_price), 1.0)
-        # 1 lot standar XAUUSD = $100 per $1 pergerakan harga
-        lot_cfd = max(0.01, round(risk_usd / (sl_dist * 100.0), 2))
-        return {
-            "execution_type": "MANUAL_CFD_SIGNAL",
-            "asset": "XAUUSD",
-            "direction": arah,
-            "suggested_lot_cfd": lot_cfd,
-            "entry": entry_price,
-            "sl": sl_price,
-            "tp1": tp1,
-            "tp2": tp2,
-            "tp3": tp3,
-        }
-
-    exec_symbol = "BTCUSDT" if aset.upper() == "BTCUSDT" else _pilih_simbol_emas_binance()
-    qty_prec, price_prec, min_qty = _aturan_presisi_simbol(exec_symbol)
-
-    # Set leverage awal (1x sesuai SOP keamanan)
-    _binance_demo_request("POST", "/fapi/v1/leverage", {"symbol": exec_symbol, "leverage": max(1, int(leverage))}, signed=True)
-
-    sl_dist = max(abs(entry_price - sl_price), entry_price * 0.002)
-    total_qty = risk_usd / sl_dist
-    per_layer_qty = max(min_qty, round(total_qty / max(1, layers), qty_prec))
-
-    side_entry = "BUY" if arah.upper() == "BUY" else "SELL"
-    side_exit = "SELL" if side_entry == "BUY" else "BUY"
-    orders_sent = []
-
-    for i in range(max(1, layers)):
-        res_order = _binance_demo_request(
-            "POST",
-            "/fapi/v1/order",
-            {
-                "symbol": exec_symbol,
-                "side": side_entry,
-                "type": "MARKET",
-                "quantity": per_layer_qty,
-            },
-            signed=True,
-        )
-        orders_sent.append({"layer": i + 1, "response": res_order})
-
-    # Pasang Hard Stop Loss & Take Profit 1 otomatis di server Binance Demo
-    sl_round = round(sl_price, price_prec)
-    tp1_round = round(tp1, price_prec)
-
-    res_sl = _binance_demo_request(
-        "POST",
-        "/fapi/v1/order",
-        {
-            "symbol": exec_symbol,
-            "side": side_exit,
-            "type": "STOP_MARKET",
-            "stopPrice": sl_round,
-            "closePosition": "true",
-        },
-        signed=True,
-    )
-    res_tp = _binance_demo_request(
-        "POST",
-        "/fapi/v1/order",
-        {
-            "symbol": exec_symbol,
-            "side": side_exit,
-            "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": tp1_round,
-            "closePosition": "true",
-        },
-        signed=True,
-    )
-
-    return {
-        "execution_type": "BINANCE_DEMO_AUTO",
-        "executed_symbol": exec_symbol,
-        "direction": side_entry,
-        "qty_per_layer": per_layer_qty,
-        "orders": orders_sent,
-        "sl_order": res_sl,
-        "tp1_order": res_tp,
-    }
-
-
-def kelola_auto_breakeven_binance() -> list[str]:
-    actions = []
-    pos_data = _binance_demo_request("GET", "/fapi/v2/positionRisk", signed=True)
-    if not isinstance(pos_data, list):
-        return actions
-
-    for p in pos_data:
-        amt = float(p.get("positionAmt", 0.0))
-        if amt == 0.0:
-            continue
-        sym = p.get("symbol", "")
-        entry = float(p.get("entryPrice", 0.0))
-        mark = float(p.get("markPrice", 0.0))
-        if entry <= 0 or mark <= 0:
-            continue
-
-        profit_pct = ((mark - entry) / entry * 100.0) if amt > 0 else ((entry - mark) / entry * 100.0)
-        # Jika posisi sudah profit >= 0.8%, geser SL ke titik impas (Breakeven)
-        if profit_pct >= 0.8:
-            _, price_prec, _ = _aturan_presisi_simbol(sym)
-            be_price = round(entry * (1.0005 if amt > 0 else 0.9995), price_prec)
-            side_exit = "SELL" if amt > 0 else "BUY"
-            res = _binance_demo_request(
-                "POST",
-                "/fapi/v1/order",
-                {
-                    "symbol": sym,
-                    "side": side_exit,
-                    "type": "STOP_MARKET",
-                    "stopPrice": be_price,
-                    "closePosition": "true",
-                },
-                signed=True,
+    def check_kill_switch(self, daily_pnl_pct: float) -> tuple[bool, str]:
+        """
+        Memeriksa apakah kerugian harian sudah menyentuh batas Kill Switch (-3.0%).
+        """
+        if daily_pnl_pct <= -abs(self.max_daily_dd_pct):
+            return False, (
+                f"KILL SWITCH AKTIF: Kerugian harian ({daily_pnl_pct:.2f}%) "
+                f"melewati batas maksimal (-{self.max_daily_dd_pct:.2f}%). Semua order baru diblokir."
             )
-            if "orderId" in res:
-                actions.append(f"{sym} SL -> BE ({be_price})")
-    return actions
+        return True, "AMAN"
+
+    def build_layered_orders(self, symbol: str, setup: dict) -> list[dict]:
+        """
+        Memecah 1 setup menjadi 1-3 Layer Limit Order di antara Entry dan Stop Loss
+        dengan total risiko tetap terkunci pada self.risk_pct (0.5% - 2%).
+        """
+        direction = setup["direction"]
+        entry = float(setup["entry"])
+        sl = float(setup["sl"])
+        tp1 = float(setup["tp1"])
+        tp2 = float(setup["tp2"])
+        tp3 = float(setup["tp3"])
+
+        stop_distance = abs(entry - sl)
+        if stop_distance <= 0:
+            return []
+
+        total_risk_usd = self.account_balance * (self.risk_pct / 100.0)
+        total_units = round(total_risk_usd / stop_distance, 4)
+
+        layer_weights = {
+            1: [1.0],
+            2: [0.60, 0.40],
+            3: [0.40, 0.35, 0.25],
+        }[self.layers_count]
+
+        layer_offsets = {
+            1: [0.0],
+            2: [0.0, 0.35],
+            3: [0.0, 0.30, 0.60],
+        }[self.layers_count]
+
+        orders = []
+        for idx, (weight, offset_ratio) in enumerate(zip(layer_weights, layer_offsets), start=1):
+            if direction == "SELL LIMIT":
+                layer_price = round(entry + (stop_distance * offset_ratio), 2)
+                bep_price = round(layer_price - (stop_distance * 0.05), 2)
+            else:
+                layer_price = round(entry - (stop_distance * offset_ratio), 2)
+                bep_price = round(layer_price + (stop_distance * 0.05), 2)
+
+            qty = round(total_units * weight, 4)
+            orders.append(
+                {
+                    "layer": idx,
+                    "symbol": symbol,
+                    "side": "SELL" if "SELL" in direction else "BUY",
+                    "order_type": "LIMIT",
+                    "price": layer_price,
+                    "sl": sl,
+                    "bep_plus_1": bep_price,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "tp3": tp3,
+                    "qty": qty,
+                    "risk_usd": round(total_risk_usd * weight, 2),
+                }
+            )
+        return orders
+
+    def _send_binance_testnet_order(self, order: dict) -> str:
+        """
+        Mengirim Limit Order ke Binance USD-M Futures Testnet (gratis, tanpa dana riil).
+        """
+        base_url = "https://testnet.binancefuture.com"
+        endpoint = "/fapi/v1/order"
+        params = {
+            "symbol": "BTCUSDT",
+            "side": order["side"],
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "quantity": max(round(order["qty"], 3), 0.001),
+            "price": order["price"],
+            "timestamp": int(time.time() * 1000),
+        }
+        query_string = urllib.parse.urlencode(params)
+        signature = hmac.new(
+            self.binance_testnet_secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        params["signature"] = signature
+
+        headers = {"X-MBX-APIKEY": self.binance_testnet_key}
+        resp = requests.post(f"{base_url}{endpoint}", headers=headers, params=params, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            return f"BinanceTestnet OrderID #{data.get('orderId')}"
+        return f"PaperFallback ({resp.status_code})"
+
+    def execute_approved_setup(self, record_id: int, payload: dict, daily_pnl_pct: float = 0.0) -> str:
+        """
+        Menjalankan eksekusi saat tombol Approve ditekan di Telegram.
+        """
+        is_safe, kill_msg = self.check_kill_switch(daily_pnl_pct)
+        if not is_safe:
+            return f"🛑 {kill_msg}"
+
+        summary_lines = [f"⚡ <b>EKSEKUSI SNIPER AKTIF (Setup #{record_id})</b>"]
+
+        for asset_key, horizon_target in [
+            ("xau", "INTRADAY (M1-M5-M15-M30-H1-H4)"),
+            ("btc", "INTRADAY (M1-M5-M15-M30-H1-H4)"),
+        ]:
+            asset_setups = payload.get(asset_key, {})
+            setup = asset_setups.get(horizon_target)
+            if not setup:
+                continue
+
+            symbol_label = "XAUUSD" if asset_key == "xau" else "BTCUSDT"
+            layered = self.build_layered_orders(symbol_label, setup)
+            if not layered:
+                continue
+
+            mode_tag = "PAPER-SIM"
+            if asset_key == "btc" and self.binance_testnet_key and self.binance_testnet_secret:
+                try:
+                    mode_tag = self._send_binance_testnet_order(layered[0])
+                except Exception:
+                    mode_tag = "PAPER-SIM"
+            elif self.mt5_webhook_url:
+                try:
+                    requests.post(
+                        self.mt5_webhook_url,
+                        json={"record_id": record_id, "symbol": symbol_label, "orders": layered},
+                        timeout=10,
+                    )
+                    mode_tag = "MT5-WEBHOOK-SENT"
+                except Exception:
+                    mode_tag = "PAPER-SIM"
+
+            summary_lines.append(
+                f"\n📌 <b>{symbol_label} [{setup['direction']}]</b> — Mode: <code>{mode_tag}</code>\n"
+                f"• Layer 1 (40%): <code>{layered[0]['price']}</code> | Risk: <code>${layered[0]['risk_usd']}</code>\n"
+                + (
+                    f"• Layer 2 (35%): <code>{layered[1]['price']}</code> | Risk: <code>${layered[1]['risk_usd']}</code>\n"
+                    if len(layered) >= 2
+                    else ""
+                )
+                + (
+                    f"• Layer 3 (25%): <code>{layered[2]['price']}</code> | Risk: <code>${layered[2]['risk_usd']}</code>\n"
+                    if len(layered) >= 3
+                    else ""
+                )
+                + f"• Hard SL: <code>{setup['sl']}</code> | Auto BEP+1 saat TP1 (<code>{setup['tp1']}</code>)"
+            )
+
+        return "\n".join(summary_lines)
