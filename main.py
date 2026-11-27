@@ -210,8 +210,8 @@ def build_and_send_institutional_report(target_chat_id: str = None):
     btc_bundle, btc_model = alpha_engine.refine_setups_with_flagship_ai("BTCUSD", btc_raw, intel, ai_router)
 
     # 3. Pre-Send Verification Gate (6 syarat keamanan)
-    xau_score = alpha_engine.calculate_confluence_score("XAUUSD", intel, macro_bias)
-btc_score = alpha_engine.calculate_confluence_score("BTCUSD", intel, macro_bias)
+    xau_score = alpha_engine.calculate_confluence_score("XAUUSD", intel, macro_bias, xau_raw.get("mtf_ladder"))
+    btc_score = alpha_engine.calculate_confluence_score("BTCUSD", intel, macro_bias, btc_raw.get("mtf_ladder"))
 
     xau_ok, xau_err = alpha_engine.verify_setup_before_send(xau_bundle, cal["news_blackout_active"], xau_score)
     btc_ok, btc_err = alpha_engine.verify_setup_before_send(btc_bundle, cal["news_blackout_active"], btc_score)
