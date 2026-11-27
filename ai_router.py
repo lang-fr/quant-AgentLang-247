@@ -16,6 +16,18 @@ class FlagshipAIRouter:
     serta menyediakan fallback aman agar proses tidak langsung crash jika API key belum diset.
     """
 
+    def refine_setup(self, prompt: str, system_instruction: str = "") -> str:
+        """
+        Method yang dipanggil oleh smc_alpha.py (refine_setups_with_flagship_ai)
+        untuk memperhalus analisis setup/sinyal trading menggunakan LLM.
+        """
+        default_sys = (
+            system_instruction
+            or "Anda adalah analis kuantitatif institusional (SMC, ICT, Order Flow, OHLC). "
+               "Ringkas, tajam, objektif, dan sertakan invalidasi risiko yang jelas."
+        )
+        return self.generate(prompt=prompt, system_instruction=default_sys)
+
     def __init__(
         self,
         gemini_api_key: Optional[str] = None,
