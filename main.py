@@ -774,7 +774,8 @@ def telegram_polling_loop():
                 elif low.startswith("/transkrip"):
                     arg = text[len("/transkrip") :].strip()
                     threading.Thread(target=handle_speech_transcript, args=(arg,), daemon=True).start()
-                   elif low.startswith("/backtest"):
+
+                elif low.startswith("/backtest"):
                     sym_arg = "BTCUSDT" if "btc" in low else "XAUUSD"
                     send_telegram(f"⏳ Menjalankan Out-of-Sample Backtest & 1.000x Monte Carlo untuk {sym_arg}...")
                     threading.Thread(
