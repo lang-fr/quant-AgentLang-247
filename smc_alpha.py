@@ -194,17 +194,26 @@ class InstitutionalSMCAlphaEngine:
         # Scan bertahap dari M1 -> M5 -> M15 -> M30 -> H1 -> H4 -> 1D -> 1W -> 1M
         dfs, ladder = self.scan_all_timeframes(symbol)
 
-        ltf_df = pd.concat([d.tail(60) for d in [dfs.get("M1"), dfs.get("M5")] if d is not None and not d.empty], ignore_index=True)
-        itf_df = pd.concat([d.tail(80) for d in [dfs.get("M15"), dfs.get("M30"), dfs.get("H1"), dfs.get("H4")] if d is not None and not d.empty], ignore_index=True)
-        htf_df = pd.concat([d.tail(60) for d in [dfs.get("1D"), dfs.get("1W")] if d is not None and not d.empty], ignore_index=True)
+        ltf_df = pd.concat(
+            [d.tail(60) for d in [dfs.get("M1"), dfs.get("M5")] if d is not None and not d.empty],
+            ignore_index=True,
+        )
+        itf_df = pd.concat(
+            [d.tail(80) for d in [dfs.get("M15"), dfs.get("M30"), dfs.get("H1"), dfs.get("H4")] if d is not None and not d.empty],
+            ignore_index=True,
+        )
+        htf_df = pd.concat(
+            [d.tail(60) for d in [dfs.get("1D"), dfs.get("1W")] if d is not None and not d.empty],
+            ignore_index=True,
+        )
         mtf_df = dfs.get("1M") if (dfs.get("1M") is not None and not dfs.get("1M").empty) else dfs.get("1W")
 
         primary_dir = "SELL LIMIT" if macro_bias == "BEARISH" else "BUY LIMIT"
 
         scalp_base = self._compute_zone_setup(ltf_df, live_price, primary_dir, is_xau, "SCALP")
-     intra_base = self._compute_zone_setup(itf_df, live_price, primary_dir, is_xau, "INTRADAY")
-     swing_base = self._compute_zone_setup(htf_df, live_price, primary_dir, is_xau, "SWING")
-     hold_base = self._compute_zone_setup(mtf_df, live_price, "BUY LIMIT", is_xau, "HOLD")
+        intra_base = self._compute_zone_setup(itf_df, live_price, primary_dir, is_xau, "INTRADAY")
+        swing_base = self._compute_zone_setup(htf_df, live_price, primary_dir, is_xau, "SWING")
+        hold_base = self._compute_zone_setup(mtf_df, live_price, "BUY LIMIT", is_xau, "HOLD")
 
         ladder_summary = " | ".join(
             [f"{tf}:{ladder[tf]['bias'][:4]}" for tf in ["M1", "M5", "M15", "M30", "H1", "H4", "1D", "1W", "1M"]]
@@ -237,6 +246,13 @@ class InstitutionalSMCAlphaEngine:
             },
         }
 
+        return {
+            "symbol": symbol,
+            "live_price": round(live_price, 2),
+            "mtf_ladder": ladder,
+            "ladder_summary": ladder_summary,
+            "setups": setups,
+        }
         return {
             "symbol": symbol,
             "live_price": round(live_price, 2),
