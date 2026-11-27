@@ -91,7 +91,7 @@ class InstitutionalSMCAlphaEngine:
 
         return dfs, ladder
 
-    def _compute_zone_setup(self, df: pd.DataFrame, live_price: float, direction: str, is_xau: bool) -> dict:
+    def _compute_zone_setup(self, df: pd.DataFrame, live_price: float, direction: str, is_xau: bool, horizon: str = "INTRADAY") -> dict:
         dec = 2
         if df is not None and not df.empty:
             high_val = float(df["High"].max())
@@ -103,28 +103,41 @@ class InstitutionalSMCAlphaEngine:
             low_val = live_price - (rng * 0.5)
 
         min_risk = live_price * (0.002 if is_xau else 0.005)
+        max_risk_pct = {
+            "SCALP": 0.012 if is_xau else 0.02,
+            "INTRADAY": 0.02 if is_xau else 0.04,
+            "SWING": 0.05 if is_xau else 0.12,
+            "HOLD": 0.12 if is_xau else 0.25,
+        }.get(horizon, 0.03)
+        max_risk = live_price * max_risk_pct
 
         if direction == "SELL LIMIT":
             entry = low_val + (rng * 0.705)
             if entry <= live_price * 1.0005:
                 entry = live_price + max(rng * 0.15, min_risk * 0.8)
-            sl = max(high_val + (rng * 0.05), entry + min_risk)
-            risk = sl - entry
-            tp1 = entry - (risk * 3.0)
-            tp2 = entry - (risk * 6.0)
-            tp3 = entry - (risk * 10.0)
+            raw_sl = max(high_val + (rng * 0.05), entry + min_risk)
+            risk = min(max(raw_sl - entry, min_risk), max_risk)
+            sl = entry + risk
+            tp1 = entry - (risk * 2.0)
+            tp2 = entry - (risk * 4.0)
+            tp3 = entry - (risk * 6.0)
         else:
             entry = high_val - (rng * 0.705)
             if entry >= live_price * 0.9995:
                 entry = live_price - max(rng * 0.15, min_risk * 0.8)
-            sl = min(low_val - (rng * 0.05), entry - min_risk)
-            risk = max(entry - sl, min_risk)
-            sl = entry - risk
-            tp1 = entry + (risk * 3.0)
-            tp2 = entry + (risk * 6.0)
-            tp3 = entry + (risk * 10.0)
+            raw_sl = min(low_val - (rng * 0.05), entry - min_risk)
+            risk = min(max(entry - raw_sl, min_risk), max_risk)
+            # Cegah SL menyentuh atau menembus 0
+            sl = max(entry - risk, entry * 0.5)
+            risk = max(entry - sl, min_risk * 0.5)
+            tp1 = entry + (risk * 2.0)
+            tp2 = entry + (risk * 4.0)
+            tp3 = entry + (risk * 6.0)
 
         rr_tp1 = round(abs(tp1 - entry) / max(abs(entry - sl), 1e-9), 1)
+        rr_tp2 = round(abs(tp2 - entry) / max(abs(entry - sl), 1e-9), 1)
+        rr_tp3 = round(abs(tp3 - entry) / max(abs(entry - sl), 1e-9), 1)
+
         return {
             "direction": direction,
             "entry": round(entry, dec),
@@ -132,9 +145,9 @@ class InstitutionalSMCAlphaEngine:
             "tp1": round(tp1, dec),
             "tp2": round(tp2, dec),
             "tp3": round(tp3, dec),
-            "rr": f"1:{rr_tp1} / 1:6.0 / 1:10.0",
+            "rr": f"1:{rr_tp1} / 1:{rr_tp2} / 1:{rr_tp3}",
         }
-
+        
     def calculate_confluence_score(self, symbol: str, intel: dict, macro_bias: str, ladder: dict | None = None) -> int:
         score = 62
         macro = intel.get("macro", {})
