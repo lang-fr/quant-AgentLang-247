@@ -1,6 +1,5 @@
 import os
 import requests
-UnifiedAIRouter = MultiTierAIRouter
 
 class MultiTierAIRouter:
     def __init__(self):
@@ -79,6 +78,7 @@ class MultiTierAIRouter:
 
     def generate_analysis(self, prompt: str) -> str:
         return self.route_high_priority(prompt, role="ANALISA")
+        UnifiedAIRouter = MultiTierAIRouter
 
     def refine_setup(self, prompt: str) -> str:
         return self.route_high_priority(prompt, role="SETUP")
