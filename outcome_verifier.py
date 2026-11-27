@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import datetime
+import pandas as pd
 import pytz
 import yfinance as yf
 
@@ -8,7 +9,7 @@ import yfinance as yf
 class OutcomeVerifierEngine:
     """
     Memverifikasi hasil riil dari setiap sinyal yang disetujui (APPROVED):
-    - Mengecek apakah harga menyentuh TP1 (geser SL ke BEP+1), TP2, TP3, atau SL
+    - Mengaudit XAUUSD dan BTCUSDT secara terpisah berdasarkan candle SETELAH waktu sinyal dibuat
     - Menghitung Win Rate historis dan Daily Realized PnL (%) untuk Kill Switch
     """
 
@@ -28,19 +29,85 @@ class OutcomeVerifierEngine:
         conn.commit()
         conn.close()
 
-    def _get_recent_high_low(self, yf_ticker: str) -> tuple[float, float, float]:
+    def _get_history_df(self, yf_ticker: str) -> pd.DataFrame:
         try:
-            df = yf.Ticker(yf_ticker).history(period="2d", interval="15m")
+            df = yf.Ticker(yf_ticker).history(period="5d", interval="15m")
             if df is None or df.empty:
-                return 0.0, 0.0, 0.0
-            return float(df["High"].max()), float(df["Low"].min()), float(df["Close"].iloc[-1])
+                return pd.DataFrame()
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("UTC").tz_convert(self.wib)
+            else:
+                df.index = df.index.tz_convert(self.wib)
+            return df
         except Exception:
-            return 0.0, 0.0, 0.0
+            return pd.DataFrame()
+
+    def _extract_setup(self, asset_dict: dict) -> dict | None:
+        for key in ("INTRADAY (M30-H1-H4)", "INTRADAY (M1-M5-M15-M30-H1-H4)", "SESI / SCALP (M1-M5-M15)"):
+            if key in asset_dict and asset_dict[key]:
+                return asset_dict[key]
+        return None
+
+    def _evaluate_single_asset(self, setup: dict, df_after: pd.DataFrame) -> tuple[str, float]:
+        if not setup or df_after.empty:
+            return "OPEN", 0.0
+
+        direction = setup.get("direction", "")
+        entry = float(setup["entry"])
+        sl = float(setup["sl"])
+        tp1 = float(setup["tp1"])
+        tp2 = float(setup["tp2"])
+        tp3 = float(setup["tp3"])
+
+        risk_dist = max(abs(entry - sl), 1e-6)
+        r_tp1 = round(abs(tp1 - entry) / risk_dist, 2)
+        r_tp2 = round(abs(tp2 - entry) / risk_dist, 2)
+        r_tp3 = round(abs(tp3 - entry) / risk_dist, 2)
+
+        triggered = False
+        bep_active = False
+
+        for _, bar in df_after.iterrows():
+            hi = float(bar["High"])
+            lo = float(bar["Low"])
+
+            if "SELL" in direction:
+                if not triggered and hi >= entry:
+                    triggered = True
+                if triggered:
+                    if hi >= sl and not bep_active:
+                        return "SL_LOSS", -1.0
+                    if lo <= tp3:
+                        return "TP3_WON", r_tp3
+                    if lo <= tp2:
+                        bep_active = True
+                    elif lo <= tp1:
+                        bep_active = True
+                    if bep_active and hi >= entry:
+                        return "BEP_CLOSED", round(r_tp1 * 0.5, 2)
+            else:
+                if not triggered and lo <= entry:
+                    triggered = True
+                if triggered:
+                    if lo <= sl and not bep_active:
+                        return "SL_LOSS", -1.0
+                    if hi >= tp3:
+                        return "TP3_WON", r_tp3
+                    if hi >= tp2:
+                        bep_active = True
+                    elif hi >= tp1:
+                        bep_active = True
+                    if bep_active and lo <= entry:
+                        return "BEP_CLOSED", round(r_tp1 * 0.5, 2)
+
+        if bep_active:
+            return "TP1_HIT_BEP_ACTIVE", r_tp1
+        return "OPEN", 0.0
 
     def verify_all_approved_setups(self) -> dict:
         self._ensure_columns()
-        xau_hi, xau_lo, xau_last = self._get_recent_high_low("GC=F")
-        btc_hi, btc_lo, btc_last = self._get_recent_high_low("BTC-USD")
+        xau_df = self._get_history_df("GC=F")
+        btc_df = self._get_history_df("BTC-USD")
 
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
@@ -60,55 +127,28 @@ class OutcomeVerifierEngine:
 
             try:
                 payload = json.loads(payload_str)
+                created_dt = self.wib.localize(datetime.datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S"))
             except Exception:
                 continue
 
-            setup = payload.get("xau", {}).get("INTRADAY (M1-M5-M15-M30-H1-H4)")
-            hi, lo = xau_hi, xau_lo
-            if not setup or hi <= 0:
-                setup = payload.get("btc", {}).get("INTRADAY (M1-M5-M15-M30-H1-H4)")
-                hi, lo = btc_hi, btc_lo
+            xau_setup = self._extract_setup(payload.get("xau", {}))
+            btc_setup = self._extract_setup(payload.get("btc", {}))
 
-            if not setup or hi <= 0:
+            xau_after = xau_df[xau_df.index >= created_dt] if not xau_df.empty else pd.DataFrame()
+            btc_after = btc_df[btc_df.index >= created_dt] if not btc_df.empty else pd.DataFrame()
+
+            xau_res, xau_r = self._evaluate_single_asset(xau_setup, xau_after)
+            btc_res, btc_r = self._evaluate_single_asset(btc_setup, btc_after)
+
+            candidates = [(xau_res, xau_r), (btc_res, btc_r)]
+            closed = [c for c in candidates if c[0] != "OPEN"]
+            if not closed:
                 continue
 
-            direction = setup.get("direction", "")
-            entry = float(setup["entry"])
-            sl = float(setup["sl"])
-            tp1 = float(setup["tp1"])
-            tp2 = float(setup["tp2"])
-            tp3 = float(setup["tp3"])
+            new_outcome = " / ".join([c[0] for c in closed]) if len(closed) > 1 else closed[0][0]
+            new_r = round(sum(c[1] for c in closed), 2)
 
-            new_outcome = outcome_status or "OPEN"
-            new_r = float(realized_r or 0.0)
-
-            if direction == "SELL LIMIT" and hi >= entry:
-                if lo <= tp3:
-                    new_outcome, new_r = "TP3_WON", 10.0
-                elif lo <= tp2:
-                    new_outcome, new_r = "TP2_HIT_BEP_ACTIVE", 6.0
-                elif lo <= tp1:
-                    new_outcome, new_r = "TP1_HIT_BEP_ACTIVE", 3.0
-                elif hi >= sl:
-                    if "BEP_ACTIVE" in new_outcome:
-                        new_outcome, new_r = "BEP_CLOSED", max(new_r, 0.2)
-                    else:
-                        new_outcome, new_r = "SL_LOSS", -1.0
-
-            elif direction == "BUY LIMIT" and lo <= entry:
-                if hi >= tp3:
-                    new_outcome, new_r = "TP3_WON", 11.0
-                elif hi >= tp2:
-                    new_outcome, new_r = "TP2_HIT_BEP_ACTIVE", 6.0
-                elif hi >= tp1:
-                    new_outcome, new_r = "TP1_HIT_BEP_ACTIVE", 3.0
-                elif lo <= sl:
-                    if "BEP_ACTIVE" in new_outcome:
-                        new_outcome, new_r = "BEP_CLOSED", max(new_r, 0.2)
-                    else:
-                        new_outcome, new_r = "SL_LOSS", -1.0
-
-            if new_outcome != outcome_status:
+            if new_outcome != outcome_status or new_r != float(realized_r or 0.0):
                 cur.execute(
                     "UPDATE signal_audit_log SET outcome_status = ?, realized_r = ? WHERE id = ?",
                     (new_outcome, new_r, row_id),
@@ -129,15 +169,10 @@ class OutcomeVerifierEngine:
         cur.execute("SELECT COUNT(*) FROM signal_audit_log WHERE status = 'APPROVED'")
         total_approved = cur.fetchone()[0]
 
-        cur.execute(
-            """
-            SELECT COUNT(*) FROM signal_audit_log
-            WHERE status = 'APPROVED' AND outcome_status IN ('TP1_HIT_BEP_ACTIVE', 'TP2_HIT_BEP_ACTIVE', 'TP3_WON', 'BEP_CLOSED')
-            """
-        )
+        cur.execute("SELECT COUNT(*) FROM signal_audit_log WHERE status = 'APPROVED' AND realized_r > 0")
         wins = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(*) FROM signal_audit_log WHERE status = 'APPROVED' AND outcome_status = 'SL_LOSS'")
+        cur.execute("SELECT COUNT(*) FROM signal_audit_log WHERE status = 'APPROVED' AND realized_r < 0")
         losses = cur.fetchone()[0]
 
         cur.execute("SELECT COALESCE(SUM(realized_r), 0.0) FROM signal_audit_log WHERE status = 'APPROVED'")
