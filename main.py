@@ -12,7 +12,7 @@ import pytz
 import requests
 from dotenv import load_dotenv
 
-from ai_router import MultiTierAIRouter as UnifiedAIRouter
+from ai_router import UnifiedAIRouter
 from market_feeds import InstitutionalMarketFeeds
 from smc_alpha import InstitutionalSMCAlphaEngine
 from execution_engine import InstitutionalExecutionEngine
@@ -62,8 +62,15 @@ def init_audit_db():
     outcome_verifier._ensure_columns()
 
 
-def save_signal_record(session_name: str, ai_model: str, xau_price: float, btc_price: float,
-                       macro_bias: str, audit_passed: bool, payload: dict) -> int:
+def save_signal_record(
+    session_name: str,
+    ai_model: str,
+    xau_price: float,
+    btc_price: float,
+    macro_bias: str,
+    audit_passed: bool,
+    payload: dict,
+) -> int:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     now_str = datetime.datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
@@ -144,7 +151,7 @@ def send_telegram_message(text: str, chat_id: str = None, reply_markup: dict = N
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    chunks = [text[i: i + 3900] for i in range(0, len(text), 3900)]
+    chunks = [text[i : i + 3900] for i in range(0, len(text), 3900)]
 
     for idx, chunk in enumerate(chunks):
         payload = {
@@ -167,14 +174,17 @@ def send_telegram_message(text: str, chat_id: str = None, reply_markup: dict = N
 
 def _format_asset_mapping(asset_title: str, bundle: dict) -> str:
     live = bundle.get("live_price", 0.0)
+    src = bundle.get("price_source", "Live")
     setups = bundle.get("setups", {})
     risk_usd = round(ACCOUNT_BALANCE * (RISK_PER_TRADE_PCT / 100.0), 2)
 
-    blocks = [f"<b>{html.escape(asset_title)} (Live: {live}) — Risk/Trade: ${risk_usd} ({RISK_PER_TRADE_PCT}%)</b>"]
+    blocks = [
+        f"<b>{html.escape(asset_title)} (Live: {live} | {html.escape(src)}) — Risk/Trade: ${risk_usd} ({RISK_PER_TRADE_PCT}%)</b>"
+    ]
     for horizon_label, s in setups.items():
         reason_text = html.escape(str(s.get("reason", "-")))
         blocks.append(
-            f"\n🎯 <b>{html.escape(horizon_label)}</b> — [<b>{s['direction']}</b>] (RR: 1:{s['rr']})\n"
+            f"\n🎯 <b>{html.escape(horizon_label)}</b> — [<b>{s['direction']}</b>] (RR: <code>{s['rr']}</code>)\n"
             f"• Rantai MTF: <code>{html.escape(s['tf_chain'])}</code> ({s['aligned_count']})\n"
             f"• Sniper Limit Entry (1-3 Layer): <code>{s['entry']}</code>\n"
             f"• Tight Stop Loss: <code>{s['sl']}</code>\n"
@@ -185,31 +195,41 @@ def _format_asset_mapping(asset_title: str, bundle: dict) -> str:
     return "\n".join(blocks)
 
 
+def _derive_macro_bias(macro: dict, matrix: dict) -> str:
+    bearish_votes = 0
+    if macro["net_liquidity_b"] < 0:
+        bearish_votes += 1
+    if macro["dfii10"] > 2.0:
+        bearish_votes += 1
+    if matrix["DXY"]["price"] >= 103.5:
+        bearish_votes += 1
+    if matrix["VIX"]["price"] >= 22.0:
+        bearish_votes += 1
+    return "BEARISH" if bearish_votes >= 2 else "BULLISH"
+
+
 def build_and_send_institutional_report(target_chat_id: str = None):
     now_str = datetime.datetime.now(WIB).strftime("%d %b %Y %H:%M WIB")
     session_name, quota_left = get_session_quota_info()
 
-    # 0. Audit otomatis hasil posisi sebelumnya (TP1/TP2/TP3/SL & Daily Drawdown)
     perf_stats = outcome_verifier.verify_all_approved_setups()
 
-    # 1. Tarik seluruh 8 Pilar Data sebelum masuk ke chart/orderflow
     intel = feeds.collect_all_8_pillars()
     macro = intel["macro"]
     matrix = intel["matrix"]
     dom = intel["crypto_dom"]
     deriv = intel["deriv_onchain"]
     cal = intel["calendar_narr"]
+    ext = intel["extended"]
 
-    macro_bias = "BEARISH" if (macro["net_liquidity_b"] < 0 and macro["dfii10"] > 2.0) else "BULLISH"
+    macro_bias = _derive_macro_bias(macro, matrix)
 
-    # 2. Pindai M1 -> 1MON lalu kalibrasi setup langsung dengan Model AI Tertinggi
     xau_raw = alpha_engine.build_cascade_setups("XAUUSD", feeds, macro_bias)
     btc_raw = alpha_engine.build_cascade_setups("BTCUSD", feeds, macro_bias)
 
     xau_bundle, xau_model = alpha_engine.refine_setups_with_flagship_ai("XAUUSD", xau_raw, intel, ai_router)
     btc_bundle, btc_model = alpha_engine.refine_setups_with_flagship_ai("BTCUSD", btc_raw, intel, ai_router)
 
-    # 3. Pre-Send Verification Gate (6 syarat keamanan)
     xau_score = alpha_engine.calculate_confluence_score("XAUUSD", intel, macro_bias, xau_raw.get("mtf_ladder"))
     btc_score = alpha_engine.calculate_confluence_score("BTCUSD", intel, macro_bias, btc_raw.get("mtf_ladder"))
 
@@ -217,7 +237,6 @@ def build_and_send_institutional_report(target_chat_id: str = None):
     btc_ok, btc_err = alpha_engine.verify_setup_before_send(btc_bundle, cal["news_blackout_active"], btc_score)
     all_ok = xau_ok and btc_ok
 
-    # 4. Ringkasan Analitis 8 Pilar dengan Model AI Tertinggi
     sys_prompt = (
         "Anda adalah Institutional Quant Strategist. Tulis analisis 3 poin padat dalam Bahasa Indonesia "
         "(1. Makro & Likuiditas, 2. Konfluensi Intermarket, On-Chain & Orderflow, 3. Skeptic Veto & Risiko Pembatalan). "
@@ -227,11 +246,12 @@ def build_and_send_institutional_report(target_chat_id: str = None):
         f"Sesi: {session_name}. Makro: NetLiq={macro['net_liquidity_b']}B, DFII10={macro['dfii10']}%, "
         f"US02Y={macro['us02y']}%, US10Y={macro['us10y']}%, FEDFUNDS={macro['fedfunds']}%, "
         f"DXY={matrix['DXY']['price']}, USOIL={matrix['USOIL']['price']}, NDX={matrix['NASDAQ100']['price']}, "
-        f"SPX={matrix['SP500']['price']}, VIX={matrix['VIX']['price']}. "
+        f"SPX={matrix['SP500']['price']}, VIX={matrix['VIX']['price']}, XAGUSD={ext['xagusd']}. "
         f"Crypto Dom: TOTAL={dom['TOTAL_B']}B, TOTAL2={dom['TOTAL2_B']}B, TOTAL3={dom['TOTAL3_B']}B, "
         f"BTC.D={dom['BTC_D']}%, USDT.D={dom['USDT_D']}%. "
         f"Derivatif/On-Chain: Funding={deriv['funding_rate_pct']}%, OI={deriv['open_interest_btc']}, "
-        f"L/S={deriv['long_short_ratio']}, Stable7D={deriv['stablecoin_7d_flow_b']}B, "
+        f"L/S={deriv['long_short_ratio']}, TakerBS={ext['taker_buy_sell_ratio']}, "
+        f"CoinbasePrem={ext['coinbase_premium_pct']}%, Stable7D={deriv['stablecoin_7d_flow_b']}B, "
         f"FnG={deriv['fear_greed_value']} ({deriv['fear_greed_label']}). "
         f"Kalender Merah: {cal['high_impact_upcoming']}. Narasi: {cal['narrative_watch']}."
     )
@@ -278,7 +298,9 @@ def build_and_send_institutional_report(target_chat_id: str = None):
         f"TOTAL3 <code>${dom['TOTAL3_B']}B</code> | BTC.D <code>{dom['BTC_D']}%</code> | USDT.D <code>{dom['USDT_D']}%</code>\n"
         f"• <b>On-Chain &amp; Orderflow:</b> Stable7D <code>${deriv['stablecoin_7d_flow_b']}B</code> | "
         f"Funding <code>{deriv['funding_rate_pct']}%</code> | L/S <code>{deriv['long_short_ratio']}</code> | "
+        f"TakerBS <code>{ext['taker_buy_sell_ratio']}</code> | CBPrem <code>{ext['coinbase_premium_pct']}%</code> | "
         f"FnG <code>{deriv['fear_greed_value']} ({deriv['fear_greed_label']})</code>\n"
+        f"• <b>Kalender Tier-1:</b> {html.escape(cal['high_impact_upcoming'])}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{narrative_safe}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -353,7 +375,6 @@ def run_247_polling_and_scheduler():
     while True:
         now_wib = datetime.datetime.now(WIB)
 
-        # Audit otomatis outcome tiap kelipatan 15 menit
         if now_wib.minute % 15 == 0 and now_wib.minute != last_audit_minute:
             last_audit_minute = now_wib.minute
             try:
@@ -361,7 +382,6 @@ def run_247_polling_and_scheduler():
             except Exception as exc:
                 print(f"[AUDIT VERIFIER] {exc}")
 
-        # Jadwal laporan otomatis (08:00 Asia, 14:00 London, 19:00 New York WIB)
         slot_key = now_wib.strftime("%Y-%m-%d_%H")
         if now_wib.hour in (8, 14, 19) and now_wib.minute == 0 and slot_key != last_sent_slot:
             last_sent_slot = slot_key
@@ -435,11 +455,12 @@ def run_247_polling_and_scheduler():
                         )
                     elif cmd in ("/status", "status"):
                         session_now, quota_left = get_session_quota_info()
+                        chain_label = f"{ai_router.primary_gemini} → {ai_router.primary_claude} → {ai_router.fallback_gemini}"
                         send_telegram_message(
                             f"🟢 <b>AGENT QUANT LANG ONLINE</b>\n"
                             f"• Sesi Aktif: {session_now}\n"
                             f"• Sisa Kuota Sesi: <b>{quota_left}/{MAX_ENTRIES_PER_SESSION}</b>\n"
-                            f"• Prioritas AI: <code>claude-fable-5-2 → gemini-4-carbon → gemini-3.8-flash</code>",
+                            f"• Prioritas AI: <code>{html.escape(chain_label)}</code>",
                             chat_id=chat_id,
                         )
                     else:
