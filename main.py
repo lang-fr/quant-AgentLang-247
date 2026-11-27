@@ -29,6 +29,8 @@ from quant_v28_core import (
     run_backtest_and_monte_carlo,
 )
 from web_bridge import register_webhook_callback, start_web_bridge_in_background
+from quant_derivatives_mm import QuantStatDerivativesMMEngine
+quant_dmm_engine = QuantStatDerivativesMMEngine()
 
 try:
     from quant_intel import QuantIntelEngine
@@ -460,7 +462,19 @@ def format_asset_report(
                 "",
             ]
         )
-
+        
+        dmm = quant_dmm_engine.run_all_three_pillars(symbol)
+    qs = dmm.get("quant_statistics", {})
+    dv = dmm.get("derivatives_microstructure", {})
+    mm = dmm.get("market_making_orderbook", {})
+    lines.extend(
+        [
+            f"📊 Quant Stat: Hurst {qs.get('hurst_exponent', 'N/A')} ({qs.get('stat_regime', 'N/A')}) | Z20D: {qs.get('price_zscore_20d', 'N/A')} | PairZ: {qs.get('pair_spread_zscore_30d', 'N/A')}",
+            f"⚡ Derivatif: FundAPR {dv.get('funding_apr_pct', 'N/A')}% | Basis {dv.get('spot_perp_basis_bps', 'N/A')}bps | OI ${dv.get('open_interest_usd_m', 'N/A')}M | {dv.get('squeeze_regime', 'N/A')}",
+            f"🏦 Market Making: OBI {mm.get('orderbook_imbalance_obi', 'N/A')} | MicroPx {mm.get('stoikov_micro_price', 'N/A')} | Quote Bid/Ask: {mm.get('avellaneda_optimal_bid_limit', 'N/A')} / {mm.get('avellaneda_optimal_ask_limit', 'N/A')}",
+            "",
+        ]
+    )
     lines.append(f"AI Setup Engine: {engine_name}")
     return "\n".join(lines)
 
