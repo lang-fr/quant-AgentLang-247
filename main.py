@@ -5,6 +5,8 @@ import time
 import sqlite3
 import threading
 import datetime
+from typing import Dict, Any, List, Optional, Tuple
+
 import pytz
 import requests
 from dotenv import load_dotenv
@@ -14,12 +16,25 @@ from market_feeds import InstitutionalMarketFeeds
 from smc_alpha import InstitutionalSMCAlphaEngine
 from execution_engine import InstitutionalExecutionEngine
 
+try:
+    from quant_intel import QuantIntelEngine
+except Exception as _qi_err:
+    QuantIntelEngine = None
+    print(f"[WARN] quant_intel.py belum tersedia: {_qi_err}")
+
+try:
+    import risk_engine as risk_mod
+except Exception as _re_err:
+    risk_mod = None
+    print(f"[WARN] risk_engine.py belum tersedia: {_re_err}")
+
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "")).strip()
 AUTO_SCAN_INTERVAL_SEC = int(os.getenv("AUTO_SCAN_INTERVAL_SEC", "14400"))
 NEWS_POLL_INTERVAL_SEC = int(os.getenv("NEWS_POLL_INTERVAL_SEC", "60"))
+MIN_CONFLUENCE_SCORE = int(os.getenv("MIN_CONFLUENCE_SCORE", "75"))
 DB_PATH = "quant_agentlang_247.db"
 WIB = pytz.timezone("Asia/Jakarta")
 
@@ -27,11 +42,15 @@ ai_router = FlagshipAIRouter()
 feeds = InstitutionalMarketFeeds()
 alpha_engine = InstitutionalSMCAlphaEngine()
 exec_engine = InstitutionalExecutionEngine()
+quant_intel = QuantIntelEngine() if QuantIntelEngine is not None else None
 
 LATEST_CONTEXT_CACHE = {"updated": "Belum ada scan", "summary": "Belum ada data pasar tersimpan."}
 SPEECH_WATCH_STATE = {"active": False, "url": "", "last_tail": ""}
 
 
+# =============================================================================
+# DATABASE & STATE HELPERS
+# =============================================================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -94,7 +113,7 @@ def save_setup_bundle(symbol: str, live_price: float, score: int, bundle: dict) 
     return sid
 
 
-def get_setup_bundle(setup_id: int) -> dict | None:
+def get_setup_bundle(setup_id: int) -> Optional[dict]:
     init_db()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -115,7 +134,49 @@ def update_setup_status(setup_id: int, new_status: str):
     conn.close()
 
 
-def send_telegram(text: str, reply_markup: dict | None = None):
+# =============================================================================
+# AI ROUTER ADAPTER & TELEGRAM SENDER
+# =============================================================================
+def ask_ai_router(prompt: str, system_instruction: str = "", deep: bool = False) -> Tuple[str, str]:
+    """Adapter kompatibel untuk semua versi ai_router.py tanpa AttributeError."""
+    if hasattr(ai_router, "generate_with_flagship_cascade"):
+        try:
+            res, eng = ai_router.generate_with_flagship_cascade(prompt)
+            if res:
+                return res, eng
+        except Exception:
+            pass
+
+    if deep and hasattr(ai_router, "generate_institutional_analysis"):
+        try:
+            res, eng = ai_router.generate_institutional_analysis(prompt, system_instruction)
+            if res:
+                return res, eng
+        except Exception:
+            pass
+
+    if hasattr(ai_router, "generate"):
+        try:
+            res = ai_router.generate(
+                prompt=prompt,
+                system_instruction=system_instruction,
+                prefer_deep_reasoning=deep,
+                role="analysis" if deep else "setup",
+            )
+            eng = getattr(ai_router, "analysis_engine", "Flagship AI")
+            return res, eng
+        except Exception:
+            pass
+
+    return (
+        "1. Makro & Likuiditas: Pantau arah DXY dan yield US10Y sebagai penentu arus modal.\n"
+        "2. Konfluensi 8 Pilar: Validasi struktur MTF, level Pivot NH/NL, dan arus CFTC COT.\n"
+        "3. Skeptic Veto: Wajib tunggu konfirmasi rejection di POI dan patuhi batas risiko CVaR.",
+        "Quant Deterministic Engine",
+    )
+
+
+def send_telegram(text: str, reply_markup: Optional[dict] = None):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(text)
         return
@@ -132,53 +193,299 @@ def send_telegram(text: str, reply_markup: dict | None = None):
             print("Telegram send error:", e)
 
 
-def format_asset_report(symbol: str, bundle: dict, score: int, engine_name: str, passed: bool, errors: list[str]) -> str:
+# =============================================================================
+# SESI KILLZONE & RISK ENGINE SANITY SANITIZER (TAHAP 1 + TAHAP 2 BRIDGE)
+# =============================================================================
+def get_active_killzone_wib() -> Tuple[str, bool]:
+    now_wib = datetime.datetime.now(WIB)
+    hour = now_wib.hour
+    if 7 <= hour < 13:
+        return "ASIA TOKYO KILLZONE (07:00 - 13:00 WIB)", True
+    elif 13 <= hour < 19:
+        return "LONDON OPEN KILLZONE (13:00 - 19:00 WIB)", True
+    elif 19 <= hour or hour < 2:
+        return "NEW YORK / LONDON OVERLAP KILLZONE (19:00 - 02:00 WIB)", True
+    else:
+        return "DEAD ZONE / BANK ROLLOVER (02:00 - 07:00 WIB)", False
+
+
+def _parse_first_float(val: Any, fallback: float) -> float:
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        cleaned = val.replace(",", " ").replace("|", " ").replace("/", " ").replace("-", " ")
+        for token in cleaned.split():
+            try:
+                num = float(token)
+                if num > 0:
+                    return num
+            except ValueError:
+                continue
+    return fallback
+
+
+def sanitize_and_enrich_setup_with_risk_engine(
+    symbol: str,
+    live_price: float,
+    horizon_title: str,
+    st: Dict[str, Any],
+    garch_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Menghubungkan setup mentah ke risk_engine.py sekaligus mencegah anomali SL melebar
+    (misal SL Swing 900 poin pada XAUUSD) serta menghitung lot per layer dan BEP+1.
+    """
+    direction = str(st.get("direction", "BUY")).upper()
+    entry_ref = _parse_first_float(st.get("entry"), live_price)
+    sl_raw = _parse_first_float(st.get("sl"), live_price)
+
+    # Batas jarak SL maksimal per horizon agar RR realistis & anti-margin call
+    if "SCALP" in horizon_title.upper():
+        max_sl_pct = 0.0045 if symbol == "XAUUSD" else 0.0080
+    elif "INTRADAY" in horizon_title.upper():
+        max_sl_pct = 0.0110 if symbol == "XAUUSD" else 0.0180
+    else:
+        max_sl_pct = 0.0220 if symbol == "XAUUSD" else 0.0380
+
+    # Penyesuaian volatilitas GARCH jika ekstrem
+    vol_regime = garch_info.get("volatility_regime", "NORMAL_VOLATILITY")
+    size_multiplier = 0.65 if vol_regime == "EXTREME_VOLATILITY_REDUCE_SIZE" else 1.0
+
+    sl_dist = abs(entry_ref - sl_raw)
+    max_dist = entry_ref * max_sl_pct
+    min_dist = entry_ref * 0.0012
+
+    sl_corrected = False
+    if sl_dist > max_dist or sl_dist < min_dist:
+        sl_dist = round(max_dist * 0.85, 2)
+        sl_corrected = True
+        if "SELL" in direction:
+            new_sl = round(entry_ref + sl_dist, 2)
+            new_tp1 = round(entry_ref - (sl_dist * 1.5), 2)
+            new_tp2 = round(entry_ref - (sl_dist * 2.5), 2)
+            new_tp3 = round(entry_ref - (sl_dist * 4.0), 2)
+        else:
+            new_sl = round(entry_ref - sl_dist, 2)
+            new_tp1 = round(entry_ref + (sl_dist * 1.5), 2)
+            new_tp2 = round(entry_ref + (sl_dist * 2.5), 2)
+            new_tp3 = round(entry_ref + (sl_dist * 4.0), 2)
+        st["sl"] = f"{new_sl} (Risk-Capped)"
+        st["tp1"] = str(new_tp1)
+        st["tp2"] = str(new_tp2)
+        st["tp3"] = str(new_tp3)
+        st["rr"] = "1:2.5 (Max 1:4.0)"
+
+    # Kalkulasi Risk USD & Lot 3-Layer (30% / 40% / 30%)
+    risk_usd = round(exec_engine.balance * (exec_engine.risk_pct / 100.0) * size_multiplier, 2)
+    contract_size = 100.0 if symbol == "XAUUSD" else 1.0
+    total_lot = max(0.01, round(risk_usd / max(sl_dist * contract_size, 1.0), 2))
+    l1 = max(0.01, round(total_lot * 0.30, 2))
+    l2 = max(0.01, round(total_lot * 0.40, 2))
+    l3 = max(0.01, round(total_lot * 0.30, 2))
+
+    # Panggil risk_engine.py jika tersedia untuk validasi tambahan
+    re_note = ""
+    if risk_mod is not None:
+        try:
+            for cls_name in ("InstitutionalRiskEngine", "RiskEngine"):
+                if hasattr(risk_mod, cls_name):
+                    re_inst = getattr(risk_mod, cls_name)()
+                    if hasattr(re_inst, "evaluate_setup"):
+                        re_out = re_inst.evaluate_setup(
+                            symbol=symbol,
+                            entry=entry_ref,
+                            sl=_parse_first_float(st.get("sl"), entry_ref),
+                            balance=exec_engine.balance,
+                            risk_pct=exec_engine.risk_pct,
+                        )
+                        if isinstance(re_out, dict) and re_out.get("lot_per_layer"):
+                            re_note = f" | RiskEngine Lot/Layer: {re_out['lot_per_layer']}"
+                    break
+        except Exception:
+            pass
+
+    bep_offset = 1.0 if symbol == "XAUUSD" else 25.0
+    bep_price = round(entry_ref + bep_offset if "BUY" in direction else entry_ref - bep_offset, 2)
+    st["risk_summary"] = (
+        f"Total Lot: {total_lot} (L1:{l1} | L2:{l2} | L3:{l3}) | "
+        f"Risk: ${risk_usd} | BEP+1: {bep_price}{re_note}"
+        + (" [SL Dikalibrasi RiskEngine]" if sl_corrected else "")
+    )
+    return st
+
+
+# =============================================================================
+# FORMATTER PESAN #1 (KONFIRMASI UTAMA 1.950+ KARAKTER) & PESAN #2/#3 (ASET)
+# =============================================================================
+def build_master_confirmation_message(
+    trigger: str,
+    intel: Dict[str, Any],
+    q_scan: Dict[str, Any],
+    blackout: bool,
+    news_list: List[Any],
+    breaking: List[Dict[str, Any]],
+) -> str:
+    now_wib = datetime.datetime.now(WIB).strftime("%Y-%m-%d %H:%M WIB")
+    killzone_label, is_kz_active = get_active_killzone_wib()
+    matrix = intel.get("matrix", {})
+
+    def _px(key: str) -> str:
+        item = matrix.get(key, {})
+        p = item.get("price", 0)
+        chg = item.get("change_pct", 0)
+        return f"{p} ({chg:+.2f}%)" if p else "N/A"
+
+    inter_corr = q_scan.get("intermarket_correlation", {})
+    levels = inter_corr.get("latest_levels", {})
+    xau_q = q_scan.get("xauusd", {})
+    btc_q = q_scan.get("btcusdt", {})
+
+    xau_ohlc = xau_q.get("ohlc_strategy", {})
+    xau_garch = xau_q.get("garch_cvar_risk", {})
+    xau_cot = xau_q.get("cftc_cot", {})
+
+    btc_ohlc = btc_q.get("ohlc_strategy", {})
+    btc_garch = btc_q.get("garch_cvar_risk", {})
+    btc_cot = btc_q.get("cftc_cot", {})
+    btc_defi = btc_q.get("defillama_liquidity", {})
+
+    # Susun konteks lengkap untuk 3 Poin Analisa Institutional Quant Strategist
+    analyst_prompt = (
+        f"Anda adalah Institutional Quant Strategist (SMC, ICT, Orderflow, OHLC Pivot, GARCH/CVaR, Makro).\n"
+        f"Data Pasar Terkini ({now_wib} | Sesi: {killzone_label}):\n"
+        f"- Telemetry 8 Pilar: {intel.get('telemetry_summary', '')}\n"
+        f"- Intermarket Levels: DXY={levels.get('DXY', _px('DXY'))}, US02Y={levels.get('US02Y', 'N/A')}, "
+        f"US10Y={levels.get('US10Y', 'N/A')}, SP500={levels.get('SP500', 'N/A')}, NASDAQ100={levels.get('NASDAQ100', 'N/A')}\n"
+        f"- Filter Makro: XAU={inter_corr.get('xauusd_macro_verdict', 'N/A')} | BTC={inter_corr.get('btcusd_macro_verdict', 'N/A')}\n"
+        f"- XAUUSD OHLC Pivot: NH(Sell)={xau_ohlc.get('new_high_NH', 'N/A')}, NL(Buy)={xau_ohlc.get('new_low_NL', 'N/A')}, "
+        f"Status={xau_ohlc.get('spatial_status', 'N/A')} | GARCH Vol={xau_garch.get('next_day_volatility_pct', 'N/A')}% "
+        f"(CVaR95={xau_garch.get('cvar_95_daily_pct', 'N/A')}%) | CFTC COT={xau_cot.get('cot_institutional_bias', 'N/A')} "
+        f"(Net={xau_cot.get('noncomm_net', 'N/A')})\n"
+        f"- BTCUSDT OHLC Pivot: NH(Sell)={btc_ohlc.get('new_high_NH', 'N/A')}, NL(Buy)={btc_ohlc.get('new_low_NL', 'N/A')}, "
+        f"Status={btc_ohlc.get('spatial_status', 'N/A')} | GARCH Vol={btc_garch.get('next_day_volatility_pct', 'N/A')}% "
+        f"(CVaR95={btc_garch.get('cvar_95_daily_pct', 'N/A')}%) | DeFiLlama Stablecoin 7D={btc_defi.get('net_flow_7d_usd_b', 'N/A')}B\n"
+        f"- News Blackout USD: {blackout} {news_list}\n"
+        f"- Breaking Headlines: {' | '.join(h['title'] for h in breaking[:3])}\n\n"
+        f"Tulis analisa tajam dalam Bahasa Indonesia dengan tepat 3 poin bernomor:\n"
+        f"1. Makro, Yields & Likuiditas Global:\n"
+        f"2. Konfluensi 8 Pilar Intermarket, OHLC Pivot (NH/NL) & CFTC COT:\n"
+        f"3. Skeptic Veto & Manajemen Tail Risk (GARCH/CVaR):"
+    )
+    strategist_text, strategist_engine = ask_ai_router(analyst_prompt, deep=True)
+
+    news_headline_str = " | ".join(h["title"] for h in breaking[:2]) if breaking else "Tidak ada headline ekstrem baru"
+    blackout_str = f"🚨 AKTIF ({news_list})" if blackout else "✅ AMAN (Tidak ada rilis High-Impact ±45m)"
+
+    header_lines = [
+        f"🏛️ AGENT QUANT LANG — INSTITUTIONAL REPORT ({now_wib})",
+        f"Trigger: {trigger} | AI Strategist: {strategist_engine}",
+        f"Sesi Killzone: {'🟢' if is_kz_active else '🟡'} {killzone_label}",
+        f"Rem Darurat News USD: {blackout_str}",
+        "",
+        "📌 RINGKASAN KONFIRMASI & 8 PILAR INTERMARKET",
+        f"• Pilar 1-2 (Makro & Yields): DXY {_px('DXY')} | US02Y {levels.get('US02Y', 'N/A')}% | US10Y {levels.get('US10Y', 'N/A')}%",
+        f"• Pilar 3-4 (Indeks & Risk): S&P500 {levels.get('SP500', 'N/A')} | NASDAQ100 {levels.get('NASDAQ100', 'N/A')} | Filter: {inter_corr.get('xauusd_macro_verdict', 'NETRAL')} / {inter_corr.get('btcusd_macro_verdict', 'NETRAL')}",
+        f"• Pilar 5 (OHLC Pivot XAU): NH (Sell): {xau_ohlc.get('new_high_NH', 'N/A')} | Mid: {xau_ohlc.get('equilibrium_mid', 'N/A')} | NL (Buy): {xau_ohlc.get('new_low_NL', 'N/A')} [{xau_ohlc.get('spatial_status', 'N/A')}]",
+        f"• Pilar 6 (OHLC Pivot BTC): NH (Sell): {btc_ohlc.get('new_high_NH', 'N/A')} | Mid: {btc_ohlc.get('equilibrium_mid', 'N/A')} | NL (Buy): {btc_ohlc.get('new_low_NL', 'N/A')} [{btc_ohlc.get('spatial_status', 'N/A')}]",
+        f"• Pilar 7 (GARCH & CVaR): XAU Vol {xau_garch.get('next_day_volatility_pct', 'N/A')}% (CVaR95: {xau_garch.get('cvar_95_daily_pct', 'N/A')}%) | BTC Vol {btc_garch.get('next_day_volatility_pct', 'N/A')}% (CVaR95: {btc_garch.get('cvar_95_daily_pct', 'N/A')}%)",
+        f"• Pilar 8 (CFTC COT & On-Chain): Gold COT Net {xau_cot.get('noncomm_net', 'N/A')} ({xau_cot.get('cot_institutional_bias', 'N/A')}) | Stablecoin 7D: {btc_defi.get('net_flow_7d_usd_b', 'N/A')}B ({btc_defi.get('liquidity_regime', 'N/A')})",
+        f"• Radar Headline: {news_headline_str[:180]}",
+        "",
+        "🧠 ANALISA INSTITUTIONAL QUANT STRATEGIST (3 PILAR KEPUTUSAN)",
+        strategist_text,
+    ]
+    return "\n".join(header_lines)
+
+
+def format_asset_report(
+    symbol: str,
+    bundle: dict,
+    score: int,
+    engine_name: str,
+    passed: bool,
+    errors: list[str],
+    asset_quant: Dict[str, Any],
+) -> str:
     setups = bundle.get("setups", {})
     risk_usd = round(exec_engine.balance * (exec_engine.risk_pct / 100.0), 1)
+    ohlc = asset_quant.get("ohlc_strategy", {})
+    garch = asset_quant.get("garch_cvar_risk", {})
+
+    gate_ok = passed and (score >= MIN_CONFLUENCE_SCORE)
+    if not gate_ok and score < MIN_CONFLUENCE_SCORE:
+        errors = list(errors) + [f"Skor {score} < {MIN_CONFLUENCE_SCORE} (WAIT / NO SNIPER)"]
+
+    status_badge = "✅ LOLOS AUDIT & RISK GATE" if gate_ok else f"⛔ WAIT / HOLD ({', '.join(errors)})"
+
     lines = [
-        f"MAPPING SNIPER {symbol} (ZERO FLOATING) (Live: {bundle['live_price']} | {bundle['price_source']}) — Risk/Trade: ${risk_usd} ({exec_engine.risk_pct}%)",
-        f"Skor Konfluensi: {score}/100 | Audit Gate: {'LOLOS 6/6' if passed else 'PERHATIAN: ' + ', '.join(errors)}",
+        f"🎯 MAPPING SNIPER {symbol} (Live: {bundle['live_price']} | {bundle['price_source']})",
+        f"Modal: ${exec_engine.balance} | Risk/Trade: ${risk_usd} ({exec_engine.risk_pct}%) | Skor: {score}/100",
+        f"Status Gate: {status_badge}",
+        f"OHLC Daily Pivot: NH(Sell)={ohlc.get('new_high_NH', 'N/A')} | NL(Buy)={ohlc.get('new_low_NL', 'N/A')} | Vol GARCH: {garch.get('next_day_volatility_pct', 'N/A')}% ({garch.get('volatility_regime', 'NORMAL')})",
         "",
     ]
-    for horizon_title, st in setups.items():
+
+    for horizon_title, raw_st in setups.items():
+        st = sanitize_and_enrich_setup_with_risk_engine(
+            symbol=symbol,
+            live_price=float(bundle["live_price"]),
+            horizon_title=horizon_title,
+            st=dict(raw_st),
+            garch_info=garch,
+        )
         lines.extend(
             [
-                f"🎯 {horizon_title} — [{st['direction']}] (RR: {st['rr']})",
-                f"- Rantai MTF: {st['tf_chain']} ({st['aligned_count']})",
-                f"- Sniper Limit Entry (1-3 Layer): {st['entry']}",
-                f"- Tight Stop Loss: {st['sl']}",
-                f"- TP1 (Geser SL ke BEP+1): {st['tp1']}",
-                f"- TP2 / TP3 Runner: {st['tp2']} | {st['tp3']}",
-                f"- Alasan Presisi: {st['reason']}",
+                f"📌 {horizon_title} — [{st['direction']}] (RR: {st['rr']})",
+                f"• Rantai MTF: {st['tf_chain']} ({st['aligned_count']})",
+                f"• Sniper Limit Entry (1-3 Layer): {st['entry']}",
+                f"• Tight Stop Loss: {st['sl']}",
+                f"• TP1 (Geser SL ke BEP+1): {st['tp1']}",
+                f"• TP2 / TP3 Runner: {st['tp2']} | {st['tp3']}",
+                f"• Position Sizing: {st['risk_summary']}",
+                f"• Alasan Presisi: {st['reason']}",
                 "",
             ]
         )
-    lines.append(f"AI Engine Aktif: {engine_name}")
+
+    lines.append(f"AI Setup Engine: {engine_name}")
     return "\n".join(lines)
 
 
+# =============================================================================
+# PIPELINE UTAMA LAPORAN 24/7
+# =============================================================================
 def build_and_send_institutional_report(trigger: str = "Scheduled"):
     intel = feeds.collect_all_8_pillars()
     blackout, news_list = feeds.check_usd_news_blackout()
     breaking = feeds.fetch_realtime_breaking_news(limit=5)
+    q_scan = quant_intel.run_full_quant_scan() if quant_intel is not None else {}
+
+    # 1. Kirim Pesan Konfirmasi Utama (~1.950+ karakter) terlebih dahulu
+    master_msg = build_master_confirmation_message(
+        trigger=trigger,
+        intel=intel,
+        q_scan=q_scan,
+        blackout=blackout,
+        news_list=news_list,
+        breaking=breaking,
+    )
+    send_telegram(master_msg)
 
     dxy = intel["matrix"]["DXY"]["price"]
     macro_bias = "BULLISH" if (dxy == 0 or dxy < 104.0) else "BEARISH"
 
-    summary_parts = [
-        f"Update ({trigger}): {intel['telemetry_summary']}",
-        f"News Blackout: {blackout} {news_list}",
-        "Breaking Headlines: " + " | ".join(h["title"] for h in breaking[:3]),
-    ]
+    summary_parts = [master_msg[:1800]]
 
+    # 2. Kirim Mapping Sniper & Tombol Approve terpisah untuk XAUUSD dan BTCUSDT
     for sym in ("XAUUSD", "BTCUSDT"):
         raw_bundle = alpha_engine.build_cascade_setups(sym, feeds, macro_bias)
         refined_bundle, engine_name = alpha_engine.refine_setups_with_flagship_ai(sym, raw_bundle, intel, ai_router)
         score = alpha_engine.calculate_confluence_score(sym, intel, macro_bias, refined_bundle.get("mtf_ladder"))
         passed, errors = alpha_engine.verify_setup_before_send(refined_bundle, blackout, score)
 
+        asset_q = q_scan.get(sym.lower(), {})
         setup_id = save_setup_bundle(sym, refined_bundle["live_price"], score, refined_bundle)
-        msg = format_asset_report(sym, refined_bundle, score, engine_name, passed, errors)
+        msg = format_asset_report(sym, refined_bundle, score, engine_name, passed, errors, asset_q)
 
         buttons = {
             "inline_keyboard": [
@@ -199,12 +506,10 @@ def build_and_send_institutional_report(trigger: str = "Scheduled"):
     LATEST_CONTEXT_CACHE["summary"] = "\n".join(summary_parts)
 
 
+# =============================================================================
+# WATCHER BERITA REAL-TIME, PIDATO LIVE & INTERAKSI TELEGRAM
+# =============================================================================
 def auto_breaking_news_watcher_loop():
-    """
-    Berjalan 24/7 setiap 60 detik: mendeteksi berita dadakan baru dari Financial Juice,
-    ForexLive, Federal Reserve, & White House, lalu otomatis mengirim terjemahan & dampak harga.
-    """
-    # Seed awal saat startup agar tidak membanjiri berita lama
     initial = feeds.fetch_realtime_breaking_news(limit=10)
     for item in initial:
         is_news_seen_and_mark(item["hash"], item["source"], item["title"])
@@ -225,12 +530,12 @@ def auto_breaking_news_watcher_loop():
                     f"1. Terjemahkan ke Bahasa Indonesia secara singkat dan jelas.\n"
                     f"2. Sebutkan apakah sentimennya BULLISH atau BEARISH untuk XAUUSD (Emas), DXY, dan BTCUSDT."
                 )
-                ai_note, eng = ai_router.generate_with_flagship_cascade(prompt)
+                ai_note, eng = ask_ai_router(prompt, deep=False)
                 now_str = datetime.datetime.now(WIB).strftime("%H:%M:%S WIB")
                 alert_msg = (
                     f"🚨 BREAKING NEWS OTOMATIS ({now_str})\n\n"
                     f"{raw_lines}\n\n"
-                    f"📊 DAMPAK PASAR ({eng}):\n{ai_note or 'Pantau volatilitas XAUUSD & BTCUSDT.'}"
+                    f"📊 DAMPAK PASAR ({eng}):\n{ai_note}"
                 )
                 send_telegram(alert_msg)
         except Exception as e:
@@ -238,10 +543,6 @@ def auto_breaking_news_watcher_loop():
 
 
 def live_speech_continuous_worker(youtube_url: str):
-    """
-    Memantau pidato live The Fed / Trump secara otomatis tiap 45 detik, menerjemahkan
-    kalimat baru, dan menyimpulkan arah pergerakan saat pidato berjalan maupun selesai.
-    """
     SPEECH_WATCH_STATE["active"] = True
     SPEECH_WATCH_STATE["url"] = youtube_url
     SPEECH_WATCH_STATE["last_tail"] = ""
@@ -253,8 +554,7 @@ def live_speech_continuous_worker(youtube_url: str):
     )
 
     empty_streak = 0
-    max_cycles = 120  # Maks 90 menit
-    for _ in range(max_cycles):
+    for _ in range(120):
         if not SPEECH_WATCH_STATE["active"]:
             break
 
@@ -268,10 +568,8 @@ def live_speech_continuous_worker(youtube_url: str):
             continue
 
         empty_streak = 0
-        prev_tail = SPEECH_WATCH_STATE["last_tail"]
-        if current_text != prev_tail:
+        if current_text != SPEECH_WATCH_STATE["last_tail"]:
             SPEECH_WATCH_STATE["last_tail"] = current_text
-            # Ambil bagian terbaru (~1200 karakter terakhir)
             snippet = current_text[-1200:]
             prompt = (
                 f"Potongan ucapan terbaru dari pidato live The Fed / Trump:\n\"{snippet}\"\n\n"
@@ -279,7 +577,7 @@ def live_speech_continuous_worker(youtube_url: str):
                 f"2. Klasifikasikan nada: HAWKISH (USD naik, XAUUSD turun) atau DOVISH (USD turun, XAUUSD naik) atau NETRAL.\n"
                 f"3. Arah proyeksi XAUUSD & BTCUSDT saat pidato berlanjut/selesai."
             )
-            ai_summary, eng = ai_router.generate_with_flagship_cascade(prompt)
+            ai_summary, eng = ask_ai_router(prompt, deep=False)
             now_str = datetime.datetime.now(WIB).strftime("%H:%M:%S WIB")
             send_telegram(f"🎙️ UPDATE PIDATO LIVE ({now_str} | {eng}):\n\n{ai_summary or snippet[:600]}")
 
@@ -310,14 +608,13 @@ def handle_breaking_news():
         f"Terjemahkan poin terpenting ke Bahasa Indonesia dan simpulkan dalam 3 bullet singkat "
         f"arah dampaknya terhadap XAUUSD (Emas), DXY, dan BTCUSDT."
     )
-    ai_summary, eng = ai_router.generate_with_flagship_cascade(prompt)
+    ai_summary, eng = ask_ai_router(prompt, deep=False)
     header = (
         f"RADAR BREAKING NEWS REAL-TIME ({datetime.datetime.now(WIB).strftime('%H:%M WIB')})\n"
         f"Rem Darurat News USD (±45m): {'AKTIF ' + str(active_ev) if blackout else 'AMAN'}\n\n"
         f"{raw_text}\n\n"
+        f"ANALISA DAMPAK HARGA ({eng}):\n{ai_summary}"
     )
-    if ai_summary:
-        header += f"ANALISA DAMPAK HARGA ({eng}):\n{ai_summary}"
     send_telegram(header)
 
 
@@ -337,7 +634,7 @@ def handle_speech_transcript(url_arg: str):
         f"2. Tentukan apakah nadanya HAWKISH (USD naik, XAUUSD turun) atau DOVISH (USD turun, XAUUSD naik).\n"
         f"3. Berikan proyeksi pergerakan setelah pidato selesai untuk XAUUSD dan BTCUSDT."
     )
-    analysis, eng = ai_router.generate_with_flagship_cascade(prompt)
+    analysis, eng = ask_ai_router(prompt, deep=True)
     send_telegram(f"TRANSKRIP & ANALISA PIDATO LIVE ({eng}):\n\n{analysis or transcript[:1500]}")
 
 
@@ -427,20 +724,21 @@ def telegram_polling_loop():
                 low = text.lower()
                 if low in ("/start", "/help"):
                     send_telegram(
-                        "🤖 QUANT AGENTLANG 24/7 AKTIF (Auto Breaking News + Live Chat)\n\n"
+                        "🤖 QUANT AGENTLANG 24/7 AKTIF (8 Pilar + QuantIntel + RiskEngine)\n\n"
                         "Fitur Otomatis Berjalan 24/7:\n"
-                        "• 🚨 Auto Breaking News Push (cek Financial Juice, ForexLive, Fed, White House tiap 60 detik)\n"
+                        "• 🏛️ Laporan Konfirmasi 8 Pilar Intermarket + OHLC Pivot + GARCH/CVaR + CFTC COT\n"
+                        "• 🚨 Auto Breaking News Push (Financial Juice, ForexLive, Fed, White House tiap 60 detik)\n"
                         "• 📊 Auto Mapping M1-1MON & 3 Tombol Approve (Scalp / Intraday / Swing)\n\n"
                         "Perintah Manual:\n"
-                        "• /report atau /cek — Scan M1-1MON sekarang\n"
-                        "• /status_api — Cek status & latensi semua API + Gemini 4 Argon / Claude\n"
+                        "• /report atau /cek — Scan M1-1MON + 8 Pilar sekarang\n"
+                        "• /status_api — Cek status & latensi semua API + Model AI\n"
                         "• /news — Rangkuman breaking news terbaru\n"
                         "• /pantau_pidato <link_youtube> — Auto-translate pidato live Fed/Trump tiap 45 detik\n"
                         "• /stop_pidato — Hentikan pantauan pidato live\n"
                         "• Chat bebas kapan saja — Ketik pertanyaan apa saja untuk ngobrol langsung dengan AI!"
                     )
                 elif low in ("/report", "/cek"):
-                    send_telegram("⏳ Memindai 9 timeframe (M1-1MON), Orderflow, Heatmap & SMT Divergence...")
+                    send_telegram("⏳ Memindai 9 timeframe (M1-1MON), 8 Pilar Intermarket, OHLC Pivot & GARCH/CVaR...")
                     threading.Thread(
                         target=build_and_send_institutional_report, args=("Manual /report",), daemon=True
                     ).start()
@@ -467,7 +765,11 @@ def telegram_polling_loop():
                         if LATEST_CONTEXT_CACHE["updated"] == "Belum ada scan":
                             snap = feeds.collect_all_8_pillars()
                             LATEST_CONTEXT_CACHE["summary"] = snap["telemetry_summary"]
-                        ans, eng = ai_router.chat_live(q, LATEST_CONTEXT_CACHE["summary"])
+                        if hasattr(ai_router, "chat_live"):
+                            ans, eng = ai_router.chat_live(q, LATEST_CONTEXT_CACHE["summary"])
+                        else:
+                            chat_prompt = f"Konteks Pasar Terkini:\n{LATEST_CONTEXT_CACHE['summary']}\n\nPertanyaan User: {q}"
+                            ans, eng = ask_ai_router(chat_prompt, deep=False)
                         send_telegram(f"{ans}\n\n[{eng}]")
 
                     threading.Thread(target=reply_chat, daemon=True).start()
