@@ -1,7 +1,10 @@
-requests
+google-genai
+anthropic
 python-dotenv
-pytz
 yfinance
-pandas
-numpy
+fredapi
 feedparser
+requests
+flask
+pytz
+youtube-transcript-api
