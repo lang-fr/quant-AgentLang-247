@@ -11,8 +11,8 @@ logger = logging.getLogger("FlagshipAIRouter")
 class FlagshipAIRouter:
     """
     Router AI untuk quant-AgentLang-247:
-    - Default / Scan awal: Gemini 4 Hydrogen (effort: high)
-    - Audit / Refine setup probabilitas tinggi: Claude Sonnet 5.5 (effort: max) dengan fallback otomatis
+    - Scan & penyaringan awal: Gemini 4 Hydrogen (effort: high)
+    - Audit / refine setup probabilitas tinggi: Claude Sonnet 5.5 (effort: max)
     """
 
     def __init__(
@@ -28,9 +28,11 @@ class FlagshipAIRouter:
         self.gemini_effort = os.getenv("GEMINI_REASONING_EFFORT", "high").strip().lower()
         self.anthropic_effort = os.getenv("ANTHROPIC_REASONING_EFFORT", "max").strip().lower()
         self.timeout = timeout
+        self.last_status = "IDLE"
 
     def _call_gemini(self, prompt: str, system_instruction: str = "") -> Optional[str]:
         if not self.gemini_api_key:
+            self.last_status = "GEMINI_KEY_MISSING"
             return None
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -54,13 +56,17 @@ class FlagshipAIRouter:
                 parts = candidates[0].get("content", {}).get("parts", [])
                 texts = [p.get("text", "") for p in parts if p.get("text")]
                 if texts:
+                    self.last_status = f"OK:{self.gemini_model}({self.gemini_effort})"
                     return "\n".join(texts).strip()
+            self.last_status = f"EMPTY_RESPONSE:{self.gemini_model}"
         except Exception as e:
+            self.last_status = f"ERR:{self.gemini_model}:{type(e).__name__}"
             logger.warning(f"Gemini ({self.gemini_model}, effort={self.gemini_effort}) gagal: {e}")
         return None
 
     def _call_anthropic(self, prompt: str, system_instruction: str = "") -> Optional[str]:
         if not self.anthropic_api_key:
+            self.last_status = "ANTHROPIC_KEY_MISSING"
             return None
         url = "https://api.anthropic.com/v1/messages"
         headers = {
@@ -84,8 +90,11 @@ class FlagshipAIRouter:
             content = data.get("content") or []
             texts = [c.get("text", "") for c in content if c.get("type") == "text"]
             if texts:
+                self.last_status = f"OK:{self.anthropic_model}({self.anthropic_effort})"
                 return "\n".join(texts).strip()
+            self.last_status = f"EMPTY_RESPONSE:{self.anthropic_model}"
         except Exception as e:
+            self.last_status = f"ERR:{self.anthropic_model}:{type(e).__name__}"
             logger.warning(f"Anthropic ({self.anthropic_model}, effort={self.anthropic_effort}) gagal: {e}")
         return None
 
@@ -103,7 +112,10 @@ class FlagshipAIRouter:
         if res:
             return res
 
-        return "[Router Info] Kedua provider LLM belum mengembalikan respons; cek API key & nama model di environment."
+        return (
+            f"[Router Status: {self.last_status}] LLM belum mengembalikan analisis penuh "
+            f"(cek GEMINI_API_KEY / ANTHROPIC_API_KEY serta nama model {self.gemini_model} / {self.anthropic_model})."
+        )
 
     def route(self, prompt: str, system_instruction: str = "", prefer_deep_reasoning: bool = False) -> str:
         return self.generate(prompt, system_instruction, prefer_deep_reasoning=prefer_deep_reasoning)
@@ -115,8 +127,9 @@ class FlagshipAIRouter:
         sys_msg = (
             system_instruction
             or "Anda adalah analis kuantitatif institusional (SMC, ICT, Order Flow, OHLC, Makro). "
-               "Evaluasi hanya setup high-probability; jika konfluensi belum matang atau di luar Kill Zone, "
-               "nyatakan WAIT/NO SNIPER dan jelaskan syarat validasi entry, SL, TP1->BEP+1, TP2, dan TP3."
+               "Wajib menahan setup dengan skor < 75 atau di luar Kill Zone sebagai WAIT / NO SNIPER. "
+               "Jika layak, susun 1-3 layer limit entry, SL ketat, TP1 -> geser SL ke BEP+1, TP2, dan TP3, "
+               "serta jelaskan alasan penahanan skor dan syarat agar skor naik >= 75."
         )
         return self.generate(
             prompt=prompt,
