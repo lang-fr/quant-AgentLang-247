@@ -27,8 +27,35 @@ class InstitutionalMarketFeeds:
             "btc_price": btc_meta.get("price", 0.0),
             "btc_source": btc_meta.get("source", "OFFLINE"),
             "extended": extended,
+            "macro": {
+                "net_liquidity_b": 0.0,
+                "dfii10": 0.0,
+                "us02y": 0.0,
+                "us10y": 0.0,
+                "fedfunds": 0.0,
+                "breakeven_10y": extended.get("breakeven_10y", 0.0),
+            },
+            "matrix": {
+                "DXY": {"price": 0.0},
+                "USOIL": {"price": 0.0},
+                "NDX": {"price": 0.0},
+                "SPX": {"price": 0.0},
+                "VIX": {"price": 0.0},
+            },
+            "crypto_dom": {
+                "TOTAL": 0.0,
+                "TOTAL2": 0.0,
+                "TOTAL3": 0.0,
+                "BTC_D": 0.0,
+                "USDT_D": 0.0,
+            },
+            "deriv_onchain": {
+                "stablecoin_7d_flow_b": 0.0,
+                "funding_rate": 0.0,
+                "ls_ratio": 1.0,
+                "fng_value": 0,
+            },
         }
-        
     def __init__(self):
         self.fred_key = os.getenv("FRED_API_KEY", "").strip()
         self.twelvedata_key = os.getenv("TWELVEDATA_API_KEY", "").strip()
