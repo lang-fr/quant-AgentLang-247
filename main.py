@@ -12,7 +12,7 @@ import pytz
 import requests
 from dotenv import load_dotenv
 
-from ai_router import UnifiedAIRouter
+from ai_router import MultiTierAIRouter as UnifiedAIRouter
 from market_feeds import InstitutionalMarketFeeds
 from smc_alpha import InstitutionalSMCAlphaEngine
 from execution_engine import InstitutionalExecutionEngine
