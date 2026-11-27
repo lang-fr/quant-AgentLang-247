@@ -5,41 +5,28 @@ import requests
 from dotenv import load_dotenv
 
 load_dotenv()
-
 logger = logging.getLogger("FlagshipAIRouter")
 
 
 class FlagshipAIRouter:
     """
-    Router AI utama untuk quant-AgentLang-247.
-    Mengutamakan Gemini API (dengan fallback ke Anthropic API jika tersedia),
-    serta menyediakan fallback aman agar proses tidak langsung crash jika API key belum diset.
+    Router AI untuk quant-AgentLang-247:
+    - Default / Scan awal: Gemini 4 Hydrogen (effort: high)
+    - Audit / Refine setup probabilitas tinggi: Claude Sonnet 5.5 (effort: max) dengan fallback otomatis
     """
-
-    def refine_setup(self, prompt: str, system_instruction: str = "") -> str:
-        """
-        Method yang dipanggil oleh smc_alpha.py (refine_setups_with_flagship_ai)
-        untuk memperhalus analisis setup/sinyal trading menggunakan LLM.
-        """
-        default_sys = (
-            system_instruction
-            or "Anda adalah analis kuantitatif institusional (SMC, ICT, Order Flow, OHLC). "
-               "Ringkas, tajam, objektif, dan sertakan invalidasi risiko yang jelas."
-        )
-        return self.generate(prompt=prompt, system_instruction=default_sys)
 
     def __init__(
         self,
         gemini_api_key: Optional[str] = None,
         anthropic_api_key: Optional[str] = None,
-        gemini_model: str = "gemini-2.5-flash",
-        anthropic_model: str = "claude-sonnet-4-20250514",
-        timeout: int = 30,
+        timeout: int = 45,
     ):
-        self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY", "").strip()
-        self.anthropic_api_key = anthropic_api_key or os.getenv("ANTHROPIC_API_KEY", "").strip()
-        self.gemini_model = os.getenv("GEMINI_MODEL", gemini_model).strip()
-        self.anthropic_model = os.getenv("ANTHROPIC_MODEL", anthropic_model).strip()
+        self.gemini_api_key = (gemini_api_key or os.getenv("GEMINI_API_KEY", "")).strip()
+        self.anthropic_api_key = (anthropic_api_key or os.getenv("ANTHROPIC_API_KEY", "")).strip()
+        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-4-hydrogen").strip()
+        self.anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5").strip()
+        self.gemini_effort = os.getenv("GEMINI_REASONING_EFFORT", "high").strip().lower()
+        self.anthropic_effort = os.getenv("ANTHROPIC_REASONING_EFFORT", "max").strip().lower()
         self.timeout = timeout
 
     def _call_gemini(self, prompt: str, system_instruction: str = "") -> Optional[str]:
@@ -51,6 +38,9 @@ class FlagshipAIRouter:
         )
         payload: Dict[str, Any] = {
             "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "thinkingConfig": {"thinkingLevel": self.gemini_effort}
+            },
         }
         if system_instruction:
             payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
@@ -66,7 +56,7 @@ class FlagshipAIRouter:
                 if texts:
                     return "\n".join(texts).strip()
         except Exception as e:
-            logger.warning(f"Gemini API gagal dipanggil: {e}")
+            logger.warning(f"Gemini ({self.gemini_model}, effort={self.gemini_effort}) gagal: {e}")
         return None
 
     def _call_anthropic(self, prompt: str, system_instruction: str = "") -> Optional[str]:
@@ -80,7 +70,8 @@ class FlagshipAIRouter:
         }
         payload: Dict[str, Any] = {
             "model": self.anthropic_model,
-            "max_tokens": 1500,
+            "max_tokens": 4096,
+            "output_config": {"effort": self.anthropic_effort},
             "messages": [{"role": "user", "content": prompt}],
         }
         if system_instruction:
@@ -95,26 +86,40 @@ class FlagshipAIRouter:
             if texts:
                 return "\n".join(texts).strip()
         except Exception as e:
-            logger.warning(f"Anthropic API gagal dipanggil: {e}")
+            logger.warning(f"Anthropic ({self.anthropic_model}, effort={self.anthropic_effort}) gagal: {e}")
         return None
 
-    def generate(self, prompt: str, system_instruction: str = "") -> str:
-        """Menghasilkan respons teks dari LLM yang tersedia."""
-        result = self._call_gemini(prompt, system_instruction)
-        if result:
-            return result
+    def generate(
+        self,
+        prompt: str,
+        system_instruction: str = "",
+        prefer_deep_reasoning: bool = False,
+    ) -> str:
+        if prefer_deep_reasoning:
+            res = self._call_anthropic(prompt, system_instruction) or self._call_gemini(prompt, system_instruction)
+        else:
+            res = self._call_gemini(prompt, system_instruction) or self._call_anthropic(prompt, system_instruction)
 
-        result = self._call_anthropic(prompt, system_instruction)
-        if result:
-            return result
+        if res:
+            return res
 
-        logger.warning("Tidak ada respons LLM aktif (cek GEMINI_API_KEY / ANTHROPIC_API_KEY).")
-        return "[Router Info] LLM tidak merespons atau API key belum dikonfigurasi; laporan berjalan dalam mode data/fallback."
+        return "[Router Info] Kedua provider LLM belum mengembalikan respons; cek API key & nama model di environment."
 
-    def route(self, prompt: str, system_instruction: str = "") -> str:
-        """Alias untuk kompatibilitas pemanggilan."""
-        return self.generate(prompt, system_instruction)
+    def route(self, prompt: str, system_instruction: str = "", prefer_deep_reasoning: bool = False) -> str:
+        return self.generate(prompt, system_instruction, prefer_deep_reasoning=prefer_deep_reasoning)
 
-    def complete(self, prompt: str, system_instruction: str = "") -> str:
-        """Alias untuk kompatibilitas pemanggilan."""
-        return self.generate(prompt, system_instruction)
+    def complete(self, prompt: str, system_instruction: str = "", prefer_deep_reasoning: bool = False) -> str:
+        return self.generate(prompt, system_instruction, prefer_deep_reasoning=prefer_deep_reasoning)
+
+    def refine_setup(self, prompt: str, system_instruction: str = "", confluence_score: int = 0) -> str:
+        sys_msg = (
+            system_instruction
+            or "Anda adalah analis kuantitatif institusional (SMC, ICT, Order Flow, OHLC, Makro). "
+               "Evaluasi hanya setup high-probability; jika konfluensi belum matang atau di luar Kill Zone, "
+               "nyatakan WAIT/NO SNIPER dan jelaskan syarat validasi entry, SL, TP1->BEP+1, TP2, dan TP3."
+        )
+        return self.generate(
+            prompt=prompt,
+            system_instruction=sys_msg,
+            prefer_deep_reasoning=(confluence_score >= 75),
+        )
