@@ -208,15 +208,53 @@ class InstitutionalMarketFeeds:
             "narrative_watch": "Fokus rotasi likuiditas RWA, AI Agents, & Pre-Market TGE/IPO",
         }
 
-    def fetch_mtf_candles(self, symbol: str, interval: str, period: str) -> pd.DataFrame:
+    def fetch_mtf_candles(self, symbol: str, tf_code: str) -> pd.DataFrame:
         """
-        Mengambil candle OHLCV untuk rantai Multi-Timeframe dari M1 (1-menit) sampai 1mo (Monthly).
+        Mengambil candle OHLCV sesuai kode timeframe eksak:
+        M1 (1 Menit), M5 (5 Menit), M15 (15 Menit), M30 (30 Menit),
+        H1 (1 Jam), H4 (4 Jam), D1 (1 Hari), W1 (1 Minggu), 1MON (1 Bulan).
         """
         yf_symbol = "GC=F" if symbol == "XAUUSD" else "BTC-USD"
-        df = yf.Ticker(yf_symbol).history(period=period, interval=interval)
+
+        tf_specs = {
+            "M1": ("1m", "2d"),       # Timeframe 1 Menit
+            "M5": ("5m", "5d"),       # Timeframe 5 Menit
+            "M15": ("15m", "10d"),    # Timeframe 15 Menit
+            "M30": ("30m", "15d"),    # Timeframe 30 Menit
+            "H1": ("1h", "60d"),      # Timeframe 1 Jam
+            "H4": ("1h", "60d"),      # Timeframe 4 Jam (di-resample dari 1 Jam)
+            "D1": ("1d", "1y"),       # Timeframe Daily / 1 Hari
+            "W1": ("1wk", "2y"),      # Timeframe Weekly / 1 Minggu
+            "1MON": ("1mo", "5y"),    # Timeframe Monthly / 1 Bulan (bukan timeframe 5 tahun)
+        }
+
+        if tf_code not in tf_specs:
+            return pd.DataFrame()
+
+        yf_interval, history_window = tf_specs[tf_code]
+        df = yf.Ticker(yf_symbol).history(period=history_window, interval=yf_interval)
         if df is None or df.empty:
             return pd.DataFrame()
-        return df.dropna()
+
+        df = df.dropna()
+
+        # Bentuk candle H4 (4 Jam) secara presisi dari data H1 (1 Jam)
+        if tf_code == "H4":
+            df = (
+                df.resample("4h")
+                .agg(
+                    {
+                        "Open": "first",
+                        "High": "max",
+                        "Low": "min",
+                        "Close": "last",
+                        "Volume": "sum",
+                    }
+                )
+                .dropna()
+            )
+
+        return df
 
     def collect_all_8_pillars(self) -> dict:
         matrix = self.fetch_cross_market_matrix()
