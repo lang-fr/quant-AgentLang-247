@@ -1,1125 +1,947 @@
 import os
-import sys
-import time
+import html
 import json
+import time
 import threading
 import sqlite3
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import ccxt
+import feedparser
 import requests
+import cot_reports as cot
+from arch import arch_model
+from backtesting import Backtest, Strategy
+from dotenv import load_dotenv
+from fredapi import Fred
+from flask import Flask, request, jsonify
+from google import genai
+from google.genai import types
 
 # ==============================================================================
-# KONFIGURASI ENVIRONMENT & KONSTANTA RISIKO
+# 1. KONFIGURASI & ENVIRONMENT VARIABLES
 # ==============================================================================
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-BLOCKWORKS_API_KEY = os.getenv("BLOCKWORKS_API_KEY", "").strip()
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+load_dotenv()
 
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+FRED_API_KEY = os.getenv("FRED_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+BLOCKWORKS_API_KEY = os.getenv("BLOCKWORKS_API_KEY", "")
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
+METAAPI_TOKEN = os.getenv("METAAPI_TOKEN", "")
+METAAPI_ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "")
+
+MAX_RISK_PCT = float(os.getenv("MAX_RISK_PER_SETUP_PCT", "1.0"))
+MAX_ENTRIES_SESSION = int(os.getenv("MAX_ENTRIES_PER_SESSION", "3"))
+MAX_LAYERS_SETUP = int(os.getenv("MAX_LAYERS_PER_SETUP", "3"))
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "2.5"))
+MAX_SPREAD_PIPS = float(os.getenv("MAX_ALLOWED_SPREAD_PIPS", "3.0"))
+AUTO_SCAN_INTERVAL_SEC = int(os.getenv("AUTO_SCAN_INTERVAL_SEC", "14400"))
+
+app = Flask(__name__)
 DB_PATH = "quant_cloud_audit.db"
-MIN_CONFLUENCE_SCORE = 75
-MAX_DAILY_DRAWDOWN_PCT = 5.0
-MAX_ENTRIES_PER_SESSION = 3
-MAX_ENTRIES_PER_DAY = 9
-
 WIB = timezone(timedelta(hours=7))
-EST = timezone(timedelta(hours=-5))
+
+
+def waktu_wib_str() -> str:
+    return datetime.now(WIB).strftime("%d %b %Y %H:%M WIB")
+
+
+def clean_yf_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df.loc[:, ~df.columns.duplicated()].copy()
 
 
 # ==============================================================================
-# 1. HEALTH CHECK SERVER (UNTUK KOYEB / CLOUD 24/7 WORKER)
-# ==============================================================================
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"AgentLang 24/7 Realtime Bot OK")
-
-    def log_message(self, format, *args):
-        return
-
-
-def start_health_server():
-    port = int(os.getenv("PORT", "8080"))
-    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-
-
-# ==============================================================================
-# 2. DATABASE AUDIT SQLITE, MEMORI CHAT & RISK GATEKEEPER
+# 2. DATABASE SQLITE & PELACAK SESI / KILLZONE
 # ==============================================================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS audit_signals (
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp_wib TEXT,
-            date_wib TEXT,
+            timestamp_utc TEXT,
+            date_utc TEXT,
             session_name TEXT,
             asset TEXT,
-            direction TEXT,
-            total_score INTEGER,
-            score_macro INTEGER,
-            score_sentiment INTEGER,
-            score_ohlc_ote INTEGER,
-            score_smc_kz INTEGER,
-            action_status TEXT,
-            entry_price REAL,
-            sl_price REAL,
-            tp1 REAL,
-            tp2 REAL,
-            tp3 REAL,
-            outcome_status TEXT DEFAULT 'PENDING',
-            notes TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS daily_equity_log (
-            date_wib TEXT PRIMARY KEY,
-            start_equity REAL,
-            last_equity REAL
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS bot_state (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS chat_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            role TEXT,
-            message TEXT,
-            timestamp_wib TEXT
+            bias TEXT,
+            score INTEGER,
+            spread_pips REAL,
+            macro_snapshot TEXT,
+            user_decision TEXT,
+            summary TEXT
         )
     """)
     conn.commit()
     conn.close()
 
 
-def get_bot_state(key: str, default: str = "") -> str:
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("SELECT value FROM bot_state WHERE key = ?", (key,))
-        row = cur.fetchone()
-        conn.close()
-        return row[0] if row else default
-    except Exception:
-        return default
+def deteksi_sesi_trading() -> str:
+    jam_utc = datetime.now(timezone.utc).hour
+    if 0 <= jam_utc < 7:
+        return "ASIA_RANGE (07:00-14:00 WIB)"
+    elif 7 <= jam_utc < 10:
+        return "LONDON_KILLZONE (14:00-17:00 WIB)"
+    elif 10 <= jam_utc < 12:
+        return "LONDON_SESSION (17:00-19:00 WIB)"
+    elif 12 <= jam_utc < 16:
+        return "NY_AM_KILLZONE (19:00-23:00 WIB)"
+    elif 16 <= jam_utc < 21:
+        return "NY_PM_SESSION (23:00-04:00 WIB)"
+    return "DEAD_ZONE (04:00-07:00 WIB)"
 
 
-def set_bot_state(key: str, value: str):
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO bot_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, str(value)),
-        )
-        conn.commit()
-        conn.close()
-    except Exception:
-        pass
-
-
-def simpan_riwayat_chat(role: str, message: str):
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        now_str = datetime.now(WIB).strftime("%H:%M WIB")
-        cur.execute(
-            "INSERT INTO chat_history (role, message, timestamp_wib) VALUES (?, ?, ?)",
-            (role, message[:1500], now_str),
-        )
-        cur.execute("DELETE FROM chat_history WHERE id NOT IN (SELECT id FROM chat_history ORDER BY id DESC LIMIT 12)")
-        conn.commit()
-        conn.close()
-    except Exception:
-        pass
-
-
-def ambil_riwayat_chat() -> str:
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("SELECT role, message, timestamp_wib FROM chat_history ORDER BY id DESC LIMIT 6")
-        rows = list(reversed(cur.fetchall()))
-        conn.close()
-        if not rows:
-            return "Belum ada riwayat chat sebelumnya."
-        return "\n".join(f"[{r[2]}] {r[0]}: {r[1]}" for r in rows)
-    except Exception:
-        return "Belum ada riwayat chat sebelumnya."
-
-
-def hitung_dynamic_half_kelly_risk(session_name: str, total_score: int, regime: str = "TRENDING") -> float:
-    if regime == "RANGING":
-        return 0.005
-
-    base_risk = 0.015 if total_score >= 85 else 0.010
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT outcome_status FROM audit_signals
-            WHERE session_name = ? AND outcome_status IN ('HIT_TP1', 'HIT_TP2', 'HIT_TP3', 'HIT_SL')
-            ORDER BY id DESC LIMIT 30
-        """, (session_name,))
-        rows = [r[0] for r in cur.fetchall()]
-        conn.close()
-
-        if len(rows) >= 8:
-            wins = sum(1 for r in rows if r.startswith("HIT_TP"))
-            win_rate = wins / len(rows)
-            rr_ratio = 2.0
-            kelly_full = win_rate - ((1.0 - win_rate) / rr_ratio)
-            half_kelly = max(0.005, min(0.015, kelly_full * 0.5))
-            return round(half_kelly, 4)
-    except Exception:
-        pass
-    return base_risk
-
-
-def deteksi_sesi_dan_killzone() -> dict:
-    now_wib = datetime.now(WIB)
-    now_est = datetime.now(EST)
-    jam_est = now_est.hour + (now_est.minute / 60.0)
-
-    if 2.0 <= jam_est <= 5.0:
-        sesi, in_kz, kz_label = "LONDON", True, "LONDON_OPEN_KILLZONE"
-    elif 7.0 <= jam_est <= 11.0:
-        sesi, in_kz, kz_label = "NEW_YORK", True, "NEW_YORK_AM_KILLZONE"
-    elif 5.0 < jam_est < 7.0:
-        sesi, in_kz, kz_label = "LONDON", False, "LONDON_PRE_NY"
-    elif 11.0 < jam_est <= 16.0:
-        sesi, in_kz, kz_label = "NEW_YORK", False, "NEW_YORK_PM"
-    else:
-        sesi, in_kz, kz_label = "ASIA", False, "ASIA_CONSOLIDATION"
-
-    return {
-        "wib_str": now_wib.strftime("%Y-%m-%d %H:%M WIB"),
-        "date_wib": now_wib.strftime("%Y-%m-%d"),
-        "est_str": now_est.strftime("%H:%M EST"),
-        "session": sesi,
-        "in_killzone": in_kz,
-        "killzone_label": kz_label,
-    }
-
-
-def cek_batas_risiko_harian(current_equity: float, date_wib: str, session_name: str) -> dict:
+def hitung_entry_terpakai_sesi_ini() -> int:
+    init_db()
+    hari_ini = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    sesi_ini = deteksi_sesi_trading()
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-
-    cur.execute("SELECT start_equity FROM daily_equity_log WHERE date_wib = ?", (date_wib,))
-    row = cur.fetchone()
-    if row is None:
-        start_eq = current_equity if current_equity > 0 else 1000.0
-        cur.execute(
-            "INSERT INTO daily_equity_log (date_wib, start_equity, last_equity) VALUES (?, ?, ?)",
-            (date_wib, start_eq, start_eq),
-        )
-    else:
-        start_eq = float(row[0])
-        cur.execute(
-            "UPDATE daily_equity_log SET last_equity = ? WHERE date_wib = ?",
-            (current_equity, date_wib),
-        )
-
-    dd_pct = ((start_eq - current_equity) / start_eq * 100.0) if start_eq > 0 else 0.0
-
-    cur.execute(
-        "SELECT COUNT(*) FROM audit_signals WHERE date_wib = ? AND action_status IN ('BINANCE_DEMO_AUTO', 'MANUAL_CFD_SIGNAL')",
-        (date_wib,),
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT COUNT(*) FROM audit_log
+        WHERE date_utc = ? AND session_name = ? AND user_decision = 'APPROVED_SIMULATION'
+        """,
+        (hari_ini, sesi_ini),
     )
-    total_hari_ini = int(cur.fetchone()[0])
-
-    cur.execute(
-        "SELECT COUNT(*) FROM audit_signals WHERE date_wib = ? AND session_name = ? AND action_status IN ('BINANCE_DEMO_AUTO', 'MANUAL_CFD_SIGNAL')",
-        (date_wib, session_name),
-    )
-    total_sesi_ini = int(cur.fetchone()[0])
-
-    conn.commit()
+    jumlah = c.fetchone()[0]
     conn.close()
-
-    if dd_pct >= MAX_DAILY_DRAWDOWN_PCT:
-        return {"allowed": False, "reason": f"KILL SWITCH AKTIF: Daily drawdown {dd_pct:.2f}% >= {MAX_DAILY_DRAWDOWN_PCT}%", "dd_pct": round(dd_pct, 2)}
-    if total_hari_ini >= MAX_ENTRIES_PER_DAY:
-        return {"allowed": False, "reason": f"Batas harian tercapai ({total_hari_ini}/{MAX_ENTRIES_PER_DAY} entry)", "dd_pct": round(dd_pct, 2)}
-    if total_sesi_ini >= MAX_ENTRIES_PER_SESSION:
-        return {"allowed": False, "reason": f"Batas sesi {session_name} tercapai ({total_sesi_ini}/{MAX_ENTRIES_PER_SESSION} entry)", "dd_pct": round(dd_pct, 2)}
-
-    return {
-        "allowed": True,
-        "dd_pct": round(dd_pct, 2),
-        "entries_today": total_hari_ini,
-        "entries_session": total_sesi_ini,
-    }
+    return jumlah
 
 
-def simpan_log_audit(record: dict):
+def simpan_log(asset: str, bias: str, score: int, spread_pips: float, macro_snapshot: str, decision: str, summary: str) -> int:
+    init_db()
+    now_utc = datetime.now(timezone.utc)
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO audit_signals (
-            timestamp_wib, date_wib, session_name, asset, direction,
-            total_score, score_macro, score_sentiment, score_ohlc_ote, score_smc_kz,
-            action_status, entry_price, sl_price, tp1, tp2, tp3, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        record["timestamp_wib"], record["date_wib"], record["session_name"], record["asset"], record["direction"],
-        record["total_score"], record["score_macro"], record["score_sentiment"], record["score_ohlc_ote"], record["score_smc_kz"],
-        record["action_status"], record["entry_price"], record["sl_price"], record["tp1"], record["tp2"], record["tp3"], record["notes"]
-    ))
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO audit_log
+        (timestamp_utc, date_utc, session_name, asset, bias, score, spread_pips, macro_snapshot, user_decision, summary)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            now_utc.isoformat(),
+            now_utc.strftime("%Y-%m-%d"),
+            deteksi_sesi_trading(),
+            asset,
+            bias,
+            score,
+            spread_pips,
+            macro_snapshot,
+            decision,
+            summary,
+        ),
+    )
+    row_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return row_id
+
+
+def update_keputusan_user(log_id: int, decision: str):
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE audit_log SET user_decision = ? WHERE id = ?", (decision, log_id))
     conn.commit()
     conn.close()
 
 
+def ambil_ringkasan_jurnal_dan_evaluasi_mingguan() -> str:
+    init_db()
+    batas_7_hari = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    c.execute("SELECT COUNT(*) FROM audit_log WHERE timestamp_utc >= ?", (batas_7_hari,))
+    scan_7d = c.fetchone()[0]
+
+    c.execute("SELECT COUNT(*) FROM audit_log WHERE timestamp_utc >= ? AND user_decision = 'APPROVED_SIMULATION'", (batas_7_hari,))
+    approved_7d = c.fetchone()[0]
+
+    c.execute("SELECT COUNT(*) FROM audit_log WHERE timestamp_utc >= ? AND user_decision = 'REJECTED_BY_USER'", (batas_7_hari,))
+    rejected_7d = c.fetchone()[0]
+
+    c.execute("SELECT AVG(score) FROM audit_log WHERE timestamp_utc >= ? AND score > 0", (batas_7_hari,))
+    avg_score = c.fetchone()[0] or 0.0
+
+    c.execute("SELECT session_name, asset, bias, score, user_decision, summary FROM audit_log ORDER BY id DESC LIMIT 5")
+    rows = c.fetchall()
+    conn.close()
+
+    sesi_aktif = deteksi_sesi_trading()
+    sisa_kuota = max(0, MAX_ENTRIES_SESSION - hitung_entry_terpakai_sesi_ini())
+
+    teks = (
+        f"📊 <b>JURNAL AUDIT & EVALUASI 7 HARI TERAKHIR</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"• <b>Total Scan Sistem:</b> {scan_7d}x\n"
+        f"• <b>Sinyal Disetujui:</b> {approved_7d}\n"
+        f"• <b>Sinyal Ditolak:</b> {rejected_7d}\n"
+        f"• <b>Rata-rata Skor Konfirmasi:</b> {round(float(avg_score), 1)}/100\n"
+        f"• <b>Sesi Aktif:</b> {html.escape(sesi_aktif)} (Sisa Kuota: {sisa_kuota}/{MAX_ENTRIES_SESSION})\n\n"
+        f"🗂 <b>5 Log Terakhir:</b>\n\n"
+    )
+    for r in rows:
+        teks += f"• <b>[{html.escape(str(r[0]))}]</b> {html.escape(str(r[1]))} | {html.escape(str(r[2]))} | Skor: <b>{r[3]}</b> ({html.escape(str(r[4]))})\n\n"
+    return teks
+
+
 # ==============================================================================
-# 3. ROUTING MODEL AI:
-#    - ANALISA SETUP 3-AGEN : CLAUDE -> GEMINI 4 HYDROGEN / PRO -> GROQ
-#    - CHAT NGOBROL BIASA   : GEMINI FLASH-LITE / FLASH (CEPAT & HEMAT)
+# 3. KALENDER BERITA TIER-1 & STRUKTUR PRESISI MULTI-TIMEFRAME (M15 s.d. MONTHLY)
 # ==============================================================================
-def _ekstrak_json_bersih(teks: str) -> dict:
-    teks = teks.strip()
-    if "```" in teks:
-        bagian = teks.split("```")
-        for b in bagian:
-            b_clean = b.replace("json", "", 1).strip()
-            if b_clean.startswith("{") and b_clean.endswith("}"):
-                return json.loads(b_clean)
-    awal = teks.find("{")
-    akhir = teks.rfind("}")
-    if awal != -1 and akhir != -1:
-        return json.loads(teks[awal:akhir + 1])
-    return json.loads(teks)
-
-
-def _panggil_claude(prompt: str, max_tokens: int = 2048) -> tuple[str, str, str]:
-    if not ANTHROPIC_API_KEY:
-        return "", "", "ANTHROPIC_API_KEY kosong"
-    err_terakhir = ""
-    for model_claude in (
-        "claude-sonnet-4-6",
-        "claude-haiku-4-5-20251001",
-        "claude-sonnet-4-5-20250929",
-    ):
-        try:
-            url = "https://api.anthropic.com/v1/messages"
-            headers = {
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            }
-            payload = {
-                "model": model_claude,
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": prompt}],
-            }
-            resp = requests.post(url, headers=headers, json=payload, timeout=30)
-            if resp.status_code == 200:
-                txt = resp.json()["content"][0]["text"].strip()
-                if txt:
-                    return txt, f"Anthropic {model_claude}", ""
-            else:
-                detail = ""
-                try:
-                    detail = resp.json().get("error", {}).get("message", "")[:70]
-                except Exception:
-                    pass
-                err_terakhir = f"HTTP {resp.status_code}: {detail}".strip()
-                if "credit balance" in detail.lower() or resp.status_code == 401:
-                    break
-        except Exception as e:
-            err_terakhir = str(e)[:70]
-            continue
-    return "", "", f"Claude ({err_terakhir})"
-
-
-def _daftar_model_gemini_terurut(untuk_analisa_berat: bool = True) -> list[str]:
-    if untuk_analisa_berat:
-        prioritas = [
-            "gemini-4-hydrogen",
-            "gemini-2.5-pro",
-            "gemini-3.5-pro",
-            "gemini-2.5-flash",
-            "gemini-3.5-flash-lite",
-        ]
-    else:
-        prioritas = [
-            "gemini-3.5-flash-lite",
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-lite",
-            "gemini-2.0-flash",
-        ]
-
+def cek_kalender_berita_tier1_otomatis() -> dict:
     try:
-        r = requests.get(
-            f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}",
-            timeout=8,
-        )
-        if r.status_code == 200:
-            tersedia = []
-            for m in r.json().get("models", []):
-                if "generateContent" in m.get("supportedGenerationMethods", []):
-                    nama = m.get("name", "").replace("models/", "")
-                    if nama and "embedding" not in nama and "imagen" not in nama:
-                        tersedia.append(nama)
-            hasil = [p for p in prioritas if p in tersedia]
-            for t in tersedia:
-                if t not in hasil:
-                    hasil.append(t)
-            if hasil:
-                return hasil
-    except Exception:
-        pass
-    return prioritas
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        events = requests.get(url, timeout=10).json()
+        now_utc = datetime.now(timezone.utc)
+        active_warnings = []
 
+        for ev in events:
+            if ev.get("country") == "USD" and ev.get("impact") == "High":
+                ev_date_str = ev.get("date", "")
+                if ev_date_str:
+                    ev_dt = datetime.fromisoformat(ev_date_str).astimezone(timezone.utc)
+                    diff_min = abs((ev_dt - now_utc).total_seconds()) / 60.0
+                    if diff_min <= 45:
+                        active_warnings.append(f"{ev.get('title')} ({int(diff_min)}m)")
 
-def _panggil_gemini(prompt: str, untuk_analisa_berat: bool = False) -> tuple[str, str, str]:
-    if not GEMINI_API_KEY:
-        return "", "", "GEMINI_API_KEY kosong"
-    err_terakhir = ""
-    for model_gem in _daftar_model_gemini_terurut(untuk_analisa_berat=untuk_analisa_berat):
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_gem}:generateContent"
-            headers = {
-                "x-goog-api-key": GEMINI_API_KEY,
-                "Content-Type": "application/json",
-            }
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.15 if untuk_analisa_berat else 0.45,
-                    "maxOutputTokens": 4096 if untuk_analisa_berat else 1500,
-                },
-            }
-            resp = requests.post(url, headers=headers, json=payload, timeout=30)
-            if resp.status_code == 200:
-                parts = resp.json()["candidates"][0]["content"]["parts"]
-                teks_hasil = "".join(
-                    p.get("text", "") for p in parts if not p.get("thought", False)
-                ).strip()
-                if teks_hasil:
-                    tag = "Analisa Setup" if untuk_analisa_berat else "Chat Biasa"
-                    return teks_hasil, f"Gemini {model_gem} ({tag})", ""
-            else:
-                err_terakhir = f"HTTP {resp.status_code}"
-                if resp.status_code in (401, 403):
-                    break
-        except Exception as e:
-            err_terakhir = str(e)[:70]
-            continue
-    return "", "", f"Gemini ({err_terakhir})"
-
-
-def _panggil_groq(prompt: str, mode_json: bool = False) -> tuple[str, str, str]:
-    if not GROQ_API_KEY:
-        return "", "", "GROQ_API_KEY kosong"
-    err_terakhir = ""
-    for model_groq in ("openai/gpt-oss-120b", "meta-llama/llama-4-scout-17b-16e-instruct"):
-        try:
-            url = "https://api.groq.com/openai/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            }
-            payload = {
-                "model": model_groq,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.15 if mode_json else 0.4,
-            }
-            if mode_json:
-                payload["response_format"] = {"type": "json_object"}
-            resp = requests.post(url, headers=headers, json=payload, timeout=20)
-            if resp.status_code == 200:
-                txt = resp.json()["choices"][0]["message"]["content"].strip()
-                if txt:
-                    return txt, f"Groq {model_groq}", ""
-            else:
-                err_terakhir = f"HTTP {resp.status_code}"
-        except Exception as e:
-            err_terakhir = str(e)[:70]
-            continue
-    return "", "", f"Groq ({err_terakhir})"
-
-
-def panggil_ai_analisa_setup(prompt: str) -> tuple[str, str, str]:
-    """Khusus Analisa Setup 3-Agen: Claude -> Gemini 4 Hydrogen / Pro -> Groq."""
-    errors = []
-    for fn in (
-        lambda: _panggil_claude(prompt, max_tokens=2048),
-        lambda: _panggil_gemini(prompt, untuk_analisa_berat=True),
-        lambda: _panggil_groq(prompt, mode_json=True),
-    ):
-        txt, model_name, err = fn()
-        if txt:
-            return txt, model_name, ""
-        if err:
-            errors.append(err)
-    return "", "Fallback Deterministik", " | ".join(errors)
-
-
-def panggil_ai_chat_biasa(prompt: str) -> tuple[str, str, str]:
-    """Khusus Ngobrol Biasa di Telegram: Gemini Flash-Lite / Flash (ringan & cepat)."""
-    errors = []
-    for fn in (
-        lambda: _panggil_gemini(prompt, untuk_analisa_berat=False),
-        lambda: _panggil_groq(prompt, mode_json=False),
-        lambda: _panggil_claude(prompt, max_tokens=1200),
-    ):
-        txt, model_name, err = fn()
-        if txt:
-            return txt, model_name, ""
-        if err:
-            errors.append(err)
-    return "", "Offline", " | ".join(errors)
-
-
-# ==============================================================================
-# 4. BLOCKWORKS TABULAR ASSETS API (SESUAI PAKET CREDITS AKUNMU)
-# ==============================================================================
-def ambil_riset_blockworks() -> str:
-    if not BLOCKWORKS_API_KEY:
-        return "BELUM DITARIK (BLOCKWORKS_API_KEY kosong di .env)"
-    try:
-        headers_baru = {
-            "X-Blockworks-API-Key": BLOCKWORKS_API_KEY,
-            "Accept": "application/json",
-        }
-        url_tabular = "https://api.blockworks.com/query/tabular/assets?limit=3"
-        r = requests.get(url_tabular, headers=headers_baru, timeout=10)
-        if r.status_code == 200:
-            return f"Blockworks Tabular OK ({str(r.json())[:160]}) [Blockworks Data API]"
-
-        # Cadangan endpoint Legacy jika key berasal dari akun Blockworks Research lama
-        r_legacy = requests.get(
-            "https://api.blockworks.com/v1/assets/metrics?assets=BTC,ETH,SOL&limit=3",
-            headers={"x-api-key": BLOCKWORKS_API_KEY},
-            timeout=10,
-        )
-        if r_legacy.status_code == 200:
-            return f"Blockworks Legacy OK ({str(r_legacy.json())[:160]}) [Blockworks API]"
-
-        return f"Blockworks HTTP {r.status_code}: {r.text[:90]}"
+        return {"is_high_impact_active": len(active_warnings) > 0, "upcoming_events": active_warnings}
     except Exception as e:
-        return f"Blockworks Error: {str(e)[:80]}"
+        return {"is_high_impact_active": False, "error": str(e)}
 
 
-def evaluasi_critical_thinking_3_agen(
-    makro: dict,
-    derivatif: dict,
-    kalender: dict,
-    smc_xau: dict,
-    smc_xyz: dict,
-    smc_btc: dict,
-    blockworks_info: str,
+def hitung_level_sniper_historis(ticker: str = "GC=F") -> dict:
+    """
+    Menarik data historis dari M15 (5 hari), H1 (30 hari), D1 (1 tahun),
+    hingga Weekly/Monthly (5 tahun) untuk menghitung:
+    - Pivot & OHLC NH/NL Harian (Intraday)
+    - Zona FVG & Order Block M15/H1 (Sniper Session Entry + Tight SL)
+    - Swing High/Low D1/W1 (Swing Trade)
+    - Zona Akumulasi Diskon / Premium 3-5 Tahun Monthly (Long-Term Hold)
+    """
+    try:
+        df_m15 = clean_yf_df(yf.download(ticker, period="5d", interval="15m", progress=False))
+        df_h1 = clean_yf_df(yf.download(ticker, period="30d", interval="1h", progress=False))
+        df_d1 = clean_yf_df(yf.download(ticker, period="1y", interval="1d", progress=False))
+        df_mo = clean_yf_df(yf.download(ticker, period="5y", interval="1mo", progress=False))
+
+        if df_h1.empty or df_d1.empty:
+            return {"error": f"Data historis {ticker} gagal dimuat."}
+
+        harga_live = round(float(df_m15["Close"].iloc[-1] if not df_m15.empty else df_h1["Close"].iloc[-1]), 2)
+
+        # 1. Kalkulasi OHLC Harian Kemarin (Intraday Pivot, NH, NL)
+        prev_d1 = df_d1.iloc[-2]
+        p_open, p_high, p_low, p_close = float(prev_d1["Open"]), float(prev_d1["High"]), float(prev_d1["Low"]), float(prev_d1["Close"])
+        pivot = round(((2 * p_close) + p_high + p_low) / 4.0, 2)
+        x_val = ((2 * p_high) + p_low + p_close) / 2.0 if p_close >= p_open else ((2 * p_low) + p_high + p_close) / 2.0
+        ohlc_nh = round(x_val - p_low, 2)
+        ohlc_nl = round(x_val - p_high, 2)
+
+        # 2. ATR Mikro M15 & H1 untuk SL Ketat (Anti-Wide SL)
+        atr_m15 = round(float((df_m15["High"] - df_m15["Low"]).tail(14).mean()), 2) if not df_m15.empty else 2.5
+        atr_h1 = round(float((df_h1["High"] - df_h1["Low"]).tail(14).mean()), 2)
+
+        # 3. Deteksi Fair Value Gap (FVG) Terakhir pada M15
+        fvg_zone = "Tidak ada FVG baru"
+        if len(df_m15) >= 5:
+            for i in range(len(df_m15) - 3, max(0, len(df_m15) - 25), -1):
+                c1_high = float(df_m15["High"].iloc[i])
+                c3_low = float(df_m15["Low"].iloc[i + 2])
+                c1_low = float(df_m15["Low"].iloc[i])
+                c3_high = float(df_m15["High"].iloc[i + 2])
+                if c3_low > c1_high:
+                    ce_mid = round((c1_high + c3_low) / 2.0, 2)
+                    fvg_zone = f"Bullish FVG M15 [{round(c1_high, 2)} - {round(c3_low, 2)}] | CE 50%: {ce_mid}"
+                    break
+                elif c3_high < c1_low:
+                    ce_mid = round((c3_high + c1_low) / 2.0, 2)
+                    fvg_zone = f"Bearish FVG M15 [{round(c3_high, 2)} - {round(c1_low, 2)}] | CE 50%: {ce_mid}"
+                    break
+
+        # 4. Konfluensi Trend H1, H4, D1, Monthly + ADX(14) + Z-Score
+        h1_trend = "BULLISH" if df_h1["Close"].ewm(span=20).mean().iloc[-1] > df_h1["Close"].ewm(span=50).mean().iloc[-1] else "BEARISH"
+        df_h4 = df_h1.resample("4h").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
+        h4_trend = "BULLISH" if df_h4["Close"].ewm(span=20).mean().iloc[-1] > df_h4["Close"].ewm(span=50).mean().iloc[-1] else "BEARISH"
+        d1_trend = "BULLISH" if df_d1["Close"].ewm(span=20).mean().iloc[-1] > df_d1["Close"].ewm(span=50).mean().iloc[-1] else "BEARISH"
+
+        high, low, close = df_d1["High"], df_d1["Low"], df_d1["Close"]
+        plus_dm = high.diff().clip(lower=0)
+        minus_dm = (-low.diff()).clip(lower=0)
+        tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+        atr_d1 = tr.rolling(14).mean()
+        plus_di = 100 * (plus_dm.rolling(14).mean() / atr_d1)
+        minus_di = 100 * (minus_dm.rolling(14).mean() / atr_d1)
+        dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+        adx_val = round(float(dx.rolling(14).mean().iloc[-1]), 1)
+
+        h1_ret = np.log(df_h1["Close"] / df_h1["Close"].shift(1)).dropna()
+        z_score_h1 = round(float((h1_ret.iloc[-1] - h1_ret.mean()) / h1_ret.std()), 2)
+
+        # 5. Zona Swing (D1 60 hari) & Hold Jangka Panjang (Monthly 5 Tahun)
+        swing_high_60d = round(float(df_d1["High"].tail(60).max()), 2)
+        swing_low_60d = round(float(df_d1["Low"].tail(60).min()), 2)
+        ote_bull_swing = round(swing_high_60d - 0.705 * (swing_high_60d - swing_low_60d), 2)
+        ote_bear_swing = round(swing_low_60d + 0.705 * (swing_high_60d - swing_low_60d), 2)
+
+        hold_high_5y = round(float(df_mo["High"].max()), 2) if not df_mo.empty else swing_high_60d
+        hold_low_5y = round(float(df_mo["Low"].min()), 2) if not df_mo.empty else swing_low_60d
+        hold_eq_5y = round((hold_high_5y + hold_low_5y) / 2.0, 2)
+        hold_discount_zone = round(hold_low_5y + 0.30 * (hold_high_5y - hold_low_5y), 2)
+
+        return {
+            "ticker": ticker,
+            "harga_terakhir": harga_live,
+            "trend_MTF": f"H1:{h1_trend} | H4:{h4_trend} | D1:{d1_trend}",
+            "ADX_14": adx_val,
+            "regime": "TRENDING" if adx_val >= 20 else "CHOPPY_SIDEWAYS",
+            "Z_score_H1": z_score_h1,
+            "ATR_M15": atr_m15,
+            "ATR_H1": atr_h1,
+            "OHLC_Pivot": pivot,
+            "OHLC_Resisten_NH": ohlc_nh,
+            "OHLC_Support_NL": ohlc_nl,
+            "FVG_M15_Terbaru": fvg_zone,
+            "Swing_60D": {"High": swing_high_60d, "Low": swing_low_60d, "OTE_Buy_0705": ote_bull_swing, "OTE_Sell_0705": ote_bear_swing},
+            "Hold_5Y_Monthly": {"ATH_5Y": hold_high_5y, "Low_5Y": hold_low_5y, "Equilibrium": hold_eq_5y, "Deep_Discount_Accumulation": hold_discount_zone},
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ==============================================================================
+# 4. HARDCODED RISK ENGINE & CIRCUIT BREAKER
+# ==============================================================================
+def validasi_hardcoded_risk(
+    balance: float,
+    sl_distance: float,
+    pip_value: float,
+    layers: int = 1,
+    daily_loss_pct: float = 0.0,
+    spread_pips: float = 1.5,
+    is_high_impact_news: bool = False,
+    z_score_h1: float = 0.0,
 ) -> dict:
-    konteks = {
-        "makro_intermarket": makro,
-        "sentimen_onchain_cot": derivatif,
-        "kalender_ekonomi": kalender,
-        "blockworks_intel": blockworks_info,
-        "xauusd_smc": smc_xau,
-        "xyz_gold_smc": smc_xyz,
-        "btcusdt_smc": smc_btc,
+    sesi = deteksi_sesi_trading()
+    terpakai = hitung_entry_terpakai_sesi_ini()
+
+    if is_high_impact_news:
+        return {"approved": False, "reason": "CIRCUIT BREAKER: Rilis berita USD Tier-1 aktif (±45 menit)."}
+    if abs(z_score_h1) >= 2.5:
+        return {"approved": False, "reason": f"SPIKE GUARD: Lonjakan ekstrem Z-Score H1 ({z_score_h1})."}
+    if daily_loss_pct >= MAX_DAILY_LOSS_PCT:
+        return {"approved": False, "reason": f"CIRCUIT BREAKER: Batas rugi harian {MAX_DAILY_LOSS_PCT}% tercapai."}
+    if terpakai >= MAX_ENTRIES_SESSION:
+        return {"approved": False, "reason": f"BATAS SESI ({sesi}): Kuota {MAX_ENTRIES_SESSION} entry habis."}
+    if spread_pips > MAX_SPREAD_PIPS:
+        return {"approved": False, "reason": f"FILTER SPREAD: Spread ({spread_pips}) > {MAX_SPREAD_PIPS} pips."}
+
+    risk_usd = balance * (MAX_RISK_PCT / 100.0)
+    risk_per_layer = risk_usd / max(1, min(layers, MAX_LAYERS_SETUP))
+    denom = max(0.1, sl_distance * pip_value)
+    lot = max(0.01, round(risk_per_layer / denom, 2))
+    return {
+        "approved": True,
+        "sesi_aktif": sesi,
+        "sisa_kuota_sesi": MAX_ENTRIES_SESSION - terpakai,
+        "lot_per_layer": lot,
+        "total_risk_usd": round(risk_usd, 2),
     }
 
-    prompt = f"""
-Kamu adalah Komite Investasi Kuantitatif Institusional (Alpha Proposer + Devil's Advocate + Risk Judge).
-Analisa data live pasar di bawah ini secara kritis, objektif, dan tanpa mengarang angka:
 
-{json.dumps(konteks)}
-
-Balas HANYA dalam JSON valid (tanpa teks tambahan di luar JSON) dengan struktur persis berikut:
-{{
-  "gold_bias": "BUY" atau "SELL" atau "NEUTRAL",
-  "gold_sentiment_score": angka bulat 0 sampai 20,
-  "gold_veto": true atau false,
-  "gold_reason": "Alasan utama arah Emas (struktur SMC/FVG/OB/Asian Sweep, ADX regime, DXY/US10Y/US02Y, CFTC COT) + sebutkan sumber API-nya dalam 2 kalimat padat",
-  "gold_invalidation": "Syarat harga/makro yang membatalkan setup Emas dalam 1 kalimat",
-  "btc_bias": "BUY" atau "SELL" atau "NEUTRAL",
-  "btc_sentiment_score": angka bulat 0 sampai 20,
-  "btc_veto": true atau false,
-  "btc_reason": "Alasan utama arah BTCUSDT (struktur SMC/FVG/Asian Sweep, ADX regime, OKX Orderflow OI/Taker, BTC.D/USDT.D, NASDAQ) + sebutkan sumber API-nya dalam 2 kalimat padat",
-  "btc_invalidation": "Syarat harga/makro yang membatalkan setup BTCUSDT dalam 1 kalimat",
-  "kritik_devils_advocate": "Kritik terkuat Agen Skeptis terhadap risiko jebakan likuiditas / divergensi makro sesi ini",
-  "ringkasan_risk_judge": "Keputusan akhir Risk Judge (eksekusi atau tahan) beserta alasan utamanya"
-}}
-"""
-    txt, model_dipakai, err_llm = panggil_ai_analisa_setup(prompt)
-    if txt:
+# ==============================================================================
+# 5. PENARIK DATA MAKRO, BLOCKWORKS INTEL (FIXED), DERIBIT & TWELVEDATA
+# ==============================================================================
+def ambil_statistik_dan_makro() -> dict:
+    tickers = {
+        "GOLD": "GC=F",
+        "NASDAQ": "^IXIC",
+        "SP500": "^GSPC",
+        "DXY": "DX-Y.NYB",
+        "US10Y": "^TNX",
+        "USOIL": "CL=F",
+        "BTC": "BTC-USD",
+        "VIX": "^VIX",
+    }
+    series_dict = {}
+    for nama, kode in tickers.items():
         try:
-            hasil_llm = _ekstrak_json_bersih(txt)
-            if "gold_bias" in hasil_llm:
-                hasil_llm["model_used"] = model_dipakai
-                return hasil_llm
+            df = clean_yf_df(yf.download(kode, period="6mo", interval="1d", progress=False))
+            if not df.empty and "Close" in df.columns:
+                series_dict[nama] = df["Close"]
         except Exception:
             pass
 
-    dxy_chg = makro.get("DXY", {}).get("chg_pct", 0.0)
-    us10y_last = makro.get("US10Y", {}).get("last", 0.0)
-    cot_bias = derivatif.get("cftc_cot", {}).get("gold_cot_bias", "NEUTRAL")
-    bias_fallback = "SELL" if dxy_chg > 0 else "BUY"
-    return {
-        "model_used": f"Fallback Deterministik ({err_llm})",
-        "gold_bias": bias_fallback,
-        "gold_sentiment_score": 12,
-        "gold_veto": False,
-        "gold_reason": f"DXY bergerak {dxy_chg:+.2f}% dengan US10Y di {us10y_last}% (Sumber: Yahoo Finance DX-Y.NYB/^TNX) dan CFTC COT {cot_bias} (Sumber: CFTC Socrata API).",
-        "gold_invalidation": "Batal jika DXY berbalik arah menembus pembukaan harian dan candle H1 menutup di luar zona FVG/OB.",
-        "btc_bias": bias_fallback,
-        "btc_sentiment_score": 12,
-        "btc_veto": False,
-        "btc_reason": f"Mengikuti korelasi DXY {dxy_chg:+.2f}% serta dominasi BTC.D/USDT.D (Sumber: CoinGecko Global API & OKX Public Orderflow).",
-        "btc_invalidation": "Batal jika Taker Buy/Sell Ratio dan Open Interest berbalik berlawanan dari struktur H1.",
-        "kritik_devils_advocate": "Waspadai false breakout (liquidity sweep) di batas sesi London-NY sebelum konfirmasi MSS.",
-        "ringkasan_risk_judge": f"Konsensus mengikuti arus DXY ({dxy_chg:+.2f}%) sambil menunggu skor konfluensi >= {MIN_CONFLUENCE_SCORE}.",
-    }
+    prices = pd.DataFrame(series_dict).ffill().dropna()
+    hasil = {"harga_terakhir": {}, "korelasi": {}, "garch_risk": {}, "fred_macro": {}}
+
+    if not prices.empty:
+        hasil["harga_terakhir"] = prices.iloc[-1].round(2).to_dict()
+        log_ret = np.log(prices / prices.shift(1)).dropna()
+        hasil["korelasi"] = log_ret.corr().round(3).to_dict()
+
+        for aset in ["GOLD", "BTC"]:
+            if aset in log_ret.columns and len(log_ret[aset]) > 30:
+                ret_pct = log_ret[aset] * 100
+                try:
+                    model = arch_model(ret_pct, vol="Garch", p=1, q=1, dist="t")
+                    fit_res = model.fit(disp="off")
+                    pred_vol = float(np.sqrt(fit_res.forecast(horizon=1).variance.values[-1, 0]))
+                except Exception:
+                    pred_vol = float(ret_pct.std())
+
+                var_95 = float(np.percentile(ret_pct, 5))
+                cvar_95 = float(ret_pct[ret_pct <= var_95].mean())
+                hasil["garch_risk"][aset] = {
+                    "prediksi_vol_besok_pct": round(pred_vol, 3),
+                    "CVaR_95_ekstrem_pct": round(cvar_95, 3),
+                }
+
+    if FRED_API_KEY:
+        try:
+            fred = Fred(api_key=FRED_API_KEY)
+            hasil["fred_macro"]["FEDFUNDS"] = round(float(fred.get_series("FEDFUNDS").iloc[-1]), 2)
+            hasil["fred_macro"]["US02Y_DGS2"] = round(float(fred.get_series("DGS2").iloc[-1]), 2)
+            hasil["fred_macro"]["REAL_YIELD_DFII10"] = round(float(fred.get_series("DFII10").iloc[-1]), 2)
+            walcl = float(fred.get_series("WALCL").iloc[-1]) / 1000.0
+            tga = float(fred.get_series("WTREGEN").iloc[-1])
+            rrp = float(fred.get_series("RRPONTSYD").iloc[-1])
+            hasil["fred_macro"]["FED_NET_LIQUIDITY_B_USD"] = round(walcl - tga - rrp, 2)
+        except Exception as e:
+            hasil["fred_macro"]["error"] = str(e)
+
+    return hasil
+
+
+def ambil_data_institusi_dan_berita() -> dict:
+    info = {"kripto_derivatif": {}, "deribit_options": {}, "stablecoin_flow": {}, "cftc_cot": {}, "berita": []}
+
+    try:
+        ex = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
+        ticker = ex.fetch_ticker("BTC/USDT")
+        funding = ex.fetch_funding_rate("BTC/USDT")
+        oi = ex.fetch_open_interest("BTC/USDT")
+        info["kripto_derivatif"] = {
+            "BTC_last": ticker["last"],
+            "funding_rate_pct": round(float(funding["fundingRate"]) * 100, 4),
+            "open_interest_btc": round(float(oi.get("openInterestAmount", 0)), 2),
+        }
+    except Exception as e:
+        info["kripto_derivatif"]["error"] = str(e)
+
+    # Deribit Options DVOL (Implied Volatility)
+    try:
+        dvol_resp = requests.get(
+            "https://www.deribit.com/api/v2/public/get_index_price",
+            params={"index_name": "btcdvol_usdc"},
+            timeout=10,
+        ).json()
+        info["deribit_options"]["BTC_DVOL"] = dvol_resp.get("result", {}).get("index_price")
+    except Exception:
+        pass
+
+    try:
+        sc_data = requests.get("https://stablecoins.llama.fi/stablecoincharts/all", timeout=10).json()
+        if len(sc_data) >= 8:
+            mcap_now = float(sc_data[-1]["totalCirculatingUSD"]["peggedUSD"])
+            mcap_7d = float(sc_data[-8]["totalCirculatingUSD"]["peggedUSD"])
+            info["stablecoin_flow"] = {
+                "total_stablecoin_B_USD": round(mcap_now / 1e9, 2),
+                "perubahan_7hari_B_USD": round((mcap_now - mcap_7d) / 1e9, 2),
+            }
+    except Exception as e:
+        info["stablecoin_flow"]["error"] = str(e)
+
+    try:
+        df_cot = cot.cot_year(year=datetime.now().year, cot_report_type="legacy_fut")
+        gold_row = df_cot[df_cot["Market and Exchange Names"].str.contains("GOLD - COMMODITY EXCHANGE", na=False)].iloc[0]
+        net_pos = int(gold_row["Noncommercial Positions-Long (All)"]) - int(gold_row["Noncommercial Positions-Short (All)"])
+        info["cftc_cot"]["GOLD_Net_HedgeFund_Contracts"] = net_pos
+    except Exception as e:
+        info["cftc_cot"]["error"] = str(e)
+
+    for url in ["https://www.investing.com/rss/news_25.rss", "https://www.investing.com/rss/news_301.rss"]:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:3]:
+                info["berita"].append(entry.title)
+        except Exception:
+            pass
+
+    return info
+
+
+def ambil_intelijen_blockworks() -> dict:
+    """
+    FIXED: Menggunakan endpoint resmi Blockworks Data API (/query/tabular/assets),
+    header X-Blockworks-API-Key, dan parameter pageSize=5 (bukan limit=5).
+    """
+    if not BLOCKWORKS_API_KEY:
+        return {"status": "opsional_belum_diisi"}
+    try:
+        headers = {
+            "X-Blockworks-API-Key": BLOCKWORKS_API_KEY,
+            "Accept": "application/json",
+        }
+        resp = requests.get(
+            "https://api.blockworks.com/query/tabular/assets",
+            headers=headers,
+            params={"pageSize": 5},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            rows = data.get("data", []) if isinstance(data, dict) else data
+            ringkasan = []
+            if isinstance(rows, list):
+                for item in rows[:5]:
+                    if isinstance(item, dict):
+                        ringkasan.append({
+                            "symbol": item.get("symbol") or item.get("ticker"),
+                            "name": item.get("name"),
+                            "slug": item.get("slug"),
+                        })
+            return {"status": "aktif_terhubung", "assets_sample": ringkasan}
+        return {"status": f"http_{resp.status_code}", "detail": resp.text[:180]}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
+def ambil_data_twelvedata_intraday() -> dict:
+    if not TWELVEDATA_API_KEY:
+        return {"status": "opsional_belum_diisi"}
+    hasil = {"status": "aktif"}
+    for label, sym in [("XAUUSD", "XAU/USD"), ("QQQ_NASDAQ", "QQQ")]:
+        try:
+            resp = requests.get(
+                "https://api.twelvedata.com/quote",
+                params={"symbol": sym, "apikey": TWELVEDATA_API_KEY},
+                timeout=10,
+            ).json()
+            if "close" in resp:
+                hasil[label] = {
+                    "close": resp.get("close"),
+                    "percent_change": resp.get("percent_change"),
+                    "high": resp.get("high"),
+                    "low": resp.get("low"),
+                }
+            else:
+                hasil[label] = {"error": resp.get("message", "gagal_quote")}
+        except Exception as e:
+            hasil[label] = {"error": str(e)}
+    return hasil
+
+
+def cek_spread_mt5_cloud(symbol: str = "XAUUSD") -> float:
+    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
+        return 1.5
+    try:
+        headers = {"auth-token": METAAPI_TOKEN}
+        url = f"https://mt-client-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/{METAAPI_ACCOUNT_ID}/symbols/{symbol}/current-price"
+        resp = requests.get(url, headers=headers, timeout=10).json()
+        bid, ask = float(resp.get("bid", 0)), float(resp.get("ask", 0))
+        if bid > 0 and ask > 0:
+            return round((ask - bid) * 10, 2)
+    except Exception:
+        pass
+    return 1.5
 
 
 # ==============================================================================
-# 5. MESIN PEMBOBOTAN SKOR KONFLUENSI (0 - 100 POIN) + REGIME FILTER
+# 6. PENGIRIM TELEGRAM HTML RAPI (SPASI LEGA & ANTI-ERROR ENTITAS)
 # ==============================================================================
-def hitung_skor_konfluensi(
-    aset: str,
-    smc_data: dict,
-    makro: dict,
-    derivatif: dict,
-    llm_view: dict,
-    kz_info: dict,
-    spread_usd: float,
-) -> dict:
-    is_gold = aset.upper() in ("XAUUSD", "XYZ:GOLD")
-    reason_ai = llm_view.get("gold_reason" if is_gold else "btc_reason", "Data belum lengkap")
-    inval_ai = llm_view.get("gold_invalidation" if is_gold else "btc_invalidation", "Tembus level SL")
-
-    if "error" in smc_data or "error" in smc_data.get("daily_ohlc", {}):
-        err_msg = smc_data.get("error", "Data chart tidak lengkap")
-        return {
-            "asset": aset,
-            "data_source": smc_data.get("data_source", "ERROR"),
-            "regime": "UNKNOWN",
-            "adx_14": 0.0,
-            "direction": "WAIT",
-            "total_score": 0,
-            "breakdown": {"macro": 0, "sentiment": 0, "ohlc_ote": 0, "smc_kz": 0},
-            "sweep_mss": "NONE/NONE",
-            "ote_pos": "UNKNOWN",
-            "fvg_zone": None,
-            "ob_zone": None,
-            "valid_setup": False,
-            "blocked_reason": err_msg,
-            "reason_utama": f"[PERLU DATA LIVE / BELUM DITARIK] {err_msg}",
-            "invalidation": inval_ai,
-            "entry": 0.0,
-            "sl": 0.0,
-            "tp1": 0.0,
-            "tp2": 0.0,
-            "tp3": 0.0,
+def kirim_telegram(pesan_html: str, log_id: int = None):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(pesan_html)
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    reply_markup = None
+    if log_id is not None:
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Approve Sniper Setup", "callback_data": f"approve_{log_id}"},
+                    {"text": "❌ Reject / Skip", "callback_data": f"reject_{log_id}"},
+                ]
+            ]
         }
 
-    ohlc = smc_data["daily_ohlc"]
-    regime_info = smc_data.get("market_regime", {"adx_14": 22.0, "atr_14": 0.0, "regime": "TRENDING"})
-    ote = smc_data.get("fibonacci_ote_h1", {})
-    fvg15 = smc_data.get("fvg_m15", {})
-    fvgh1 = smc_data.get("fvg_h1", {})
-    obh1 = smc_data.get("order_block_h1", {})
-    sweep_mss = smc_data.get("sweep_and_mss", {})
+    chunks = [pesan_html[i : i + 3800] for i in range(0, len(pesan_html), 3800)]
+    for idx, chunk in enumerate(chunks):
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if reply_markup and idx == len(chunks) - 1:
+            payload["reply_markup"] = json.dumps(reply_markup)
+        resp = requests.post(url, json=payload, timeout=15)
+        if resp.status_code != 200:
+            # Fallback plain text jika ada tag terpotong antar chunk
+            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk}, timeout=15)
 
-    bias_llm = llm_view.get("gold_bias" if is_gold else "btc_bias", "NEUTRAL").upper()
-    skor_sentimen_raw = int(llm_view.get("gold_sentiment_score" if is_gold else "btc_sentiment_score", 10))
-    veto_judge = bool(llm_view.get("gold_veto" if is_gold else "btc_veto", False))
-    bias_ohlc = ohlc.get("bias_ohlc", "BUY").upper()
 
-    arah = bias_ohlc if bias_llm in ("NEUTRAL", bias_ohlc) else bias_llm
-
-    skor_makro = 0
-    dxy_chg = makro.get("DXY", {}).get("chg_pct", 0.0)
-    us10y_chg = makro.get("US10Y", {}).get("chg_pct", 0.0)
-    vix_last = makro.get("VIX", {}).get("last", 18.0)
-
-    if is_gold:
-        silver_chg = makro.get("SILVER", {}).get("chg_pct", 0.0)
-        cot_bias = derivatif.get("cftc_cot", {}).get("gold_cot_bias", "NEUTRAL")
-        if (arah == "BUY" and dxy_chg < 0) or (arah == "SELL" and dxy_chg > 0):
-            skor_makro += 7
-        if (arah == "BUY" and us10y_chg < 0) or (arah == "SELL" and us10y_chg > 0):
-            skor_makro += 6
-        if (arah == "BUY" and silver_chg > 0) or (arah == "SELL" and silver_chg < 0):
-            skor_makro += 4
-        if (arah == "BUY" and vix_last >= 17.0) or (arah == "SELL" and vix_last < 17.0):
-            skor_makro += 4
-        if (arah == "BUY" and "BULLISH" in cot_bias) or (arah == "SELL" and "BEARISH" in cot_bias):
-            skor_makro += 4
-    else:
-        nq_chg = makro.get("NASDAQ", {}).get("chg_pct", 0.0)
-        sp_chg = makro.get("SP500", {}).get("chg_pct", 0.0)
-        of_bias = derivatif.get("btc_orderflow", {}).get("orderflow_bias", "NEUTRAL")
-        if (arah == "BUY" and dxy_chg < 0) or (arah == "SELL" and dxy_chg > 0):
-            skor_makro += 6
-        if (arah == "BUY" and (nq_chg > 0 or sp_chg > 0)) or (arah == "SELL" and (nq_chg < 0 or sp_chg < 0)):
-            skor_makro += 6
-        if (arah == "BUY" and vix_last < 22.0) or (arah == "SELL" and vix_last >= 22.0):
-            skor_makro += 5
-        if (arah == "BUY" and "BUY" in of_bias) or (arah == "SELL" and "SELL" in of_bias):
-            skor_makro += 8
-
-    if veto_judge:
-        skor_sentimen = 0
-    elif bias_llm == arah:
-        skor_sentimen = max(0, min(20, skor_sentimen_raw))
-    elif bias_llm == "NEUTRAL":
-        skor_sentimen = 10
-    else:
-        skor_sentimen = 3
-
-    skor_ohlc_ote = 0
-    if bias_ohlc == arah:
-        skor_ohlc_ote += 10
-
-    pos_ote = ote.get("price_position", "")
-    if arah == "BUY" and pos_ote in ("IN_BUY_OTE_DISCOUNT", "DISCOUNT_ZONE"):
-        skor_ohlc_ote += 10 if pos_ote == "IN_BUY_OTE_DISCOUNT" else 6
-    elif arah == "SELL" and pos_ote in ("IN_SELL_OTE_PREMIUM", "PREMIUM_ZONE"):
-        skor_ohlc_ote += 10 if pos_ote == "IN_SELL_OTE_PREMIUM" else 6
-
-    last_px = float(ohlc["last_price"])
-    nl_px = float(ohlc["NL_support"])
-    nh_px = float(ohlc["NH_resisten"])
-    rentang_harian = max(abs(nh_px - nl_px), last_px * 0.005)
-
-    if arah == "BUY" and abs(last_px - nl_px) <= (0.35 * rentang_harian):
-        skor_ohlc_ote += 5
-    elif arah == "SELL" and abs(nh_px - last_px) <= (0.35 * rentang_harian):
-        skor_ohlc_ote += 5
-
-    skor_smc_kz = 0
-    sweep = sweep_mss.get("sweep_signal", "NONE")
-    mss = sweep_mss.get("mss_signal", "NONE")
-    asian_sw = sweep_mss.get("asian_sweep", "NONE")
-
-    if arah == "BUY":
-        fvg_aktif = fvg15.get("bullish_fvg") or fvgh1.get("bullish_fvg")
-        ob_aktif = obh1.get("bullish_ob")
-        if fvg_aktif:
-            skor_smc_kz += 8
-        if ob_aktif:
-            skor_smc_kz += 6
-        if sweep == "BULLISH_LIQUIDITY_SWEEP" or mss == "BULLISH_MSS" or asian_sw == "BULLISH_ASIAN_SWEEP":
-            skor_smc_kz += 6
-    else:
-        fvg_aktif = fvg15.get("bearish_fvg") or fvgh1.get("bearish_fvg")
-        ob_aktif = obh1.get("bearish_ob")
-        if fvg_aktif:
-            skor_smc_kz += 8
-        if ob_aktif:
-            skor_smc_kz += 6
-        if sweep == "BEARISH_LIQUIDITY_SWEEP" or mss == "BEARISH_MSS" or asian_sw == "BEARISH_ASIAN_SWEEP":
-            skor_smc_kz += 6
-
-    batas_spread = 1.50 if is_gold else 15.0
-    if spread_usd <= batas_spread:
-        skor_smc_kz += 3
-
-    if kz_info["in_killzone"]:
-        skor_smc_kz += 7
-    elif aset.upper() != "XAUUSD":
-        skor_smc_kz += 2
-
-    penalti_regime = 10 if regime_info.get("regime") == "RANGING" else 0
-    total_skor = max(0, (skor_makro + skor_sentimen + skor_ohlc_ote + skor_smc_kz) - penalti_regime)
-
-    jarak_sl_dasar = max(rentang_harian * 0.25, last_px * (0.0025 if is_gold else 0.006))
-    if arah == "BUY":
-        sl_px = round(min(nl_px - (jarak_sl_dasar * 0.2), last_px - jarak_sl_dasar), 2)
-        risk_dist = abs(last_px - sl_px)
-        tp1 = round(last_px + (1.5 * risk_dist), 2)
-        tp2 = round(last_px + (2.5 * risk_dist), 2)
-        tp3 = round(last_px + (4.0 * risk_dist), 2)
-    else:
-        sl_px = round(max(nh_px + (jarak_sl_dasar * 0.2), last_px + jarak_sl_dasar), 2)
-        risk_dist = abs(sl_px - last_px)
-        tp1 = round(last_px - (1.5 * risk_dist), 2)
-        tp2 = round(last_px - (2.5 * risk_dist), 2)
-        tp3 = round(last_px - (4.0 * risk_dist), 2)
-
-    valid = (total_skor >= MIN_CONFLUENCE_SCORE) and (not veto_judge)
-    if veto_judge:
-        blocked_reason = "Veto Risk Judge aktif"
-    elif regime_info.get("regime") == "RANGING" and total_skor < MIN_CONFLUENCE_SCORE:
-        blocked_reason = f"Pasar RANGING (ADX {regime_info.get('adx_14')} < 20) & Skor {total_skor}/100 < {MIN_CONFLUENCE_SCORE}"
-    else:
-        blocked_reason = f"Skor {total_skor}/100 < {MIN_CONFLUENCE_SCORE}"
-
-    reason_lengkap = (
-        f"{reason_ai} | Teknikal: Regime={regime_info.get('regime')} (ADX {regime_info.get('adx_14')}), "
-        f"OHLC Bias={bias_ohlc} (Pivot {ohlc['pivot']}), Zona={pos_ote}, "
-        f"Sweep/MSS={sweep}/{mss} (Asian={asian_sw}), FVG={fvg_aktif}, OB={ob_aktif} "
-        f"[Sumber Chart: {smc_data.get('data_source', 'API')}]."
+# ==============================================================================
+# 7. DEWAN JURI 4-AGEN: SNIPER ZERO FLOATING (SESI, INTRADAY, SWING, HOLD)
+# ==============================================================================
+def format_setup_horizon(judul: str, data: dict) -> str:
+    if not isinstance(data, dict):
+        return ""
+    arah = html.escape(str(data.get("action", "WAIT")))
+    entry = html.escape(str(data.get("entry_limit", "-")))
+    sl = html.escape(str(data.get("sl", "-")))
+    tp1 = html.escape(str(data.get("tp1_bep", "-")))
+    tp2 = html.escape(str(data.get("tp2", "-")))
+    tp3 = html.escape(str(data.get("tp3_runner", "-")))
+    rr = html.escape(str(data.get("rr", "-")))
+    alasan = html.escape(str(data.get("reason", "-")))
+    return (
+        f"🎯 <b>{judul}</b> — <b>[{arah}]</b> (RR: <b>{rr}</b>)\n"
+        f"• <b>Sniper Limit Entry:</b> <code>{entry}</code>\n"
+        f"• <b>Tight Stop Loss:</b> <code>{sl}</code>\n"
+        f"• <b>TP1 (Geser SL ke BEP+1):</b> <code>{tp1}</code>\n"
+        f"• <b>TP2 / TP3 Runner:</b> <code>{tp2}</code> | <code>{tp3}</code>\n"
+        f"• <i>Alasan Presisi:</i> {alasan}\n\n"
     )
 
-    return {
-        "asset": aset,
-        "data_source": smc_data.get("data_source", "UNKNOWN"),
-        "regime": regime_info.get("regime", "TRENDING"),
-        "adx_14": regime_info.get("adx_14", 0.0),
-        "direction": arah,
-        "total_score": total_skor,
-        "breakdown": {
-            "macro": skor_makro,
-            "sentiment": skor_sentimen,
-            "ohlc_ote": skor_ohlc_ote,
-            "smc_kz": skor_smc_kz,
-        },
-        "sweep_mss": f"{sweep}/{mss}",
-        "ote_pos": pos_ote,
-        "fvg_zone": fvg_aktif,
-        "ob_zone": ob_aktif,
-        "valid_setup": valid,
-        "blocked_reason": "" if valid else blocked_reason,
-        "reason_utama": reason_lengkap,
-        "invalidation": inval_ai,
-        "entry": round(last_px, 2),
-        "sl": sl_px,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-    }
 
+def jalankan_analisa_lengkap(pemicu: str = "Auto-Scan 24/7") -> str:
+    data_makro = ambil_statistik_dan_makro()
+    data_institusi = ambil_data_institusi_dan_berita()
+    blockworks_intel = ambil_intelijen_blockworks()
+    twelvedata_quote = ambil_data_twelvedata_intraday()
+    level_gold = hitung_level_sniper_historis("GC=F")
+    level_btc = hitung_level_sniper_historis("BTC-USD")
+    kalender_news = cek_kalender_berita_tier1_otomatis()
+    spread_aktif = cek_spread_mt5_cloud("XAUUSD")
 
-# ==============================================================================
-# 6. TELEGRAM INTERAKTIF (CHAT NGOBROL BIASA + FULL SCAN REALTIME)
-# ==============================================================================
-def kirim_telegram(pesan: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(pesan)
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        potongan = [pesan[i:i + 3900] for i in range(0, len(pesan), 3900)]
-        for part in potongan:
-            requests.post(
-                url,
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": part},
-                timeout=12,
-            )
-    except Exception as e:
-        print(f"Gagal kirim Telegram: {e}")
+    sl_dinamis_gold = max(2.0, round(float(level_gold.get("ATR_M15", 2.5)) * 1.2, 2))
+    risk_status = validasi_hardcoded_risk(
+        balance=1000.0,
+        sl_distance=sl_dinamis_gold,
+        pip_value=1.0,
+        layers=2,
+        spread_pips=spread_aktif,
+        is_high_impact_news=kalender_news.get("is_high_impact_active", False),
+        z_score_h1=level_gold.get("Z_score_H1", 0.0),
+    )
 
+    macro_snap = json.dumps(data_makro.get("harga_terakhir", {}))
 
-def _ambil_snapshot_harga_cepat() -> str:
-    ringkas = []
-    try:
-        r_btc = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr?symbol=BTCUSDT", timeout=6).json()
-        if "lastPrice" in r_btc:
-            ringkas.append(f"BTCUSDT Live: ${float(r_btc['lastPrice']):,.2f} ({float(r_btc['priceChangePercent']):+.2f}%) [Binance Vision]")
-    except Exception:
-        pass
-    try:
-        r_fg = requests.get("https://api.alternative.me/fng/?limit=1", timeout=6).json()
-        d_fg = r_fg.get("data", [{}])[0]
-        if "value" in d_fg:
-            ringkas.append(f"Crypto Fear & Greed: {d_fg['value']} ({d_fg['value_classification']}) [Alternative.me]")
-    except Exception:
-        pass
-    return " | ".join(ringkas) if ringkas else "Gunakan laporan audit terakhir di bawah."
+    if not GEMINI_API_KEY:
+        pesan = f"⚠️ <b>GEMINI_API_KEY belum diisi.</b>\n\nBlockworks: {html.escape(str(blockworks_intel))}"
+        kirim_telegram(pesan)
+        return pesan
 
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    prompt = f"""
+Kamu adalah Dewan Juri 4-Agen Kuantitatif Institusional (SMC, ICT, Orderflow, Makro, On-Chain).
+Analisa seluruh data historis s.d. harga terbaru berikut untuk XAUUSD (GOLD) dan BTCUSDT:
 
-def balas_chat_telegram_interaktif(ringkasan_data_live: str = "", poll_timeout: int = 3):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+Waktu: {waktu_wib_str()} | Sesi: {deteksi_sesi_trading()} | Spread XAU: {spread_aktif} pips
+1. Makro, Korelasi, GARCH & FRED: {data_makro}
+2. Level Sniper Historis XAUUSD (M15 FVG, OHLC Pivot/NH/NL, Swing 60D, Hold 5Y): {level_gold}
+3. Level Sniper Historis BTCUSDT (M15 FVG, OHLC Pivot/NH/NL, Swing 60D, Hold 5Y): {level_btc}
+4. CFTC COT, Derivatif OI/Funding, Deribit DVOL, Stablecoin Flow & Berita: {data_institusi}
+5. Blockworks Intel & Twelve Data Real-Time: {blockworks_intel} | {twelvedata_quote}
+6. Kalender Berita Tier-1 & Hardcoded Risk: {kalender_news} | {risk_status}
 
-    raw_offset = get_bot_state("tg_last_update_id", "0")
-    last_offset = int(raw_offset) if raw_offset.isdigit() else 0
+ATURAN MUTLAK SNIPER ENTRY (ZERO FLOATING & HIGH RR):
+- DILARANG memberi entry market di tengah rentang! Wajib tentukan titik LIMIT ORDER presisi di ujung zona PD Array (FVG M15 CE 50%, OHLC NL/NH, Order Block, atau Fibonacci OTE 0.705) agar potensi floating minus minimal.
+- Stop Loss (SL) wajib KETAT tepat di luar sumbu struktur invalidasi (gunakan referensi ATR M15/H1, bukan SL lebar).
+- Rasio Risk-to-Reward (RR) minimal 1:3 untuk Sesi/Intraday, 1:5 untuk Swing, dan 1:10+ untuk Hold Position jangka panjang.
+- Jika skor konfirmasi < 75 atau tidak memenuhi syarat, isi action dengan "WAIT_LIMIT".
 
-    try:
-        url_get = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={last_offset + 1}&timeout={poll_timeout}"
-        resp = requests.get(url_get, timeout=poll_timeout + 8).json()
-        updates = resp.get("result", [])
-        if not updates:
-            return
-
-        pesan_user_list = []
-        max_uid = last_offset
-        for upd in updates:
-            uid = upd.get("update_id", 0)
-            if uid > max_uid:
-                max_uid = uid
-            msg = upd.get("message", {})
-            chat_id_msg = str(msg.get("chat", {}).get("id", ""))
-            teks_msg = msg.get("text", "").strip()
-            if chat_id_msg == str(TELEGRAM_CHAT_ID) and teks_msg:
-                pesan_user_list.append(teks_msg)
-
-        set_bot_state("tg_last_update_id", str(max_uid))
-
-        if not pesan_user_list:
-            return
-
-        if any(p.lower() in ("/scan", "/analisa", "scan sekarang", "analisa sekarang") for p in pesan_user_list):
-            kirim_telegram("Siap bro, menjalankan full scan 3-Agen & SMC sekarang...")
-            jalankan_analisa_lengkap(cek_chat_lagi=False)
-            return
-
-        gabungan_chat = "\n".join(pesan_user_list[-3:])
-        simpan_riwayat_chat("User", gabungan_chat)
-
-        konteks_laporan = ringkasan_data_live or get_bot_state("last_market_report", "")
-        riwayat_sebelumnya = ambil_riwayat_chat()
-        harga_cepat = _ambil_snapshot_harga_cepat()
-        waktu_skrg = datetime.now(WIB).strftime("%Y-%m-%d %H:%M WIB")
-
-        prompt_chat = f"""
-Kamu adalah AgentLang, partner diskusi & asisten AI Quant pribadi di Telegram.
-Gaya bicara: santai, nyambung, lugas, cerdas seperti rekan diskusi trading profesional (boleh pakai 'bro' atau gaya bahasa user).
-
-WAKTU SEKARANG: {waktu_skrg}
-SNAPSHOT LIVE CEPAT: {harga_cepat}
-RIWAYAT OBROLAN TERAKHIR:
-{riwayat_sebelumnya}
-
-LAPORAN ANALISA MARKET TERAKHIR:
-{konteks_laporan[:3000] if konteks_laporan else "[Belum ada laporan siklus terakhir]"}
-
-PESAN BARU DARI USER:
-{gabungan_chat}
-
-ATURAN JAWABAN:
-1. Jika user menyapa ('bro', 'halo', 'tes'), curhat, atau tanya hal umum/konsep trading/cara kerja bot, jawab secara natural, ramah, dan langsung nyambung seperti chat biasa.
-2. Jika user menanyakan analisa market / arah pair (XAUUSD, BTCUSDT, DXY, dll), sertakan:
-   - Arah Bias (BULLISH / BEARISH / WAIT)
-   - Reason Utama (struktur SMC/FVG/OB, ADX regime, orderflow, makro) + Bukti Sumber Data spesifik (jangan mengarang angka!)
-   - Skenario Entry, SL, TP, dan Syarat Invalidasi.
-3. Jangan pakai simbol markdown (*, _, #) supaya tampilan chat Telegram bersih.
+Kembalikan HANYA JSON valid dengan struktur persis berikut:
+{{
+  "xau_score": integer (0-100),
+  "xau_bias": "BULLISH" | "BEARISH" | "WAIT",
+  "btc_score": integer (0-100),
+  "btc_bias": "BULLISH" | "BEARISH" | "WAIT",
+  "macro_reason": "penjelasan makro & likuiditas 2 kalimat jelas",
+  "smc_orderflow_reason": "penjelasan struktur MTF, FVG, liquidity sweep & COT/OI 2 kalimat jelas",
+  "skeptic_risk_reason": "risiko pembatal setup & kondisi berita 1-2 kalimat jelas",
+  "xau_setups": {{
+    "sesi_scalp": {{"action": "BUY LIMIT/SELL LIMIT/WAIT", "entry_limit": "angka", "sl": "angka", "tp1_bep": "angka", "tp2": "angka", "tp3_runner": "angka", "rr": "1:3.5", "reason": "alasan singkat"}},
+    "intraday": {{"action": "...", "entry_limit": "...", "sl": "...", "tp1_bep": "...", "tp2": "...", "tp3_runner": "...", "rr": "...", "reason": "..."}},
+    "swing": {{"action": "...", "entry_limit": "...", "sl": "...", "tp1_bep": "...", "tp2": "...", "tp3_runner": "...", "rr": "...", "reason": "..."}},
+    "hold_longterm": {{"action": "...", "entry_limit": "...", "sl": "...", "tp1_bep": "...", "tp2": "...", "tp3_runner": "...", "rr": "1:12", "reason": "zona akumulasi multi-bulan s.d. tahunan"}}
+  }},
+  "btc_setups": {{
+    "sesi_scalp": {{"action": "...", "entry_limit": "...", "sl": "...", "tp1_bep": "...", "tp2": "...", "tp3_runner": "...", "rr": "...", "reason": "..."}},
+    "intraday": {{"action": "...", "entry_limit": "...", "sl": "...", "tp1_bep": "...", "tp2": "...", "tp3_runner": "...", "rr": "...", "reason": "..."}},
+    "swing": {{"action": "...", "entry_limit": "...", "sl": "...", "tp1_bep": "...", "tp2": "...", "tp3_runner": "...", "rr": "...", "reason": "..."}},
+    "hold_longterm": {{"action": "...", "entry_limit": "...", "sl": "...", "tp1_bep": "...", "tp2": "...", "tp3_runner": "...", "rr": "1:15", "reason": "zona akumulasi multi-bulan s.d. tahunan"}}
+  }}
+}}
 """
-        jawaban, model_chat, err_chat = panggil_ai_chat_biasa(prompt_chat)
-        if jawaban:
-            simpan_riwayat_chat("AgentLang", jawaban)
-            kirim_telegram(f"AgentLang ({model_chat}):\n\n{jawaban}")
-        else:
-            kirim_telegram(
-                f"AgentLang (Mode Cadangan):\n"
-                f"Pesan masuk, tapi koneksi chat AI lagi kendala ({err_chat}).\n"
-                f"Data live: {harga_cepat}"
-            )
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        v = json.loads(response.text)
+        xau_score = int(v.get("xau_score", 0))
+        btc_score = int(v.get("btc_score", 0))
+        top_score = max(xau_score, btc_score)
+        bias_summary = f"XAU:{v.get('xau_bias')}({xau_score}) | BTC:{v.get('btc_bias')}({btc_score})"
+        lolos_final = risk_status.get("approved") and (top_score >= 75)
+
+        xau_s = v.get("xau_setups", {})
+        btc_s = v.get("btc_setups", {})
+
+        pesan_html = (
+            f"🏛 <b>QUANT AGENT v2.5 — SNIPER INSTITUTIONAL REPORT</b>\n"
+            f"🕒 <i>{waktu_wib_str()}</i>\n"
+            f"🌐 <b>Sesi:</b> {html.escape(deteksi_sesi_trading())}\n"
+            f"📡 <b>Blockworks API:</b> {html.escape(str(blockworks_intel.get('status')))}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📌 <b>RINGKASAN KONFIRMASI</b>\n\n"
+            f"🥇 <b>XAUUSD (Live: {level_gold.get('harga_terakhir')})</b>\n"
+            f"Bias: <b>{html.escape(str(v.get('xau_bias')))}</b> | Skor: <b>{xau_score}/100</b> | {html.escape(str(level_gold.get('regime')))}\n\n"
+            f"₿ <b>BTCUSDT (Live: {level_btc.get('harga_terakhir')})</b>\n"
+            f"Bias: <b>{html.escape(str(v.get('btc_bias')))}</b> | Skor: <b>{btc_score}/100</b> | {html.escape(str(level_btc.get('regime')))}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🧠 <b>1. ANALISA MAKRO & LIKUIDITAS</b>\n"
+            f"{html.escape(str(v.get('macro_reason')))}\n\n\n"
+            f"📐 <b>2. KONFLUENSI SMC, ORDERFLOW & ON-CHAIN</b>\n"
+            f"{html.escape(str(v.get('smc_orderflow_reason')))}\n\n\n"
+            f"🛡 <b>3. SKEPTIC VETO & FILTER RISIKO</b>\n"
+            f"{html.escape(str(v.get('skeptic_risk_reason')))}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🥇 <b>MAPPING SNIPER XAUUSD (ZERO FLOATING)</b>\n\n"
+            f"{format_setup_horizon('SESI / SCALP (M5-M15)', xau_s.get('sesi_scalp'))}"
+            f"{format_setup_horizon('INTRADAY (H1-H4)', xau_s.get('intraday'))}"
+            f"{format_setup_horizon('SWING (D1-W1)', xau_s.get('swing'))}"
+            f"{format_setup_horizon('HOLD POSITION (BULANAN-TAHUNAN)', xau_s.get('hold_longterm'))}"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"₿ <b>MAPPING SNIPER BTCUSDT (ZERO FLOATING)</b>\n\n"
+            f"{format_setup_horizon('SESI / SCALP (M5-M15)', btc_s.get('sesi_scalp'))}"
+            f"{format_setup_horizon('INTRADAY (H1-H4)', btc_s.get('intraday'))}"
+            f"{format_setup_horizon('SWING (D1-W1)', btc_s.get('swing'))}"
+            f"{format_setup_horizon('HOLD POSITION (BULANAN-TAHUNAN)', btc_s.get('hold_longterm'))}"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚖️ <b>Status Guardrail:</b> {'✅ LOLOS EKSEKUSI (>=75)' if lolos_final else '⏳ WAIT LIMIT / TUNGGU KONFIRMASI'}"
+        )
     except Exception as e:
-        print(f"Telegram chat listener warning: {e}")
+        top_score = 0
+        bias_summary = "ERROR"
+        lolos_final = False
+        pesan_html = f"❌ <b>Gagal memproses analisa AI:</b>\n<code>{html.escape(str(e))}</code>"
+
+    log_id = simpan_log(
+        "XAUUSD/BTC",
+        bias_summary,
+        top_score,
+        spread_aktif,
+        macro_snap,
+        "PENDING_REVIEW" if lolos_final else "AUTO_WAIT",
+        pesan_html[:600],
+    )
+    kirim_telegram(pesan_html, log_id=log_id if lolos_final else None)
+    return pesan_html
 
 
-def jalankan_mode_chat_saja():
-    init_db()
-    balas_chat_telegram_interaktif(poll_timeout=3)
+# ==============================================================================
+# 8. LIVE CHAT INTERAKTIF TELEGRAM (BISA NGOBROL, TANYA & CEK SETUP KAPAN SAJA)
+# ==============================================================================
+def jawab_live_chat_telegram(pertanyaan_user: str) -> str:
+    if not GEMINI_API_KEY:
+        return "⚠️ GEMINI_API_KEY belum terpasang."
+
+    level_gold = hitung_level_sniper_historis("GC=F")
+    level_btc = hitung_level_sniper_historis("BTC-USD")
+    jurnal_terakhir = ambil_ringkasan_jurnal_dan_evaluasi_mingguan()
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    prompt = f"""
+Kamu adalah Co-Pilot Quant Trader pribadi pengguna di Telegram.
+Jawab pertanyaan pengguna secara langsung, padat, tajam, dan berbasis data live + historis berikut:
+
+Waktu Sekarang: {waktu_wib_str()} | Sesi Aktif: {deteksi_sesi_trading()}
+Data Sniper XAUUSD Terbaru: {level_gold}
+Data Sniper BTCUSDT Terbaru: {level_btc}
+Log Audit Terakhir: {jurnal_terakhir}
+
+Pertanyaan / Pesan Pengguna:
+"{pertanyaan_user}"
+
+Aturan Jawaban:
+- Gunakan bahasa Indonesia yang santai tapi profesional ala meja institusional.
+- Jika pengguna bertanya setup (sesi, intraday, swing, atau hold jangka panjang), berikan angka Entry Limit presisi, SL ketat, TP1 (BEP), TP2, TP3, dan RR.
+- Pisahkan setiap poin dengan baris kosong agar rapi dibaca di HP. Jangan gunakan markdown tanda bintang (*), gunakan teks polos atau format rapi tanpa tag HTML rumit.
+"""
+    try:
+        res = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        return f"💬 <b>QUANT CO-PILOT LIVE</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n{html.escape(res.text)}"
+    except Exception as e:
+        return f"❌ Error Live Chat: <code>{html.escape(str(e))}</code>"
 
 
-def jalankan_bot_realtime_247():
-    """Mode server 24/7 (Koyeb / PC): balas chat Telegram < 2 detik + analisa penuh tiap 4 jam."""
-    init_db()
-    start_health_server()
-    kirim_telegram("AgentLang 24/7 Realtime Mode AKTIF. Sekarang bisa diajak chat kapan saja (ketik /scan untuk analisa full 3-Agen).")
-    last_full_scan = 0.0
+# ==============================================================================
+# 9. BACKTESTING & MONTE CARLO
+# ==============================================================================
+class TrendQuantStrategy(Strategy):
+    fast_period = 20
+    slow_period = 50
+
+    def init(self):
+        close = pd.Series(self.data.Close)
+        self.sma_fast = self.I(lambda x: pd.Series(x).rolling(self.fast_period).mean(), close)
+        self.sma_slow = self.I(lambda x: pd.Series(x).rolling(self.slow_period).mean(), close)
+
+    def next(self):
+        if self.sma_fast[-1] > self.sma_slow[-1] and not self.position:
+            self.buy(size=0.1)
+        elif self.sma_fast[-1] < self.sma_slow[-1] and self.position:
+            self.position.close()
+
+
+def jalankan_backtest_dan_montecarlo(ticker: str = "GC=F", period: str = "2y") -> str:
+    df = clean_yf_df(yf.download(ticker, period=period, interval="1d", progress=False))
+    if df.empty or len(df) < 120:
+        return f"Data historis {ticker} tidak cukup."
+
+    ohlc = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    split_idx = int(len(ohlc) * 0.7)
+    oos_data = ohlc.iloc[split_idx:]
+
+    bt = Backtest(oos_data, TrendQuantStrategy, cash=10000, commission=0.0005, finalize_trades=True)
+    stats = bt.run()
+    trades_df = stats["_trades"]
+
+    if trades_df is None or len(trades_df) < 5:
+        return f"Sampel trade OOS {ticker} terlalu sedikit."
+
+    trade_returns = trades_df["ReturnPct"].values
+    np.random.seed(42)
+    mc_final_returns, mc_max_drawdowns = [], []
+    for _ in range(1000):
+        sim_seq = np.random.choice(trade_returns, size=len(trade_returns), replace=True)
+        equity_curve = np.cumprod(1 + sim_seq)
+        running_max = np.maximum.accumulate(equity_curve)
+        dd = (running_max - equity_curve) / running_max
+        mc_final_returns.append((equity_curve[-1] - 1) * 100)
+        mc_max_drawdowns.append(np.max(dd) * 100)
+
+    return (
+        f"📈 <b>BACKTEST & MONTE CARLO ({ticker})</b>\n"
+        f"• Trade OOS: {len(trades_df)} | Win Rate: {round(float(stats['Win Rate [%]']), 1)}%\n"
+        f"• Median Return (1.000x MC): {round(float(np.percentile(mc_final_returns, 50)), 2)}%\n"
+        f"• Max Drawdown 95%: -{round(float(np.percentile(mc_max_drawdowns, 95)), 2)}%"
+    )
+
+
+# ==============================================================================
+# 10. BACKGROUND SCHEDULER & TELEGRAM LISTENER (ANTI-STUCK)
+# ==============================================================================
+def loop_scheduler_otomatis():
+    time.sleep(15)
     while True:
         try:
-            now_ts = time.time()
-            if now_ts - last_full_scan >= 4 * 3600:
-                jalankan_analisa_lengkap(cek_chat_lagi=False)
-                last_full_scan = time.time()
-            balas_chat_telegram_interaktif(poll_timeout=20)
+            jalankan_analisa_lengkap(pemicu="Auto-Scan Cloud 24/7")
         except Exception as e:
-            print(f"Realtime loop error: {e}")
-            time.sleep(3)
+            print("Error scheduler:", e)
+        time.sleep(AUTO_SCAN_INTERVAL_SEC)
 
 
-def jalankan_analisa_lengkap(cek_chat_lagi: bool = True):
-    from market_feeds import (
-        ambil_data_makro,
-        ambil_metrik_derivatif_dan_sentimen,
-        cek_kalender_ekonomi_high_impact,
-    )
-    from smc_alpha import analisa_smc_matematis, cek_anti_korelasi_ganda
-    from execution_engine import ambil_info_akun_dan_spread, proses_eksekusi_sinyal
+def loop_listener_telegram():
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    offset = 0
+    base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    while True:
+        try:
+            resp = requests.get(f"{base_url}/getUpdates", params={"offset": offset, "timeout": 30}, timeout=35).json()
+            if not resp.get("ok"):
+                print("Telegram getUpdates warning:", resp)
+                time.sleep(5)
+                continue
 
-    try:
-        from execution_engine import kelola_auto_breakeven_binance
-    except ImportError:
-        def kelola_auto_breakeven_binance():
-            return []
+            for item in resp.get("result", []):
+                offset = item["update_id"] + 1
 
-    init_db()
-    kz = deteksi_sesi_dan_killzone()
+                if "callback_query" in item:
+                    cb = item["callback_query"]
+                    cb_id = cb["id"]
+                    data_cb = cb.get("data", "")
+                    from_id = str(cb.get("from", {}).get("id", ""))
+                    if from_id == TELEGRAM_CHAT_ID and "_" in data_cb:
+                        aksi, id_str = data_cb.split("_", 1)
+                        log_id = int(id_str)
+                        if aksi == "approve":
+                            update_keputusan_user(log_id, "APPROVED_SIMULATION")
+                            requests.post(f"{base_url}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "Approved!"})
+                            kirim_telegram(f"✅ <b>Sinyal #{log_id} DISETUJUI.</b>\nDisiplin risiko & aturan BEP TP1 aktif.")
+                        elif aksi == "reject":
+                            update_keputusan_user(log_id, "REJECTED_BY_USER")
+                            requests.post(f"{base_url}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "Rejected!"})
+                            kirim_telegram(f"❌ <b>Sinyal #{log_id} DITOLAK.</b>\nModal aman terjaga.")
+                    continue
 
-    be_actions = kelola_auto_breakeven_binance()
-    akun = ambil_info_akun_dan_spread()
-    equity = float(akun.get("usdt_total", 1000.0))
-    spread_gold = float(akun.get("spread_digital_gold", 0.25))
-    spread_btc = float(akun.get("spread_btc", 1.00))
+                msg = item.get("message", {})
+                raw_text = msg.get("text", "").strip()
+                text_lower = raw_text.lower()
+                chat_id = str(msg.get("chat", {}).get("id", ""))
 
-    risk_gate = cek_batas_risiko_harian(equity, kz["date_wib"], kz["session"])
-    kalender = cek_kalender_ekonomi_high_impact(window_menit=60)
+                if chat_id == TELEGRAM_CHAT_ID and raw_text:
+                    if text_lower in ["/start", "/help"]:
+                        kirim_telegram(
+                            "🤖 <b>QUANT AGENT v2.5 (LIVE CHAT & SNIPER 4-HORIZON)</b>\n"
+                            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                            "• <code>/cek</code> — Analisa lengkap 4 Horizon (Sesi, Intraday, Swing, Hold)\n\n"
+                            "• <code>/backtest</code> — Uji Backtest & 1.000x Monte Carlo\n\n"
+                            "• <code>/jurnal</code> — Lihat log audit & kuota sesi\n\n"
+                            "• <b>Live Chat Bebas:</b> Ketik pertanyaan apa saja langsung di chat ini (misal: <i>\"cek setup swing gold minggu ini\"</i> atau <i>\"kenapa BTC tertahan?\"</i>)."
+                        )
+                    elif text_lower in ["/cek", "/analisa"]:
+                        kirim_telegram("⏳ <i>Menarik data historis s.d. tick terbaru, Blockworks, FRED, COT & menghitung zona Sniper Limit...</i>")
+                        jalankan_analisa_lengkap(pemicu="Manual /cek HP")
+                    elif text_lower == "/backtest":
+                        kirim_telegram("⏳ <i>Menjalankan Backtest Out-of-Sample & 1.000x Monte Carlo...</i>")
+                        kirim_telegram(f"{jalankan_backtest_dan_montecarlo('GC=F', '2y')}\n\n{jalankan_backtest_dan_montecarlo('BTC-USD', '2y')}")
+                    elif text_lower in ["/jurnal", "/evaluasi"]:
+                        kirim_telegram(ambil_ringkasan_jurnal_dan_evaluasi_mingguan())
+                    else:
+                        # LIVE CHAT INTERAKTIF BEBAS
+                        kirim_telegram(jawab_live_chat_telegram(raw_text))
+        except Exception as e:
+            print("Listener error:", e)
+            time.sleep(5)
 
-    makro = ambil_data_makro()
-    derivatif = ambil_metrik_derivatif_dan_sentimen()
-    bw_info = ambil_riset_blockworks()
-    smc_xau = analisa_smc_matematis("XAUUSD")
-    smc_xyz = analisa_smc_matematis("XYZ:GOLD")
-    smc_btc = analisa_smc_matematis("BTCUSDT")
-    korelasi = cek_anti_korelasi_ganda(threshold=0.80)
 
-    llm_view = evaluasi_critical_thinking_3_agen(
-        makro, derivatif, kalender, smc_xau, smc_xyz, smc_btc, bw_info
-    )
+@app.route("/", methods=["GET"])
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({
+        "status": "alive",
+        "version": "2.5-sniper-livechat",
+        "session": deteksi_sesi_trading(),
+        "wib": waktu_wib_str(),
+    })
 
-    hasil_skor = [
-        hitung_skor_konfluensi("XAUUSD", smc_xau, makro, derivatif, llm_view, kz, 0.25),
-        hitung_skor_konfluensi("XYZ:GOLD", smc_xyz, makro, derivatif, llm_view, kz, spread_gold),
-        hitung_skor_konfluensi("BTCUSDT", smc_btc, makro, derivatif, llm_view, kz, spread_btc),
-    ]
 
-    kandidat_lolos = [h for h in hasil_skor if h["valid_setup"]]
-    if korelasi.get("double_exposure_blocked") and len(kandidat_lolos) > 1:
-        kandidat_lolos.sort(key=lambda x: x["total_score"], reverse=True)
-        aset_terpilih = kandidat_lolos[0]["asset"]
-        for h in hasil_skor:
-            if h["valid_setup"] and h["asset"] != aset_terpilih:
-                h["valid_setup"] = False
-                h["blocked_reason"] = f"Ditahan filter Anti-Korelasi ({korelasi.get('corr_30d')})"
-
-    laporan_eksekusi = []
-    for h in hasil_skor:
-        status_aksi = "NO_TRADE"
-        catatan = h.get("blocked_reason", "")
-
-        if h["valid_setup"]:
-            if kalender.get("news_blackout"):
-                status_aksi = "BLOCKED_NEWS"
-                catatan = f"Red Folder News Blackout: {', '.join(kalender.get('high_impact_events', []))}"
-            elif not risk_gate["allowed"]:
-                status_aksi = "BLOCKED_RISK"
-                catatan = risk_gate["reason"]
-            else:
-                risk_pct = hitung_dynamic_half_kelly_risk(kz["session"], h["total_score"], h.get("regime", "TRENDING"))
-                risk_usd = round(equity * risk_pct, 2)
-                jml_layer = 2 if h["total_score"] >= 85 else 1
-
-                res_exec = proses_eksekusi_sinyal(
-                    aset=h["asset"],
-                    arah=h["direction"],
-                    risk_usd=risk_usd,
-                    entry_price=h["entry"],
-                    sl_price=h["sl"],
-                    tp1=h["tp1"],
-                    tp2=h["tp2"],
-                    tp3=h["tp3"],
-                    layers=jml_layer,
-                    leverage=1,
-                )
-                status_aksi = res_exec.get("execution_type", "PROCESSED")
-                catatan = json.dumps(res_exec)
-                laporan_eksekusi.append((h, res_exec, risk_usd, risk_pct))
-
-        simpan_log_audit({
-            "timestamp_wib": kz["wib_str"],
-            "date_wib": kz["date_wib"],
-            "session_name": kz["session"],
-            "asset": h["asset"],
-            "direction": h["direction"],
-            "total_score": h["total_score"],
-            "score_macro": h["breakdown"]["macro"],
-            "score_sentiment": h["breakdown"]["sentiment"],
-            "score_ohlc_ote": h["breakdown"]["ohlc_ote"],
-            "score_smc_kz": h["breakdown"]["smc_kz"],
-            "action_status": status_aksi,
-            "entry_price": h["entry"],
-            "sl_price": h["sl"],
-            "tp1": h["tp1"],
-            "tp2": h["tp2"],
-            "tp3": h["tp3"],
-            "notes": catatan,
-        })
-
-    btc_of = derivatif.get("btc_orderflow", {})
-    cot = derivatif.get("cftc_cot", {})
-    liq = derivatif.get("crypto_liquidity", {})
-    us02y = makro.get("US02Y", {})
-    ry10y = makro.get("REAL_YIELD_10Y", {})
-    news_status = (
-        f"BLACKOUT ({', '.join(kalender['high_impact_events'])})"
-        if kalender.get("news_blackout")
-        else "AMAN (Tidak ada Red Folder +/-60m | Sumber: ForexFactory JSON)"
-    )
-
-    lines = [
-        f"QUANT AI CONFLUENCE & 3-AGENT REPORT",
-        f"Waktu: {kz['wib_str']} | Sesi: {kz['session']} ({kz['killzone_label']})",
-        f"AI Analisa: {llm_view.get('model_used', 'Claude/Gemini')} | Binance Demo: ${equity:,.2f} (DD: {risk_gate['dd_pct']}%)",
-        f"Kalender Ekonomi: {news_status}",
-        f"----------------------------------------",
-        f"1. MAKRO, ORDERFLOW & CFTC COT",
-        f"- DXY: {makro.get('DXY', {}).get('last')} ({makro.get('DXY', {}).get('chg_pct'):+.2f}%) | US10Y: {makro.get('US10Y', {}).get('last')} | USOIL: {makro.get('USOIL', {}).get('last')} [Yahoo Finance]",
-        f"- US02Y: {us02y.get('last', 0.0)}% | Real Yield 10Y: {ry10y.get('last', 0.0)}% [FRED API]",
-        f"- BTC Orderflow: {btc_of.get('orderflow_bias')} (OI {btc_of.get('oi_change_pct'):+.2f}%, Taker {btc_of.get('taker_buy_sell_ratio')}) [{btc_of.get('source', 'OKX')}]",
-        f"- CFTC Gold COT: {cot.get('gold_cot_bias')} (Net {cot.get('gold_managed_money_net'):,}) [CFTC Socrata API]",
-        f"- Likuiditas & Sentimen: BTC.D {liq.get('btc_dominance')}% | USDT.D {liq.get('usdt_dominance')}% | TOTAL3 ${liq.get('total3_usd_b')}B | Fear&Greed {liq.get('fear_greed_index')} ({liq.get('fear_greed_label')})",
-        f"- Blockworks Intel: {bw_info}",
-        f"----------------------------------------",
-        f"2. SIDANG CRITICAL THINKING (3-AGEN)",
-        f"- Devil's Advocate: {llm_view.get('kritik_devils_advocate')}",
-        f"- Risk Judge: {llm_view.get('ringkasan_risk_judge')}",
-        f"----------------------------------------",
-        f"3. ANALISA SETUP, REASON & LEVEL HARGA PER ASET",
-    ]
-
-    for h in hasil_skor:
-        b = h["breakdown"]
-        status_label = "LOLOS EKSEKUSI" if h["valid_setup"] else f"WAIT / WATCHLIST ({h['blocked_reason']})"
-        mode_tag = "Manual CFD" if h["asset"] == "XAUUSD" else "Auto Binance Demo"
-        lines.extend([
-            f"",
-            f"[{h['asset']} | {mode_tag}] -> BIAS: {h['direction']} | SKOR: {h['total_score']}/100",
-            f"Status: {status_label}",
-            f"Rincian: Makro {b['macro']}/25 | Judge {b['sentiment']}/20 | OHLC/OTE {b['ohlc_ote']}/25 | SMC/KZ {b['smc_kz']}/30",
-            f"Reason Utama: {h['reason_utama']}",
-            f"Plan Harga: Entry {h['entry']} | SL {h['sl']} | TP1 {h['tp1']} | TP2 {h['tp2']} | TP3 {h['tp3']}",
-            f"Invalidasi: {h['invalidation']}",
-        ])
-
-    if be_actions:
-        lines.append("")
-        lines.append("Auto-Breakeven Aktif: " + ", ".join(be_actions))
-
-    if laporan_eksekusi:
-        lines.append("")
-        lines.append("----------------------------------------")
-        lines.append("4. DETAIL EKSEKUSI TERKIRIM")
-        for h, res, r_usd, r_pct in laporan_eksekusi:
-            if res.get("execution_type") == "MANUAL_CFD_SIGNAL":
-                lines.append(
-                    f"MANUAL CFD {h['asset']} ({h['direction']}): Lot {res.get('suggested_lot_cfd')} (Risk {r_pct*100:.2f}% / ${r_usd}) | Entry {h['entry']} | SL {h['sl']} | TP1 {h['tp1']}"
-                )
-            else:
-                lines.append(
-                    f"AUTO BINANCE DEMO {h['asset']} -> {res.get('executed_symbol')} ({h['direction']}): Risk {r_pct*100:.2f}% (${r_usd}) | {len(res.get('orders', []))} layer terkirim"
-                )
-
-    laporan_teks = "\n".join(lines)
-    set_bot_state("last_market_report", laporan_teks)
-    kirim_telegram(laporan_teks)
-
-    if cek_chat_lagi:
-        balas_chat_telegram_interaktif(laporan_teks, poll_timeout=3)
+@app.route("/webhook", methods=["POST"])
+def tradingview_webhook():
+    payload = request.get_json(silent=True) or {"raw": request.data.decode("utf-8", errors="ignore")}
+    threading.Thread(target=jalankan_analisa_lengkap, args=(f"TradingView Alert: {payload}",), daemon=True).start()
+    return jsonify({"received": True})
 
 
 if __name__ == "__main__":
-    if "--realtime-bot" in sys.argv:
-        jalankan_bot_realtime_247()
-    elif "--chat-only" in sys.argv:
-        jalankan_mode_chat_saja()
-    else:
-        jalankan_analisa_lengkap()
+    init_db()
+    threading.Thread(target=loop_scheduler_otomatis, daemon=True).start()
+    threading.Thread(target=loop_listener_telegram, daemon=True).start()
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
