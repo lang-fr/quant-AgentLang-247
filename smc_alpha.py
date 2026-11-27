@@ -193,6 +193,18 @@ class InstitutionalSMCAlphaEngine:
             if 45.0 <= btc_d <= 65.0:
                 score += 4
 
+        ext = intel.get("extended", {})
+        if symbol == "XAUUSD":
+            if float(ext.get("xagusd", 0.0)) > 0:
+                score += 4
+        else:
+            cb_prem = float(ext.get("coinbase_premium_pct", 0.0))
+            taker_bs = float(ext.get("taker_buy_sell_ratio", 1.0))
+            if (macro_bias == "BULLISH" and cb_prem > 0 and taker_bs >= 1.02) or (
+                macro_bias == "BEARISH" and cb_prem < 0 and taker_bs <= 0.98
+            ):
+                score += 7
+
         if ladder:
             aligned = sum(1 for tf in ["M1", "M5", "M15", "M30", "H1", "H4", "1D", "1W", "1M"] if ladder.get(tf, {}).get("bias") == macro_bias)
             if aligned >= 6:
