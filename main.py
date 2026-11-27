@@ -15,7 +15,6 @@ from ai_router import FlagshipAIRouter
 from market_feeds import InstitutionalMarketFeeds
 from smc_alpha import InstitutionalSMCAlphaEngine
 from execution_engine import InstitutionalExecutionEngine
-
 from quant_v28_core import (
     TRADING_SKILLS,
     init_audit_db,
@@ -775,6 +774,21 @@ def telegram_polling_loop():
                 elif low.startswith("/transkrip"):
                     arg = text[len("/transkrip") :].strip()
                     threading.Thread(target=handle_speech_transcript, args=(arg,), daemon=True).start()
+                    elif low.startswith("/backtest"):
+                    sym_arg = "BTCUSDT" if "btc" in low else "XAUUSD"
+                    send_telegram(f"⏳ Menjalankan Out-of-Sample Backtest & 1.000x Monte Carlo untuk {sym_arg}...")
+                    threading.Thread(
+                        target=lambda s=sym_arg: send_telegram(run_backtest_and_monte_carlo(s, 1000)),
+                        daemon=True,
+                    ).start()
+                elif low in ("/jurnal", "/evaluasi"):
+                    send_telegram(get_journal_and_evaluation())
+                elif low == "/skills":
+                    skills_txt = "\n".join(
+                        f"• {k} ({v['tf_focus']} | Min RR 1:{v['min_rr']}): {v['rules']}"
+                        for k, v in TRADING_SKILLS.items()
+                    )
+                    send_telegram(f"📚 5 PLAYBOOK TRADING_SKILLS AKTIF:\n\n{skills_txt}")
                 else:
                     def reply_chat(q=text):
                         if LATEST_CONTEXT_CACHE["updated"] == "Belum ada scan":
@@ -805,9 +819,14 @@ def scheduled_loop():
 
 if __name__ == "__main__":
     init_db()
+    init_audit_db()
     if "--report" in sys.argv:
         build_and_send_institutional_report("GitHub Actions Scheduled")
     else:
+        register_webhook_callback(
+            lambda payload: send_telegram(f"📡 TRADINGVIEW WEBHOOK MASUK:\n{json.dumps(payload, indent=2)}")
+        )
+        start_web_bridge_in_background()
         threading.Thread(target=scheduled_loop, daemon=True).start()
         threading.Thread(target=auto_breaking_news_watcher_loop, daemon=True).start()
         telegram_polling_loop()
