@@ -1,99 +1,108 @@
 import os
+import logging
+from typing import Optional, Dict, Any
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logger = logging.getLogger("FlagshipAIRouter")
 
 
-class MultiTierAIRouter:
-    def __init__(self):
-        self.anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-        self.gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-        self.primary_gemini = os.getenv("GEMINI_PRO_MODEL", "gemini-4-hydrogen")
-        self.primary_claude = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
-        self.fallback_gemini = os.getenv("GEMINI_LITE_MODEL", "gemini-3.5-flash-lite")
-        self.active_setup_engine = "Quant Deterministic Engine"
-        self.active_analysis_engine = "Quant Deterministic Engine"
+class FlagshipAIRouter:
+    """
+    Router AI utama untuk quant-AgentLang-247.
+    Mengutamakan Gemini API (dengan fallback ke Anthropic API jika tersedia),
+    serta menyediakan fallback aman agar proses tidak langsung crash jika API key belum diset.
+    """
 
-    def _call_claude(self, prompt: str, max_tokens: int = 950) -> str:
-        if not self.anthropic_key:
-            return ""
+    def __init__(
+        self,
+        gemini_api_key: Optional[str] = None,
+        anthropic_api_key: Optional[str] = None,
+        gemini_model: str = "gemini-2.5-flash",
+        anthropic_model: str = "claude-sonnet-4-20250514",
+        timeout: int = 30,
+    ):
+        self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY", "").strip()
+        self.anthropic_api_key = anthropic_api_key or os.getenv("ANTHROPIC_API_KEY", "").strip()
+        self.gemini_model = os.getenv("GEMINI_MODEL", gemini_model).strip()
+        self.anthropic_model = os.getenv("ANTHROPIC_MODEL", anthropic_model).strip()
+        self.timeout = timeout
+
+    def _call_gemini(self, prompt: str, system_instruction: str = "") -> Optional[str]:
+        if not self.gemini_api_key:
+            return None
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self.gemini_model}:generateContent?key={self.gemini_api_key}"
+        )
+        payload: Dict[str, Any] = {
+            "contents": [{"parts": [{"text": prompt}]}],
+        }
+        if system_instruction:
+            payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+
         try:
-            resp = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": self.anthropic_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": self.primary_claude,
-                    "max_tokens": max_tokens,
-                    "temperature": 0.2,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-                timeout=25,
-            )
-            if resp.status_code == 200:
-                return resp.json()["content"][0]["text"].strip()
-        except Exception:
-            pass
-        return ""
+            resp = requests.post(url, json=payload, timeout=self.timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            candidates = data.get("candidates") or []
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                texts = [p.get("text", "") for p in parts if p.get("text")]
+                if texts:
+                    return "\n".join(texts).strip()
+        except Exception as e:
+            logger.warning(f"Gemini API gagal dipanggil: {e}")
+        return None
 
-    def _call_gemini(self, model_name: str, prompt: str, max_tokens: int = 950) -> str:
-        if not self.gemini_key:
-            return ""
+    def _call_anthropic(self, prompt: str, system_instruction: str = "") -> Optional[str]:
+        if not self.anthropic_api_key:
+            return None
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": self.anthropic_api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload: Dict[str, Any] = {
+            "model": self.anthropic_model,
+            "max_tokens": 1500,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if system_instruction:
+            payload["system"] = system_instruction
+
         try:
-            url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model_name}:generateContent?key={self.gemini_key}"
-            )
-            resp = requests.post(
-                url,
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens},
-                },
-                timeout=25,
-            )
-            if resp.status_code == 200:
-                return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except Exception:
-            pass
-        return ""
+            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            content = data.get("content") or []
+            texts = [c.get("text", "") for c in content if c.get("type") == "text"]
+            if texts:
+                return "\n".join(texts).strip()
+        except Exception as e:
+            logger.warning(f"Anthropic API gagal dipanggil: {e}")
+        return None
 
-    def route_high_priority(self, prompt: str, role: str = "ANALISA", max_tokens: int = 950) -> str:
-        out = self._call_gemini(self.primary_gemini, prompt, max_tokens)
-        if out:
-            engine_label = f"{self.primary_gemini} (Tier-1 Gemini)"
-        else:
-            out = self._call_claude(prompt, max_tokens)
-            if out:
-                engine_label = f"{self.primary_claude} (Tier-1 Claude)"
-            else:
-                out = self._call_gemini(self.fallback_gemini, prompt, max_tokens)
-                engine_label = f"{self.fallback_gemini} (Fallback)" if out else "Quant Deterministic Engine"
+    def generate(self, prompt: str, system_instruction: str = "") -> str:
+        """Menghasilkan respons teks dari LLM yang tersedia."""
+        result = self._call_gemini(prompt, system_instruction)
+        if result:
+            return result
 
-        if role == "SETUP":
-            self.active_setup_engine = engine_label
-        else:
-            self.active_analysis_engine = engine_label
-        return out
+        result = self._call_anthropic(prompt, system_instruction)
+        if result:
+            return result
 
-    def generate_analysis(self, prompt: str) -> str:
-        return self.route_high_priority(prompt, role="ANALISA")
+        logger.warning("Tidak ada respons LLM aktif (cek GEMINI_API_KEY / ANTHROPIC_API_KEY).")
+        return "[Router Info] LLM tidak merespons atau API key belum dikonfigurasi; laporan berjalan dalam mode data/fallback."
 
-    def refine_setup(self, prompt: str) -> str:
-        return self.route_high_priority(prompt, role="SETUP")
+    def route(self, prompt: str, system_instruction: str = "") -> str:
+        """Alias untuk kompatibilitas pemanggilan."""
+        return self.generate(prompt, system_instruction)
 
-    def generate(self, sys_prompt: str, usr_prompt: str, max_tokens: int = 950, role: str = "ANALISA"):
-        combined = f"{sys_prompt}\n\n{usr_prompt}"
-        text = self.route_high_priority(combined, role=role, max_tokens=max_tokens)
-        if not text:
-            text = (
-                "1. Makro & Likuiditas: Mode deterministik kuantitatif aktif (API LLM tidak merespons).\n"
-                "2. Konfluensi Intermarket & Orderflow: Sinyal divalidasi berdasarkan struktur MTF & likuiditas.\n"
-                "3. Skeptic Veto: Patuhi batas risiko 1% dan SL ketat sesuai aturan mesin."
-            )
-        engine = self.active_setup_engine if role == "SETUP" else self.active_analysis_engine
-        return text, engine
-
-
-UnifiedAIRouter = MultiTierAIRouter
+    def complete(self, prompt: str, system_instruction: str = "") -> str:
+        """Alias untuk kompatibilitas pemanggilan."""
+        return self.generate(prompt, system_instruction)
