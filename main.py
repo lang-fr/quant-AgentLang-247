@@ -16,6 +16,21 @@ from market_feeds import InstitutionalMarketFeeds
 from smc_alpha import InstitutionalSMCAlphaEngine
 from execution_engine import InstitutionalExecutionEngine
 
+from quant_v28_core import (
+    TRADING_SKILLS,
+    init_audit_db,
+    check_and_consume_session_quota,
+    record_trade_journal,
+    get_journal_and_evaluation,
+    calculate_regime_and_guards,
+    fetch_deribit_options_btc,
+    fetch_cmc_global_metrics,
+    fetch_blockworks_intel,
+    audit_high_probability_setup,
+    run_backtest_and_monte_carlo,
+)
+from web_bridge import register_webhook_callback, start_web_bridge_in_background
+
 try:
     from quant_intel import QuantIntelEngine
 except Exception as _qi_err:
