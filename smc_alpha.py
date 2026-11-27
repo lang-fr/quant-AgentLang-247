@@ -215,81 +215,92 @@ class InstitutionalSMCAlphaEngine:
         return max(0, min(100, int(score)))
 
     def build_cascade_setups(self, symbol: str, feeds, macro_bias: str) -> dict:
-        live_price = feeds.get_live_price(symbol)
-        is_xau = symbol == "XAUUSD"
-        if live_price <= 0:
-            live_price = 3620.4 if is_xau else 61400.0
+        price_meta = feeds.get_live_price_with_meta(symbol) if hasattr(feeds, "get_live_price_with_meta") else {
+            "price": feeds.get_live_price(symbol),
+            "source": "Primary Feed",
+            "realtime": True,
+        }
+        live_price = float(price_meta["price"])
+        is_xau = "XAU" in symbol.upper()
 
-        # Scan bertahap dari M1 -> M5 -> M15 -> M30 -> H1 -> H4 -> 1D -> 1W -> 1M
+        if live_price <= 0:
+            raise RuntimeError(f"Harga live {symbol} OFFLINE — setup dibatalkan demi keamanan eksekusi.")
+
         dfs, ladder = self.scan_all_timeframes(symbol)
 
-        ltf_df = pd.concat(
-            [d.tail(60) for d in [dfs.get("M1"), dfs.get("M5")] if d is not None and not d.empty],
+        scalp_df = pd.concat(
+            [d.tail(45) for d in [dfs.get("M1"), dfs.get("M5"), dfs.get("M15")] if d is not None and not d.empty],
             ignore_index=True,
         )
-        itf_df = pd.concat(
-            [d.tail(80) for d in [dfs.get("M15"), dfs.get("M30"), dfs.get("H1"), dfs.get("H4")] if d is not None and not d.empty],
+        intra_df = pd.concat(
+            [d.tail(60) for d in [dfs.get("M30"), dfs.get("H1"), dfs.get("H4")] if d is not None and not d.empty],
             ignore_index=True,
         )
-        htf_df = pd.concat(
-            [d.tail(60) for d in [dfs.get("1D"), dfs.get("1W")] if d is not None and not d.empty],
+        swing_df = pd.concat(
+            [d.tail(50) for d in [dfs.get("1D"), dfs.get("1W")] if d is not None and not d.empty],
             ignore_index=True,
         )
-        mtf_df = dfs.get("1M") if (dfs.get("1M") is not None and not dfs.get("1M").empty) else dfs.get("1W")
+        hold_df = dfs.get("1M") if (dfs.get("1M") is not None and not dfs.get("1M").empty) else dfs.get("1W")
 
         primary_dir = "SELL LIMIT" if macro_bias == "BEARISH" else "BUY LIMIT"
 
-        scalp_base = self._compute_zone_setup(ltf_df, live_price, primary_dir, is_xau, "SCALP")
-        intra_base = self._compute_zone_setup(itf_df, live_price, primary_dir, is_xau, "INTRADAY")
-        swing_base = self._compute_zone_setup(htf_df, live_price, primary_dir, is_xau, "SWING")
-        hold_base = self._compute_zone_setup(mtf_df, live_price, "BUY LIMIT", is_xau, "HOLD")
+        scalp_base = self._compute_zone_setup(scalp_df, live_price, primary_dir, is_xau, "SCALP")
+        intra_base = self._compute_zone_setup(intra_df, live_price, primary_dir, is_xau, "INTRADAY")
+        swing_base = self._compute_zone_setup(swing_df, live_price, primary_dir, is_xau, "SWING")
+        hold_base = self._compute_zone_setup(hold_df, live_price, primary_dir, is_xau, "HOLD")
 
         ladder_summary = " | ".join(
             [f"{tf}:{ladder[tf]['bias'][:4]}" for tf in ["M1", "M5", "M15", "M30", "H1", "H4", "1D", "1W", "1M"]]
         )
 
         setups = {
-            "SESI / SCALP (M1-M5)": {
+            "SESI / SCALP (M1-M5-M15)": {
                 **scalp_base,
-                "tf_chain": "M1 → M5",
-                "aligned_count": f"{ladder['M1']['bias']}/{ladder['M5']['bias']}",
-                "reason": f"Struktur mikro M1-M5 & sweep likuiditas sesi mengikuti bias {macro_bias}.",
+                "tf_chain": "M1 → M5 → M15",
+                "aligned_count": f"{ladder['M1']['bias']}/{ladder['M5']['bias']}/{ladder['M15']['bias']}",
+                "reason": (
+                    f"Micro-sweep likuiditas M1-M15 & mitigasi FVG/OB sesi aktif di {scalp_base['entry']} "
+                    f"(Sumber: {price_meta['source']}, bias {macro_bias}, target skalping presisi)."
+                ),
             },
-            "INTRADAY (M15-M30-H1-H4)": {
+            "INTRADAY (M30-H1-H4)": {
                 **intra_base,
-                "tf_chain": "M15 → M30 → H1 → H4",
-                "aligned_count": f"{ladder['H1']['bias']}/{ladder['H4']['bias']}",
-                "reason": f"Konfluensi M15-H4 (OB/FVG & OTE) searah struktur {macro_bias}.",
+                "tf_chain": "M30 → H1 → H4",
+                "aligned_count": f"{ladder['M30']['bias']}/{ladder['H1']['bias']}/{ladder['H4']['bias']}",
+                "reason": (
+                    f"Konfluensi struktur M30-H4 (OTE 0.705 + Order Block/FVG) searah bias makro {macro_bias} "
+                    f"menuju pool likuiditas sesi London/NY."
+                ),
             },
             "SWING (1D-1W)": {
                 **swing_base,
                 "tf_chain": "1D → 1W",
                 "aligned_count": f"{ladder['1D']['bias']}/{ladder['1W']['bias']}",
-                "reason": f"Zona OTE 0.705 harian-mingguan pada tren {macro_bias}.",
+                "reason": (
+                    f"Area diskon/premium institusional 1D-1W selaras dengan arah DXY, real yield US10Y, "
+                    f"dan posisi COT mingguan ({macro_bias})."
+                ),
             },
             "HOLD POSITION (1M BULANAN)": {
                 **hold_base,
                 "tf_chain": "1D → 1W → 1M",
                 "aligned_count": f"1M:{ladder['1M']['bias']}",
-                "reason": "Pemetaan struktur bulanan (1M) & histori panjang untuk zona akumulasi.",
+                "reason": (
+                    f"Zona akumulasi/distribusi struktural bulanan (1M) berdasarkan siklus likuiditas global "
+                    f"dan kebijakan moneter jangka panjang."
+                ),
             },
         }
 
         return {
             "symbol": symbol,
             "live_price": round(live_price, 2),
+            "price_source": price_meta["source"],
+            "is_realtime": price_meta["realtime"],
             "mtf_ladder": ladder,
             "ladder_summary": ladder_summary,
             "setups": setups,
         }
-        return {
-            "symbol": symbol,
-            "live_price": round(live_price, 2),
-            "mtf_ladder": ladder,
-            "ladder_summary": ladder_summary,
-            "setups": setups,
-        }
-
     def refine_setups_with_flagship_ai(self, symbol: str, raw_bundle: dict, intel: dict, ai_router) -> tuple[dict, str]:
         intra = raw_bundle["setups"]["INTRADAY (M15-M30-H1-H4)"]
         swing = raw_bundle["setups"]["SWING (1D-1W)"]
