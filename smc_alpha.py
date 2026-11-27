@@ -201,10 +201,10 @@ class InstitutionalSMCAlphaEngine:
 
         primary_dir = "SELL LIMIT" if macro_bias == "BEARISH" else "BUY LIMIT"
 
-        scalp_base = self._compute_zone_setup(ltf_df, live_price, primary_dir, is_xau)
-        intra_base = self._compute_zone_setup(itf_df, live_price, primary_dir, is_xau)
-        swing_base = self._compute_zone_setup(htf_df, live_price, primary_dir, is_xau)
-        hold_base = self._compute_zone_setup(mtf_df, live_price, "BUY LIMIT", is_xau)
+        scalp_base = self._compute_zone_setup(ltf_df, live_price, primary_dir, is_xau, "SCALP")
+     intra_base = self._compute_zone_setup(itf_df, live_price, primary_dir, is_xau, "INTRADAY")
+     swing_base = self._compute_zone_setup(htf_df, live_price, primary_dir, is_xau, "SWING")
+     hold_base = self._compute_zone_setup(mtf_df, live_price, "BUY LIMIT", is_xau, "HOLD")
 
         ladder_summary = " | ".join(
             [f"{tf}:{ladder[tf]['bias'][:4]}" for tf in ["M1", "M5", "M15", "M30", "H1", "H4", "1D", "1W", "1M"]]
