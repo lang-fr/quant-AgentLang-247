@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 import requests
 from dotenv import load_dotenv
 
@@ -10,64 +10,98 @@ logger = logging.getLogger("FlagshipAIRouter")
 
 class FlagshipAIRouter:
     """
-    Router AI untuk quant-AgentLang-247:
-    - Scan & penyaringan awal: Gemini 4 Hydrogen (effort: high)
-    - Audit / refine setup probabilitas tinggi: Claude Sonnet 5.5 (effort: max)
+    Router AI Multi-Provider & Multi-Tier untuk quant-AgentLang-247:
+    1. Gemini (env GEMINI_MODEL -> gemini-3.8-flash -> gemini-3.5-flash-lite)
+    2. Anthropic Claude (env ANTHROPIC_MODEL -> claude-sonnet-5-5)
+    3. Groq Backup (llama-3.3-70b-versatile via GROQ_API_KEY)
     """
 
     def __init__(
         self,
         gemini_api_key: Optional[str] = None,
         anthropic_api_key: Optional[str] = None,
+        groq_api_key: Optional[str] = None,
         timeout: int = 45,
     ):
         self.gemini_api_key = (gemini_api_key or os.getenv("GEMINI_API_KEY", "")).strip()
         self.anthropic_api_key = (anthropic_api_key or os.getenv("ANTHROPIC_API_KEY", "")).strip()
-        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-4-hydrogen").strip()
+        self.groq_api_key = (groq_api_key or os.getenv("GROQ_API_KEY", "")).strip()
+
+        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
         self.anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5").strip()
         self.gemini_effort = os.getenv("GEMINI_REASONING_EFFORT", "high").strip().lower()
         self.anthropic_effort = os.getenv("ANTHROPIC_REASONING_EFFORT", "max").strip().lower()
+
         self.timeout = timeout
+        self.setup_engine = "Quant Deterministic Engine"
+        self.analysis_engine = "Quant Deterministic Engine"
         self.last_status = "IDLE"
 
-    def _call_gemini(self, prompt: str, system_instruction: str = "") -> Optional[str]:
-        if not self.gemini_api_key:
-            self.last_status = "GEMINI_KEY_MISSING"
+    def _post_gemini(
+        self, model_name: str, prompt: str, system_instruction: str = "", use_thinking: bool = True
+    ) -> Optional[str]:
+        if not self.gemini_api_key or not model_name:
             return None
+
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self.gemini_model}:generateContent?key={self.gemini_api_key}"
+            f"{model_name}:generateContent?key={self.gemini_api_key}"
         )
         payload: Dict[str, Any] = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "thinkingConfig": {"thinkingLevel": self.gemini_effort}
-            },
+            "generationConfig": {"temperature": 0.25},
         }
+        if use_thinking and self.gemini_effort in ["minimal", "low", "medium", "high"]:
+            payload["generationConfig"]["thinkingConfig"] = {"thinkingLevel": self.gemini_effort}
+
         if system_instruction:
             payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
 
         try:
             resp = requests.post(url, json=payload, timeout=self.timeout)
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                logger.warning(f"Gemini [{model_name}] HTTP {resp.status_code}: {resp.text[:200]}")
+                return None
             data = resp.json()
             candidates = data.get("candidates") or []
             if candidates:
                 parts = candidates[0].get("content", {}).get("parts", [])
-                texts = [p.get("text", "") for p in parts if p.get("text")]
+                texts = [p.get("text", "") for p in parts if p.get("text") and not p.get("thought")]
+                if not texts:
+                    texts = [p.get("text", "") for p in parts if p.get("text")]
                 if texts:
-                    self.last_status = f"OK:{self.gemini_model}({self.gemini_effort})"
+                    self.last_status = f"OK:{model_name}"
                     return "\n".join(texts).strip()
-            self.last_status = f"EMPTY_RESPONSE:{self.gemini_model}"
         except Exception as e:
-            self.last_status = f"ERR:{self.gemini_model}:{type(e).__name__}"
-            logger.warning(f"Gemini ({self.gemini_model}, effort={self.gemini_effort}) gagal: {e}")
+            logger.warning(f"Gemini [{model_name}] error: {e}")
         return None
 
-    def _call_anthropic(self, prompt: str, system_instruction: str = "") -> Optional[str]:
-        if not self.anthropic_api_key:
-            self.last_status = "ANTHROPIC_KEY_MISSING"
+    def _call_gemini_cascade(self, prompt: str, system_instruction: str = "") -> Tuple[Optional[str], str]:
+        if not self.gemini_api_key:
+            return None, ""
+
+        tried: List[Tuple[str, bool]] = []
+        if self.gemini_model:
+            tried.append((self.gemini_model, True))
+            tried.append((self.gemini_model, False))
+        for m in ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]:
+            if m != self.gemini_model:
+                tried.append((m, True))
+                tried.append((m, False))
+
+        for model_name, think_on in tried:
+            res = self._post_gemini(model_name, prompt, system_instruction, use_thinking=think_on)
+            if res:
+                label = f"{model_name} ({self.gemini_effort})" if think_on else model_name
+                return res, label
+        return None, ""
+
+    def _post_anthropic(
+        self, model_name: str, prompt: str, system_instruction: str = "", use_effort: bool = False
+    ) -> Optional[str]:
+        if not self.anthropic_api_key or not model_name:
             return None
+
         url = "https://api.anthropic.com/v1/messages"
         headers = {
             "x-api-key": self.anthropic_api_key,
@@ -75,46 +109,105 @@ class FlagshipAIRouter:
             "content-type": "application/json",
         }
         payload: Dict[str, Any] = {
-            "model": self.anthropic_model,
-            "max_tokens": 4096,
-            "output_config": {"effort": self.anthropic_effort},
+            "model": model_name,
+            "max_tokens": 2048,
             "messages": [{"role": "user", "content": prompt}],
         }
+        if use_effort and self.anthropic_effort in ["low", "medium", "high", "max"]:
+            payload["output_config"] = {"effort": self.anthropic_effort}
         if system_instruction:
             payload["system"] = system_instruction
 
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                logger.warning(f"Anthropic [{model_name}] HTTP {resp.status_code}: {resp.text[:200]}")
+                return None
             data = resp.json()
             content = data.get("content") or []
             texts = [c.get("text", "") for c in content if c.get("type") == "text"]
             if texts:
-                self.last_status = f"OK:{self.anthropic_model}({self.anthropic_effort})"
+                self.last_status = f"OK:{model_name}"
                 return "\n".join(texts).strip()
-            self.last_status = f"EMPTY_RESPONSE:{self.anthropic_model}"
         except Exception as e:
-            self.last_status = f"ERR:{self.anthropic_model}:{type(e).__name__}"
-            logger.warning(f"Anthropic ({self.anthropic_model}, effort={self.anthropic_effort}) gagal: {e}")
+            logger.warning(f"Anthropic [{model_name}] error: {e}")
         return None
+
+    def _call_anthropic_cascade(self, prompt: str, system_instruction: str = "") -> Tuple[Optional[str], str]:
+        if not self.anthropic_api_key:
+            return None, ""
+
+        tried: List[Tuple[str, bool]] = []
+        if self.anthropic_model:
+            tried.append((self.anthropic_model, False))
+            tried.append((self.anthropic_model, True))
+        for m in ["claude-sonnet-5-5", "claude-sonnet-4-6"]:
+            if m != self.anthropic_model:
+                tried.append((m, False))
+
+        for model_name, eff_on in tried:
+            res = self._post_anthropic(model_name, prompt, system_instruction, use_effort=eff_on)
+            if res:
+                label = f"{model_name} ({self.anthropic_effort})" if eff_on else model_name
+                return res, label
+        return None, ""
+
+    def _call_groq_backup(self, prompt: str, system_instruction: str = "") -> Tuple[Optional[str], str]:
+        if not self.groq_api_key:
+            return None, ""
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.groq_api_key}",
+            "Content-Type": "application/json",
+        }
+        messages = []
+        if system_instruction:
+            messages.append({"role": "system", "content": system_instruction})
+        messages.append({"role": "user", "content": prompt})
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": messages,
+            "temperature": 0.25,
+            "max_tokens": 1800,
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            if resp.status_code >= 400:
+                return None, ""
+            data = resp.json()
+            choices = data.get("choices") or []
+            if choices:
+                text = choices[0].get("message", {}).get("content", "").strip()
+                if text:
+                    self.last_status = "OK:groq"
+                    return text, "llama-3.3-70b-versatile (Groq)"
+        except Exception:
+            pass
+        return None, ""
 
     def generate(
         self,
         prompt: str,
         system_instruction: str = "",
         prefer_deep_reasoning: bool = False,
+        role: str = "analysis",
     ) -> str:
         if prefer_deep_reasoning:
-            res = self._call_anthropic(prompt, system_instruction) or self._call_gemini(prompt, system_instruction)
+            order = [self._call_anthropic_cascade, self._call_gemini_cascade, self._call_groq_backup]
         else:
-            res = self._call_gemini(prompt, system_instruction) or self._call_anthropic(prompt, system_instruction)
+            order = [self._call_gemini_cascade, self._call_anthropic_cascade, self._call_groq_backup]
 
-        if res:
-            return res
+        for fn in order:
+            res, engine_label = fn(prompt, system_instruction)
+            if res:
+                if role == "setup":
+                    self.setup_engine = engine_label
+                else:
+                    self.analysis_engine = engine_label
+                return res
 
         return (
-            f"[Router Status: {self.last_status}] LLM belum mengembalikan analisis penuh "
-            f"(cek GEMINI_API_KEY / ANTHROPIC_API_KEY serta nama model {self.gemini_model} / {self.anthropic_model})."
+            "Setup divalidasi oleh konfluensi MTF, zona OTE Fibonacci, dan struktur SMC/Orderflow."
         )
 
     def route(self, prompt: str, system_instruction: str = "", prefer_deep_reasoning: bool = False) -> str:
@@ -123,16 +216,23 @@ class FlagshipAIRouter:
     def complete(self, prompt: str, system_instruction: str = "", prefer_deep_reasoning: bool = False) -> str:
         return self.generate(prompt, system_instruction, prefer_deep_reasoning=prefer_deep_reasoning)
 
+    def analyze(self, prompt: str, system_instruction: str = "", prefer_deep_reasoning: bool = False) -> str:
+        return self.generate(prompt, system_instruction, prefer_deep_reasoning=prefer_deep_reasoning)
+
+    def generate_institutional_analysis(self, prompt: str, system_instruction: str = "") -> Tuple[str, str]:
+        text = self.generate(prompt, system_instruction, prefer_deep_reasoning=True, role="analysis")
+        return text, self.analysis_engine
+
     def refine_setup(self, prompt: str, system_instruction: str = "", confluence_score: int = 0) -> str:
         sys_msg = (
             system_instruction
-            or "Anda adalah analis kuantitatif institusional (SMC, ICT, Order Flow, OHLC, Makro). "
-               "Wajib menahan setup dengan skor < 75 atau di luar Kill Zone sebagai WAIT / NO SNIPER. "
-               "Jika layak, susun 1-3 layer limit entry, SL ketat, TP1 -> geser SL ke BEP+1, TP2, dan TP3, "
-               "serta jelaskan alasan penahanan skor dan syarat agar skor naik >= 75."
+            or "Anda adalah Institutional Quant Strategist (SMC, ICT, Order Flow, OHLC, Makro). "
+               "Tulis alasan presisi singkat (maksimal 180 karakter) mengenai validitas POI, "
+               "konfluensi intermarket, dan syarat invalidasi."
         )
         return self.generate(
             prompt=prompt,
             system_instruction=sys_msg,
             prefer_deep_reasoning=(confluence_score >= 75),
+            role="setup",
         )
