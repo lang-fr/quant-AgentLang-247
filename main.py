@@ -192,8 +192,9 @@ def ask_ai_router(prompt: str, system_instruction: str = "", deep: bool = False)
     )
 
 
-def send_telegram(from ai_router import clean_plain_text
-    text = clean_plain_text(text) text: str, reply_markup: Optional[dict] = None):
+def send_telegram(text: str, reply_markup: Optional[dict] = None) -> None:
+    from ai_router import clean_plain_text
+    text = clean_plain_text(text)
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(text)
         return
