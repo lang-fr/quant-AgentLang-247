@@ -23,10 +23,11 @@ class InstitutionalSMCAlphaEngine:
         self.wib = pytz.timezone("Asia/Jakarta")
         self.asset_telemetry = {}
 
-    def _fetch_ohlc_series(self, symbol: str, interval_key: str) -> list[dict]:
+   def _fetch_ohlc_series(self, symbol: str, interval_key: str) -> list[dict]:
         sym = symbol.upper()
         if "BTC" in sym or "ETH" in sym:
             pair = "ETHUSDT" if "ETH" in sym else "BTCUSDT"
+            okx_inst = "ETH-USDT" if "ETH" in sym else "BTC-USDT"
             binance_map = {
                 "M1": ("1m", 80),
                 "M5": ("5m", 80),
@@ -53,6 +54,38 @@ class InstitutionalSMCAlphaEngine:
                         }
                         for k in r.json()
                     ]
+            except Exception:
+                pass
+
+            # Fallback otomatis ke OKX Spot Public API v5 (bebas blokir IP US/Cloud)
+            okx_bar_map = {
+                "M1": "1m",
+                "M5": "5m",
+                "M15": "15m",
+                "M30": "30m",
+                "H1": "1H",
+                "H4": "4H",
+                "D1": "1Dutc",
+                "W1": "1Wutc",
+                "1MON": "1Mutc",
+            }
+            okx_bar = okx_bar_map.get(interval_key, "1H")
+            try:
+                okx_url = f"https://www.okx.com/api/v5/market/candles?instId={okx_inst}&bar={okx_bar}&limit={lim}"
+                r_okx = requests.get(okx_url, timeout=6)
+                if r_okx.status_code == 200:
+                    raw_candles = r_okx.json().get("data", [])
+                    if raw_candles:
+                        return [
+                            {
+                                "open": float(k[1]),
+                                "high": float(k[2]),
+                                "low": float(k[3]),
+                                "close": float(k[4]),
+                                "volume": float(k[5]),
+                            }
+                            for k in reversed(raw_candles)
+                        ]
             except Exception:
                 pass
             return []
@@ -93,7 +126,7 @@ class InstitutionalSMCAlphaEngine:
             except Exception:
                 continue
         return []
-
+       
     def _detect_smt_divergence(self, symbol: str, primary_bars: list[dict]) -> dict:
         """
         SMT Divergence (Smart Money Technique) antar-aset berkorelasi:
