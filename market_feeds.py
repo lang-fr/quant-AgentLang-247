@@ -124,20 +124,7 @@ class InstitutionalMarketFeeds:
         except Exception:
             pass
 
-        taker_ratio = 1.0
-        funding_pct = 0.0
-        try:
-            r_tk = requests.get(
-                "https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=BTCUSDT&period=15m&limit=1",
-                timeout=5,
-            )
-            if r_tk.status_code == 200 and r_tk.json():
-                taker_ratio = round(float(r_tk.json()[-1].get("buySellRatio", 1.0)), 3)
-            r_fr = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT", timeout=5)
-            if r_fr.status_code == 200:
-                funding_pct = round(float(r_fr.json().get("lastFundingRate", 0.0)) * 100.0, 4)
-        except Exception:
-            pass
+        
 
         telemetry_summary = (
             f"XAU:{xau_meta['price']} | BTC:{btc_meta['price']} | DXY:{dxy} | US10Y:{us10y} | "
@@ -300,9 +287,10 @@ class InstitutionalMarketFeeds:
             if not self.fred_key
             else (self._fetch_fred_latest("FEDFUNDS") > 0, "FEDFUNDS / DFII10 / NetLiq")
         ))
-        probe("Binance Spot & Futures", lambda: (
-            requests.get("https://api.binance.com/api/v3/ping", timeout=5).status_code == 200,
-            "Kline M1-1MON + Orderbook L2 + OI",
+        probe("Crypto Spot & Futures (Binance / OKX)", lambda: (
+            (requests.get("https://api.binance.com/api/v3/ping", timeout=4).status_code == 200)
+            or (requests.get("https://www.okx.com/api/v5/public/time", timeout=4).status_code == 200),
+            "Kline M1-1MON + Orderbook L2 + OI/Funding",
         ))
         probe("Yahoo Finance (GC=F/DXY)", lambda: (
             self._fetch_yf_last("GC=F") > 0,
