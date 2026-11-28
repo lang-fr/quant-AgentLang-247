@@ -23,7 +23,7 @@ class InstitutionalSMCAlphaEngine:
         self.wib = pytz.timezone("Asia/Jakarta")
         self.asset_telemetry = {}
 
-   def _fetch_ohlc_series(self, symbol: str, interval_key: str) -> list[dict]:
+    def _fetch_ohlc_series(self, symbol: str, interval_key: str) -> list[dict]:
         sym = symbol.upper()
         if "BTC" in sym or "ETH" in sym:
             pair = "ETHUSDT" if "ETH" in sym else "BTCUSDT"
@@ -174,6 +174,9 @@ class InstitutionalSMCAlphaEngine:
 
         oi_delta_pct = 0.0
         funding_pct = 0.0
+        oi_fetched = False
+        fr_fetched = False
+
         try:
             r_oi = requests.get(
                 "https://fapi.binance.com/futures/data/openInterestHist?symbol=BTCUSDT&period=15m&limit=5",
@@ -185,16 +188,46 @@ class InstitutionalSMCAlphaEngine:
                 oi_new = float(arr[-1]["sumOpenInterest"])
                 if oi_old > 0:
                     oi_delta_pct = round(((oi_new - oi_old) / oi_old) * 100.0, 2)
+                    oi_fetched = True
         except Exception:
             pass
+
+        if not oi_fetched:
+            try:
+                r_okx_oi = requests.get(
+                    "https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-volume?ccy=BTC&period=15m",
+                    timeout=5,
+                )
+                if r_okx_oi.status_code == 200:
+                    arr = r_okx_oi.json().get("data", [])
+                    if len(arr) >= 5:
+                        oi_new = float(arr[0][1])
+                        oi_old = float(arr[4][1])
+                        if oi_old > 0:
+                            oi_delta_pct = round(((oi_new - oi_old) / oi_old) * 100.0, 2)
+            except Exception:
+                pass
 
         try:
             r_fr = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT", timeout=5)
             if r_fr.status_code == 200:
                 funding_pct = round(float(r_fr.json().get("lastFundingRate", 0.0)) * 100.0, 4)
+                fr_fetched = True
         except Exception:
             pass
 
+        if not fr_fetched:
+            try:
+                r_okx_fr = requests.get(
+                    "https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP",
+                    timeout=5,
+                )
+                if r_okx_fr.status_code == 200:
+                    fr_data = (r_okx_fr.json().get("data") or [{}])[0]
+                    if fr_data.get("fundingRate") is not None:
+                        funding_pct = round(float(fr_data["fundingRate"]) * 100.0, 4)
+            except Exception:
+                pass
         price_up = recent_bars[-1]["close"] >= recent_bars[-5]["close"] if len(recent_bars) >= 5 else True
         if funding_pct >= 0.03:
             regime_bias = "BEARISH"
@@ -260,26 +293,43 @@ class InstitutionalSMCAlphaEngine:
         if "BTC" not in symbol.upper() or live_price <= 0:
             return {"bid_wall": 0.0, "ask_wall": 0.0, "ob_imbalance": 0.0}
 
+        raw_bids, raw_asks = [], []
         try:
             url = "https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=100"
             r = requests.get(url, timeout=4)
             if r.status_code == 200:
                 data = r.json()
-                bids = [(float(p), float(q)) for p, q in data.get("bids", []) if float(p) < live_price]
-                asks = [(float(p), float(q)) for p, q in data.get("asks", []) if float(p) > live_price]
-                total_bid = sum(q for _, q in bids)
-                total_ask = sum(q for _, q in asks)
-                denom = total_bid + total_ask
-                imbalance = round((total_bid - total_ask) / denom, 3) if denom > 0 else 0.0
-                best_bid_wall = max(bids, key=lambda x: x[1])[0] if bids else 0.0
-                best_ask_wall = max(asks, key=lambda x: x[1])[0] if asks else 0.0
-                return {
-                    "bid_wall": round(best_bid_wall, 2),
-                    "ask_wall": round(best_ask_wall, 2),
-                    "ob_imbalance": imbalance,
-                }
+                raw_bids = data.get("bids", [])
+                raw_asks = data.get("asks", [])
         except Exception:
             pass
+
+        if not raw_bids or not raw_asks:
+            try:
+                okx_url = "https://www.okx.com/api/v5/market/books?instId=BTC-USDT&sz=100"
+                r_okx = requests.get(okx_url, timeout=4)
+                if r_okx.status_code == 200:
+                    book = (r_okx.json().get("data") or [{}])[0]
+                    raw_bids = book.get("bids", [])
+                    raw_asks = book.get("asks", [])
+            except Exception:
+                pass
+
+        if raw_bids and raw_asks:
+            bids = [(float(b[0]), float(b[1])) for b in raw_bids if float(b[0]) < live_price]
+            asks = [(float(a[0]), float(a[1])) for a in raw_asks if float(a[0]) > live_price]
+            total_bid = sum(q for _, q in bids)
+            total_ask = sum(q for _, q in asks)
+            denom = total_bid + total_ask
+            imbalance = round((total_bid - total_ask) / denom, 3) if denom > 0 else 0.0
+            best_bid_wall = max(bids, key=lambda x: x[1])[0] if bids else 0.0
+            best_ask_wall = max(asks, key=lambda x: x[1])[0] if asks else 0.0
+            return {
+                "bid_wall": round(best_bid_wall, 2),
+                "ask_wall": round(best_ask_wall, 2),
+                "ob_imbalance": imbalance,
+            }
+
         return {"bid_wall": 0.0, "ask_wall": 0.0, "ob_imbalance": 0.0}
 
     def _compute_orderflow_and_quant(self, recent: list[dict]) -> dict:
