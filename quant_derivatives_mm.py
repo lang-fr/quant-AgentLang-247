@@ -124,7 +124,7 @@ class QuantStatDerivativesMMEngine:
             ).json()
             spot_px = float(((r_spot.get("data") or [{}])[0]).get("last", 0.0))
             perp_px = float(((r_perp.get("data") or [{}])[0]).get("last", 0.0))
-            basis_bps = round(((perp_px - spot_px) / max(spot_px, 1e-9)) * 10000.0, 2) if spot_px > 0 else 0.0
+            basis_bps = round(((perp_px - spot_px) / max(spot_px, 1e-9)) * 10000.0, 2) if (spot_px > 0 and perp_px > 0) else "N/A"
 
             # 3. Open Interest & Kuadran Harga vs OI (Candle 1H OKX)
             r_oi = requests.get(
@@ -146,9 +146,10 @@ class QuantStatDerivativesMMEngine:
                 c_prev = float(candles[1][4])
                 px_delta_pct = round(((c_now - c_prev) / max(c_prev, 1e-9)) * 100.0, 3)
 
-            if funding_rate > 0.0003 and basis_bps > 8.0:
+            basis_num = float(basis_bps) if isinstance(basis_bps, (int, float)) else 0.0
+            if funding_rate > 0.0003 and basis_num > 8.0:
                 squeeze_risk = "HIGH_LONG_CROWDING_SQUEEZE_DOWN_RISK"
-            elif funding_rate < -0.0002 and basis_bps < -5.0:
+            elif funding_rate < -0.0002 and basis_num < -5.0:
                 squeeze_risk = "HIGH_SHORT_CROWDING_SQUEEZE_UP_RISK"
             else:
                 squeeze_risk = "BALANCED_DERIVATIVES_LEVERAGE"
@@ -158,11 +159,10 @@ class QuantStatDerivativesMMEngine:
                 "funding_rate_pct": round(funding_rate * 100.0, 4),
                 "funding_apr_pct": funding_apr,
                 "spot_perp_basis_bps": basis_bps,
-                "open_interest_usd_m": round(oi_usd / 1e6, 2),
+                "open_interest_usd_m": round(oi_usd / 1e6, 2) if oi_usd > 0 else "N/A",
                 "h1_price_delta_pct": px_delta_pct,
                 "squeeze_regime": squeeze_risk,
             }
-
             # 4. Khusus BTC: Hitung Options Max Pain & Gamma Wall dari Deribit
             if symbol.upper() != "XAUUSD":
                 result["deribit_options_levels"] = self._compute_deribit_max_pain_and_walls(spot_px)
