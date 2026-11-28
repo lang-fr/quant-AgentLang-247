@@ -22,14 +22,21 @@ class InstitutionalMarketFeeds:
     def get_live_price_with_meta(self, symbol: str) -> dict:
         sym = symbol.upper()
         if "BTC" in sym:
-            try:
-                r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=5)
-                if r.status_code == 200:
-                    px = float(r.json().get("price", 0.0))
-                    if px > 0:
-                        return {"price": round(px, 2), "source": "Binance Spot Live", "realtime": True}
-            except Exception:
-                pass
+            btc_endpoints = [
+                ("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", "Binance Spot Live", lambda d: float(d["price"])),
+                ("https://fapi.binance.com/fapi/v1/ticker/price?symbol=BTCUSDT", "Binance Futures Live", lambda d: float(d["price"])),
+                ("https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT", "OKX Spot Live", lambda d: float(d["data"][0]["last"])),
+                ("https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT-SWAP", "OKX Perp Live", lambda d: float(d["data"][0]["last"])),
+            ]
+            for url, label, parser in btc_endpoints:
+                try:
+                    r = requests.get(url, timeout=5)
+                    if r.status_code == 200:
+                        px = parser(r.json())
+                        if px > 0:
+                            return {"price": round(px, 2), "source": label, "realtime": True}
+                except Exception:
+                    continue
             try:
                 df = yf.Ticker("BTC-USD").history(period="1d", interval="1m")
                 if df is not None and not df.empty:
