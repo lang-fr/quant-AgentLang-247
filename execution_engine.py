@@ -80,6 +80,7 @@ class InstitutionalExecutionEngine:
 
         headers = {"X-MBX-APIKEY": self.binance_api_key}
         base_params = dict(params or {})
+        last_error = "BINANCE_API_UNREACHABLE"
 
         for base in self.binance_base_urls:
             try:
@@ -87,15 +88,32 @@ class InstitutionalExecutionEngine:
                 p["timestamp"] = int(time.time() * 1000)
                 p["recvWindow"] = 5000
                 qs = urlencode(p)
-                sig = hmac.new(self.binance_api_secret.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256).hexdigest()
+                sig = hmac.new(
+                    self.binance_api_secret.encode("utf-8"),
+                    qs.encode("utf-8"),
+                    hashlib.sha256,
+                ).hexdigest()
                 url = f"{base}{path}?{qs}&signature={sig}"
                 r = requests.request(method, url, headers=headers, timeout=12)
-                data = r.json()
+                try:
+                    data = r.json()
+                except Exception:
+                    data = {"msg": (r.text or "").strip()[:200]}
+
                 if r.status_code == 200:
                     return {"ok": True, "data": data, "endpoint": base}
-            except Exception:
+
+                if isinstance(data, dict):
+                    code = data.get("code", "")
+                    msg = data.get("msg", r.text[:160])
+                    last_error = f"HTTP_{r.status_code} [{code}]: {msg} ({base})"
+                else:
+                    last_error = f"HTTP_{r.status_code}: {str(data)[:160]} ({base})"
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {str(e)[:140]} ({base})"
                 continue
-        return {"ok": False, "error": "BINANCE_API_UNREACHABLE"}
+
+        return {"ok": False, "error": last_error}
 
     def get_binance_usdt_balance(self) -> dict:
         mode = "TESTNET" if self.binance_use_testnet else "LIVE"
@@ -166,12 +184,24 @@ class InstitutionalExecutionEngine:
         self._binance_request(
             "POST",
             "/fapi/v1/order",
-            {"symbol": clean_sym, "side": opp_side, "type": "STOP_MARKET", "stopPrice": round(sl_px, 1), "closePosition": "true"},
+            {
+                "symbol": clean_sym,
+                "side": opp_side,
+                "type": "STOP_MARKET",
+                "stopPrice": round(sl_px, 1),
+                "closePosition": "true",
+            },
         )
         self._binance_request(
             "POST",
             "/fapi/v1/order",
-            {"symbol": clean_sym, "side": opp_side, "type": "TAKE_PROFIT_MARKET", "stopPrice": round(tp1_px, 1), "closePosition": "true"},
+            {
+                "symbol": clean_sym,
+                "side": opp_side,
+                "type": "TAKE_PROFIT_MARKET",
+                "stopPrice": round(tp1_px, 1),
+                "closePosition": "true",
+            },
         )
 
         return {
