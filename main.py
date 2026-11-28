@@ -564,7 +564,7 @@ def build_and_send_institutional_report(trigger: str = "Scheduled"):
 
         setup_id = save_setup_bundle(sym, refined_bundle["live_price"], final_score, refined_bundle)
         msg = format_asset_report(sym, refined_bundle, final_score, engine_name, passed, errors, asset_q)
-if unified_hub is not None:
+                if unified_hub is not None:
             try:
                 hub_res = unified_hub.run_unified_analysis(
                     symbol=sym,
