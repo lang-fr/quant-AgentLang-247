@@ -397,6 +397,7 @@ def build_master_confirmation_message(
         f"🏛️ AGENT QUANT LANG — INSTITUTIONAL REPORT ({now_wib})",
         f"Trigger: {trigger} | AI Strategist: {strategist_engine}",
         f"Sesi Killzone: {'🟢' if is_kz_active else '🟡'} {killzone_label}",
+        f"Dompet Eksekusi: {exec_engine.get_balance_summary()}",
         f"Rem Darurat News USD: {blackout_str}",
         "",
         "📌 RINGKASAN KONFIRMASI & 8 PILAR INTERMARKET",
