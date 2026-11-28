@@ -124,7 +124,54 @@ class InstitutionalMarketFeeds:
         except Exception:
             pass
 
-        
+        taker_ratio = 1.0
+        funding_pct = 0.0
+        tk_ok = False
+        fr_ok = False
+        try:
+            r_tk = requests.get(
+                "https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=BTCUSDT&period=15m&limit=1",
+                timeout=5,
+            )
+            if r_tk.status_code == 200 and r_tk.json():
+                taker_ratio = round(float(r_tk.json()[-1].get("buySellRatio", 1.0)), 3)
+                tk_ok = True
+        except Exception:
+            pass
+
+        if not tk_ok:
+            try:
+                r_okx_tk = requests.get(
+                    "https://www.okx.com/api/v5/rubik/stat/taker-volume?ccy=BTC&instType=CONTRACTS&period=15m",
+                    timeout=5,
+                )
+                if r_okx_tk.status_code == 200:
+                    rows = r_okx_tk.json().get("data", [])
+                    if rows and float(rows[0][1]) > 0:
+                        taker_ratio = round(float(rows[0][2]) / float(rows[0][1]), 3)
+            except Exception:
+                pass
+
+        try:
+            r_fr = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT", timeout=5)
+            if r_fr.status_code == 200:
+                funding_pct = round(float(r_fr.json().get("lastFundingRate", 0.0)) * 100.0, 4)
+                fr_ok = True
+        except Exception:
+            pass
+
+        if not fr_ok:
+            try:
+                r_okx_fr = requests.get(
+                    "https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP",
+                    timeout=5,
+                )
+                if r_okx_fr.status_code == 200:
+                    fr_data = (r_okx_fr.json().get("data") or [{}])[0]
+                    if fr_data.get("fundingRate") is not None:
+                        funding_pct = round(float(fr_data["fundingRate"]) * 100.0, 4)
+            except Exception:
+                pass
 
         telemetry_summary = (
             f"XAU:{xau_meta['price']} | BTC:{btc_meta['price']} | DXY:{dxy} | US10Y:{us10y} | "
