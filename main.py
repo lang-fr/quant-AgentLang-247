@@ -44,6 +44,12 @@ except Exception as _re_err:
     risk_mod = None
     print(f"[WARN] risk_engine.py belum tersedia: {_re_err}")
 
+try:
+    from outcome_verifier import OutcomeVerifierEngine
+except Exception as _ov_err:
+    OutcomeVerifierEngine = None
+    print(f"[WARN] outcome_verifier.py belum tersedia: {_ov_err}")
+
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -51,6 +57,7 @@ TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "")).strip()
 AUTO_SCAN_INTERVAL_SEC = int(os.getenv("AUTO_SCAN_INTERVAL_SEC", "14400"))
 NEWS_POLL_INTERVAL_SEC = int(os.getenv("NEWS_POLL_INTERVAL_SEC", "60"))
 MIN_CONFLUENCE_SCORE = int(os.getenv("MIN_CONFLUENCE_SCORE", "75"))
+AUTO_EXECUTE_ENABLED = os.getenv("AUTO_EXECUTE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 DB_PATH = "quant_agentlang_247.db"
 WIB = pytz.timezone("Asia/Jakarta")
 
@@ -59,6 +66,7 @@ feeds = InstitutionalMarketFeeds()
 alpha_engine = InstitutionalSMCAlphaEngine()
 exec_engine = InstitutionalExecutionEngine()
 quant_intel = QuantIntelEngine() if QuantIntelEngine is not None else None
+outcome_verifier = OutcomeVerifierEngine() if OutcomeVerifierEngine is not None else None
 
 LATEST_CONTEXT_CACHE = {"updated": "Belum ada scan", "summary": "Belum ada data pasar tersimpan."}
 SPEECH_WATCH_STATE = {"active": False, "url": "", "last_tail": ""}
@@ -486,12 +494,20 @@ def format_asset_report(
 # PIPELINE UTAMA LAPORAN 24/7
 # =============================================================================
 def build_and_send_institutional_report(trigger: str = "Scheduled"):
+    if outcome_verifier is not None:
+        try:
+            for m_name in ("verify_all_pending_and_approved", "verify_pending", "run_verification", "verify_all"):
+                if hasattr(outcome_verifier, m_name):
+                    getattr(outcome_verifier, m_name)()
+                    break
+        except Exception as e:
+            print("Outcome verifier warning:", e)
+
     intel = feeds.collect_all_8_pillars()
     blackout, news_list = feeds.check_usd_news_blackout()
     breaking = feeds.fetch_realtime_breaking_news(limit=5)
     q_scan = quant_intel.run_full_quant_scan() if quant_intel is not None else {}
 
-    # 1. Kirim Pesan Konfirmasi Utama (~1.950+ karakter) terlebih dahulu
     master_msg = build_master_confirmation_message(
         trigger=trigger,
         intel=intel,
@@ -504,10 +520,8 @@ def build_and_send_institutional_report(trigger: str = "Scheduled"):
 
     dxy = intel["matrix"]["DXY"]["price"]
     macro_bias = "BULLISH" if (dxy == 0 or dxy < 104.0) else "BEARISH"
-
     summary_parts = [master_msg[:1800]]
 
-    # 2. Kirim Mapping Sniper & Tombol Approve terpisah untuk XAUUSD dan BTCUSDT
     for sym in ("XAUUSD", "BTCUSDT"):
         raw_bundle = alpha_engine.build_cascade_setups(sym, feeds, macro_bias)
         refined_bundle, engine_name = alpha_engine.refine_setups_with_flagship_ai(sym, raw_bundle, intel, ai_router)
@@ -515,8 +529,31 @@ def build_and_send_institutional_report(trigger: str = "Scheduled"):
         passed, errors = alpha_engine.verify_setup_before_send(refined_bundle, blackout, score)
 
         asset_q = q_scan.get(sym.lower(), {})
-        setup_id = save_setup_bundle(sym, refined_bundle["live_price"], score, refined_bundle)
-        msg = format_asset_report(sym, refined_bundle, score, engine_name, passed, errors, asset_q)
+        intraday_setup = refined_bundle.get("setups", {}).get("INTRADAY (M1-M5-M15-M30-H1-H4)", {})
+        final_score = score
+        try:
+            jury_audit = audit_high_probability_setup(
+                symbol=sym,
+                direction=intraday_setup.get("direction", "BUY"),
+                entry=_parse_first_float(intraday_setup.get("entry"), refined_bundle["live_price"]),
+                sl=_parse_first_float(intraday_setup.get("sl"), refined_bundle["live_price"]),
+                tp2=_parse_first_float(intraday_setup.get("tp2"), refined_bundle["live_price"]),
+                raw_score=score,
+                intel=intel,
+                q_scan=q_scan,
+                dmm=quant_dmm_engine.run_all_three_pillars(sym),
+                news_blackout=blackout,
+            )
+            if isinstance(jury_audit, dict):
+                final_score = int(jury_audit.get("final_score", score))
+                if not jury_audit.get("approved", True):
+                    passed = False
+                    errors = list(errors) + jury_audit.get("red_flags", [])[:2]
+        except Exception as _ja_err:
+            print("Jury audit fallback:", _ja_err)
+
+        setup_id = save_setup_bundle(sym, refined_bundle["live_price"], final_score, refined_bundle)
+        msg = format_asset_report(sym, refined_bundle, final_score, engine_name, passed, errors, asset_q)
 
         buttons = {
             "inline_keyboard": [
@@ -531,11 +568,49 @@ def build_and_send_institutional_report(trigger: str = "Scheduled"):
             ]
         }
         send_telegram(msg, reply_markup=buttons)
-        summary_parts.append(f"{sym} Score {score}/100: {json.dumps(refined_bundle.get('setups', {}))[:450]}")
+
+        if AUTO_EXECUTE_ENABLED and passed and final_score >= MIN_CONFLUENCE_SCORE and not blackout and intraday_setup:
+            try:
+                q_res = check_and_consume_session_quota(sym, "INTRADAY")
+                quota_ok, quota_msg = (q_res[0], str(q_res[1])) if isinstance(q_res, tuple) else (bool(q_res), "Kuota Sesi OK")
+            except Exception:
+                quota_ok, quota_msg = True, "Kuota Sesi OK"
+
+            if quota_ok:
+                res = exec_engine.execute_horizon_setup(sym, "INTRADAY", intraday_setup)
+                update_setup_status(setup_id, "AUTO_EXECUTED_INTRADAY")
+                try:
+                    record_trade_journal(
+                        symbol=sym,
+                        horizon="INTRADAY",
+                        direction=intraday_setup.get("direction", "BUY"),
+                        entry=_parse_first_float(intraday_setup.get("entry"), refined_bundle["live_price"]),
+                        sl=_parse_first_float(intraday_setup.get("sl"), refined_bundle["live_price"]),
+                        tp1=_parse_first_float(intraday_setup.get("tp1"), refined_bundle["live_price"]),
+                        tp2=_parse_first_float(intraday_setup.get("tp2"), refined_bundle["live_price"]),
+                        tp3=_parse_first_float(intraday_setup.get("tp3"), refined_bundle["live_price"]),
+                        score=final_score,
+                        mode=f"AUTO_{res.get('mode', 'SIM')}",
+                        notes=f"Auto-Executed Setup #{setup_id}",
+                    )
+                except Exception as _rj_err:
+                    print("Record journal warning:", _rj_err)
+
+                layers_txt = "\n".join(
+                    f"  - Layer {l['layer']}: {l['order_type']} @ {l['price']} | Lot: {l['lot']} | SL: {l['sl']} | TP: {l['tp']}"
+                    for l in res["plan"]["layers"]
+                )
+                send_telegram(
+                    f"⚡ AUTO-EXECUTE INTRADAY AKTIF — {sym} (Setup #{setup_id} | Skor {final_score}/100)\n"
+                    f"Mode: {res['mode']} | {quota_msg}\n"
+                    f"{layers_txt}\n"
+                    f"Status: {res['message']}"
+                )
+
+        summary_parts.append(f"{sym} Score {final_score}/100: {json.dumps(refined_bundle.get('setups', {}))[:450]}")
 
     LATEST_CONTEXT_CACHE["updated"] = datetime.datetime.now(WIB).strftime("%Y-%m-%d %H:%M WIB")
     LATEST_CONTEXT_CACHE["summary"] = "\n".join(summary_parts)
-
 
 # =============================================================================
 # WATCHER BERITA REAL-TIME, PIDATO LIVE & INTERAKSI TELEGRAM
@@ -712,6 +787,23 @@ def process_callback_query(cb: dict):
 
         res = exec_engine.execute_horizon_setup(record["symbol"], horizon_code, chosen_setup)
         update_setup_status(sid, f"APPROVED_{horizon_code}")
+        live_px = float(record["bundle"].get("live_price", 0.0))
+        try:
+            record_trade_journal(
+                symbol=record["symbol"],
+                horizon=horizon_code,
+                direction=chosen_setup.get("direction", "BUY"),
+                entry=_parse_first_float(chosen_setup.get("entry"), live_px),
+                sl=_parse_first_float(chosen_setup.get("sl"), live_px),
+                tp1=_parse_first_float(chosen_setup.get("tp1"), live_px),
+                tp2=_parse_first_float(chosen_setup.get("tp2"), live_px),
+                tp3=_parse_first_float(chosen_setup.get("tp3"), live_px),
+                score=0,
+                mode=f"MANUAL_{res.get('mode', 'SIM')}",
+                notes=f"Approved via Telegram Button #{sid}",
+            )
+        except Exception:
+            pass
         layers_txt = "\n".join(
             f"  - Layer {l['layer']}: {l['order_type']} @ {l['price']} | Lot: {l['lot']} | SL: {l['sl']} | TP: {l['tp']}"
             for l in res["plan"]["layers"]
@@ -807,6 +899,22 @@ def telegram_polling_loop():
                         for k, v in TRADING_SKILLS.items()
                     )
                     send_telegram(f"📚 5 PLAYBOOK TRADING_SKILLS AKTIF:\n\n{skills_txt}")
+                elif low == "/auto_on":
+                    globals()["AUTO_EXECUTE_ENABLED"] = True
+                    send_telegram("⚡ AUTO-EXECUTE 24/7 DIAKTIFKAN. Setup yang lolos filter & sidang 4-Agen akan langsung dieksekusi.")
+                elif low == "/auto_off":
+                    globals()["AUTO_EXECUTE_ENABLED"] = False
+                    send_telegram("🛑 AUTO-EXECUTE DIMATIKAN. Mode berubah ke Semi-Otomatis (menunggu klik tombol Approve).")
+                elif low == "/audit":
+                    if outcome_verifier is not None:
+                        summary_audit = None
+                        for m_name in ("verify_all_pending_and_approved", "verify_pending", "run_verification", "verify_all"):
+                            if hasattr(outcome_verifier, m_name):
+                                summary_audit = getattr(outcome_verifier, m_name)()
+                                break
+                        send_telegram(f"🔍 HASIL AUDIT AKURASI SINYAL:\n{json.dumps(summary_audit, indent=2, default=str)}")
+                    else:
+                        send_telegram("Modul outcome_verifier.py belum aktif.")
                 else:
                     def reply_chat(q=text):
                         if LATEST_CONTEXT_CACHE["updated"] == "Belum ada scan":
@@ -835,11 +943,30 @@ def scheduled_loop():
         time.sleep(AUTO_SCAN_INTERVAL_SEC)
 
 
+def drain_telegram_updates_briefly(duration_sec: int = 25):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    offset = 0
+    deadline = time.time() + duration_sec
+    while time.time() < deadline:
+        try:
+            resp = requests.get(f"{base_url}/getUpdates", params={"offset": offset, "timeout": 5}, timeout=8).json()
+            for item in resp.get("result", []):
+                offset = item["update_id"] + 1
+                if "callback_query" in item:
+                    process_callback_query(item["callback_query"])
+        except Exception:
+            pass
+        time.sleep(1)
+
+
 if __name__ == "__main__":
     init_db()
     init_audit_db()
     if "--report" in sys.argv:
         build_and_send_institutional_report("GitHub Actions Scheduled")
+        drain_telegram_updates_briefly(25)
     else:
         register_webhook_callback(
             lambda payload: send_telegram(f"📡 TRADINGVIEW WEBHOOK MASUK:\n{json.dumps(payload, indent=2)}")
