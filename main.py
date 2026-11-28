@@ -49,7 +49,17 @@ try:
 except Exception as _ov_err:
     OutcomeVerifierEngine = None
     print(f"[WARN] outcome_verifier.py belum tersedia: {_ov_err}")
-
+try:
+    from outcome_verifier import OutcomeVerifierEngine
+except Exception as _ov_err:
+    OutcomeVerifierEngine = None
+    print(f"[WARN] outcome_verifier.py belum tersedia: {_ov_err}")
+try:
+    from quant_unified_hub import QuantUnifiedHub
+    unified_hub = QuantUnifiedHub()
+except Exception as _quh_err:
+    unified_hub = None
+    print(f"[WARN] quant_unified_hub.py belum aktif: {_quh_err}")
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -554,7 +564,43 @@ def build_and_send_institutional_report(trigger: str = "Scheduled"):
 
         setup_id = save_setup_bundle(sym, refined_bundle["live_price"], final_score, refined_bundle)
         msg = format_asset_report(sym, refined_bundle, final_score, engine_name, passed, errors, asset_q)
+if unified_hub is not None:
+            try:
+                hub_res = unified_hub.run_unified_analysis(
+                    symbol=sym,
+                    feeds=feeds,
+                    intel=intel,
+                    ai_router=ai_router,
+                    account_balance=exec_engine.balance,
+                    consume_quota_on_approve=False,
+                )
+                j_audit = hub_res.get("jury_audit", {})
+                add_guard = hub_res.get("additive_guard", {})
+                r_sent = hub_res.get("realtime_sentiment", {})
+                reg_g = hub_res.get("regime_and_guards", {})
+                r_verd = hub_res.get("risk_verdict", {})
 
+                if isinstance(j_audit.get("final_score"), (int, float)):
+                    final_score = int(j_audit["final_score"])
+                if not j_audit.get("approved_high_prob", True):
+                    passed = False
+                    errors = list(errors) + list(j_audit.get("red_flags", []))[:2]
+                if not add_guard.get("additive_pass", True):
+                    passed = False
+                    errors = list(errors) + list(add_guard.get("extra_warnings", []))
+
+                extra_lines = [
+                    "",
+                    "🛡️ KONFIRMASI TAMBAHAN UNIFIED HUB 360°:",
+                    f"• Playbook & Sesi WIB: {hub_res.get('active_playbook', '-')} | {add_guard.get('wib_session', '-')}",
+                    f"• Regime ADX/RSI: {reg_g.get('regime', '-')} (ADX H1: {reg_g.get('adx_h1', '-')} | RSI H1: {reg_g.get('rsi_h1', '-')} | Spike Z: {reg_g.get('z_score_h1', '-')})",
+                    f"• Sentimen Realtime: Fear & Greed {r_sent.get('fear_greed_value', '-')} ({r_sent.get('fear_greed_label', '-')}) | OKX L/S: {r_sent.get('okx_btc_long_short_ratio', 'N/A')}",
+                    f"• Dewan Juri 4-Agen: Skor Final {final_score}/100 ({j_audit.get('status_label', '-')}) | Red Flags: {', '.join(j_audit.get('red_flags', [])) or 'NIHIL'}",
+                    f"• Risk Engine CRO: {r_verd.get('reason', '-')}",
+                ]
+                msg = msg + "\n" + "\n".join(extra_lines)
+            except Exception as _hub_err:
+                print(f"[WARN] UnifiedHub enrichment {sym}: {_hub_err}")
         buttons = {
             "inline_keyboard": [
                 [
@@ -915,6 +961,21 @@ def telegram_polling_loop():
                         send_telegram(f"🔍 HASIL AUDIT AKURASI SINYAL:\n{json.dumps(summary_audit, indent=2, default=str)}")
                     else:
                         send_telegram("Modul outcome_verifier.py belum aktif.")
+                elif low.startswith("/hub"):
+                    if unified_hub is None:
+                        send_telegram("Modul quant_unified_hub.py belum aktif.")
+                    else:
+                        sym_hub = "BTCUSDT" if "btc" in low else "XAUUSD"
+                        send_telegram(f"⏳ Menjalankan Unified Hub 360° (SMC + Quant + MM + 4-Agent Jury) untuk {sym_hub}...")
+                        def run_hub_cmd(s=sym_hub):
+                            rep = unified_hub.run_unified_analysis(
+                                symbol=s,
+                                feeds=feeds,
+                                ai_router=ai_router,
+                                account_balance=exec_engine.balance,
+                            )
+                            send_telegram(unified_hub.format_institutional_brief(rep))
+                        threading.Thread(target=run_hub_cmd, daemon=True).start()
                 else:
                     def reply_chat(q=text):
                         if LATEST_CONTEXT_CACHE["updated"] == "Belum ada scan":
