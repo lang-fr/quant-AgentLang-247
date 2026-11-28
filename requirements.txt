@@ -2,13 +2,12 @@ requests
 python-dotenv
 numpy
 pandas
+scipy
 google-genai
 anthropic
-python-dotenv
 yfinance
 fredapi
 feedparser
-requests
 flask
 pytz
 youtube-transcript-api
